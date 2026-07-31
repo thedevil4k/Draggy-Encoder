@@ -1,0 +1,40 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.venv/
+venv/
+env/
+
+# IDEs
+.vscode/
+.idea/
+
+# Binarios descargados por la aplicación
+bin/
+
+# Datos personales (tokens, API keys, etc.)
+personal/
+
+# Herramientas de escritorio
+.freebuff/
+
+# Outputs y temporales
+*.mkv
+*.mp4
+*.avi
+*.wmv
+*.mov
+*.webm
+*.tmp
+*.log
+
+# PyInstaller
+build/
+dist/
+*.spec
+
+# OS
+.DS_Store
+Thumbs.db

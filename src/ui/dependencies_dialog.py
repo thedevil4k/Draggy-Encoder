@@ -1,0 +1,1125 @@
+"""Panel de gestión de dependencias externas del programa.
+
+Muestra una lista de dependencias (FFmpeg real, más placeholders de runtimes y
+ranuras de modelos) con su estado, versión instalada y acciones disponibles
+(instalar / reinstalar, abrir carpeta, abrir logs).
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+import platform
+import subprocess
+import traceback
+from datetime import datetime, timezone
+
+from PySide6.QtCore import Qt, QThread, QTimer, Signal
+from PySide6.QtGui import QColor, QFont
+from PySide6.QtWidgets import (
+    QDialog,
+    QFrame,
+    QHBoxLayout,
+    QLabel,
+    QMessageBox,
+    QProgressDialog,
+    QPushButton,
+    QScrollArea,
+    QTabWidget,
+    QVBoxLayout,
+    QWidget,
+)
+
+import src.dependencies as dependencies
+from src.ai.bus import bus as _state_bus
+from src.runtimes.manager import get_python_support_info as _get_python_support_info
+from src.ai.engines_state import (
+    get_state as engines_state_get,
+    mark_failed as engines_mark_failed,
+    mark_installed as engines_mark_installed,
+    mark_onnx as engines_mark_onnx,
+    mark_uninstalled as engines_mark_uninstalled,
+    patch as engines_state_patch,
+)
+from src.ai.fetcher import (
+    GitCloneWorker,
+    HFDownloadWorker,
+    OnnxConvertWorker,
+    is_git_available,
+    is_hf_hub_available,
+)
+from src.ai.registry import CATALOG, get_engine_dir
+from src.config import get_logs_dir
+from src.ffmpeg.full_download_worker import FFmpegFullDownloadWorker
+from src.ffmpeg.manager import (
+    get_local_ffmpeg_full_path,
+    has_libplacebo_support,
+)
+from src.ffmpeg.upstream import clear_cache
+from src.ui.engines_tab import EnginesTab
+
+
+_STATUS_COLORS = {
+    dependencies.STATUS_INSTALLED: ("#00d2d3", "#0f0f1a"),      # turquesa (sobre fondo claro)
+    dependencies.STATUS_MISSING: ("#e74c3c", "#ffffff"),         # rojo
+    dependencies.STATUS_ERROR: ("#f39c12", "#0f0f1a"),           # ámbar
+    dependencies.STATUS_COMING_SOON: ("#5f27cd", "#ffffff"),     # lila (coming soon)
+}
+
+
+def _format_latest_line(info):
+    """Devuelve el texto "Latest: … · last check: …" para la columna Latest."""
+    fp = info.get("latest_fingerprint") or {}
+    last_mod = fp.get("last_modified_iso")
+    checked_at = fp.get("checked_at")
+    if not last_mod:
+        if info.get("upstream_error"):
+            return "Latest: — (offline) · last check: never"
+        return "Latest: — · last check: never"
+    # Mostrar solo la fecha (YYYY-MM-DD) para no saturar la línea
+    short = last_mod.split("T", 1)[0]
+    # Edad del check en horas
+    age_text = "—"
+    if checked_at:
+        try:
+            dt = datetime.fromisoformat(checked_at)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            hours = (datetime.now(timezone.utc) - dt).total_seconds() / 3600.0
+            if hours < 1:
+                age_text = f"{int(hours * 60)} min ago"
+            elif hours < 24:
+                age_text = f"{hours:.1f} h ago"
+            else:
+                age_text = f"{hours / 24:.1f} d ago"
+        except Exception:
+            pass
+    return f"Latest upstream build: {short}  ·  last check: {age_text}"
+
+
+class _ReinstallWorker(QThread):
+    """Hilo separado para no bloquear la UI durante la descarga."""
+
+    progress = Signal(int)
+    finished_ok = Signal(str)         # dep_id
+    failed = Signal(str, str)         # dep_id, mensaje
+
+    def __init__(self, dep_id, parent=None):
+        super().__init__(parent)
+        self.dep_id = dep_id
+
+    def run(self):
+        try:
+            dependencies.reinstall(
+                self.dep_id,
+                progress_callback=lambda v: self.progress.emit(v),
+                parent=self.parent(),
+            )
+            self.finished_ok.emit(self.dep_id)
+        except Exception as exc:
+            self.failed.emit(self.dep_id, str(exc))
+
+
+class _UpstreamCheckWorker(QThread):
+    """Hilo independiente para refrescar la huella del upstream."""
+
+    done = Signal()
+
+    def __init__(self, force=False, parent=None):
+        super().__init__(parent)
+        # Cuando ``force`` es True se ignora el cache de 24h (Refresh manual).
+        # Cuando es False, sólo se hace HEAD si el cache tiene más de 24h.
+        self.force = force
+
+    def run(self):
+        # Llamada bloqueante pero acotada por timeout de requests.
+        try:
+            from src.ffmpeg.upstream import get_fingerprint
+            get_fingerprint(force=self.force)
+        except Exception:
+            # La falla queda registrada en el cache (last_error); no
+            # necesitamos propagarla. El panel leerá el cache y mostrará
+            # el último estado conocido.
+            pass
+        self.done.emit()
+
+
+class _DepRow(QFrame):
+    """Una fila con el estado + versión + acciones de una dependencia."""
+
+    redownload_requested = Signal(str)
+
+    def __init__(self, info, parent=None):
+        super().__init__(parent)
+        self.info = info
+        self.setObjectName("DepRow")
+        self.setStyleSheet(self._stylesheet())
+        self._build(info)
+
+    def _stylesheet(self):
+        return """
+        #DepRow {
+            background-color: #16213e;
+            border: 1px solid #2c3e50;
+            border-radius: 8px;
+        }
+        #DepRow QPushButton {
+            background-color: #1f2c4c;
+            color: #e0e0e0;
+            border: 1px solid #2c3e50;
+            border-radius: 6px;
+            padding: 6px 12px;
+        }
+        #DepRow QPushButton:hover {
+            background-color: #00d2d3;
+            color: #0f0f1a;
+        }
+        #DepRow QPushButton:disabled {
+            background-color: #2c3e50;
+            color: #5f6f7f;
+        }
+        #StatusBadge {
+            border-radius: 9px;
+            padding: 2px 10px;
+            font-weight: bold;
+            font-size: 11px;
+        }
+        """
+
+    def _build(self, info):
+        outer = QHBoxLayout(self)
+        outer.setSpacing(14)
+        outer.setContentsMargins(14, 12, 14, 12)
+
+        # Columna izquierda: nombre + versión + ruta
+        left = QVBoxLayout()
+        left.setSpacing(4)
+        title = QLabel(info.get("display_name", "—"))
+        title_font = QFont()
+        title_font.setPointSize(12)
+        title_font.setBold(True)
+        title.setFont(title_font)
+        title.setStyleSheet("color: #ffffff;")
+        left.addWidget(title)
+
+        kind_label = info.get("kind", "").upper()
+        version_text = info.get("version") or "—"
+        meta = QLabel(f"{kind_label}  ·  version: {version_text}")
+        meta.setStyleSheet("color: #a0a0b0; font-size: 11px;")
+        left.addWidget(meta)
+
+        path_label = QLabel(
+            info.get("install_dir") or "(no install dir)"
+        )
+        path_label.setStyleSheet(
+            "color: #707080; font-size: 10px; font-family: Consolas, monospace;"
+        )
+        path_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        left.addWidget(path_label)
+
+        if info.get("source_url"):
+            url_label = QLabel(info["source_url"])
+            url_label.setStyleSheet(
+                "color: #00d2d3; font-size: 10px;"
+            )
+            url_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+            left.addWidget(url_label)
+
+        # Línea "Latest <fecha>" cuando hay datos de upstream (sólo BINARY)
+        if info.get("kind") == dependencies.KIND_BINARY:
+            latest_text = _format_latest_line(info)
+            if latest_text:
+                latest_label = QLabel(latest_text)
+                latest_label.setStyleSheet("color: #00d2d3; font-size: 11px;")
+                latest_label.setTextInteractionFlags(
+                    Qt.TextInteractionFlag.TextSelectableByMouse
+                )
+                left.addWidget(latest_label)
+
+        if info.get("detail"):
+            detail = QLabel(info["detail"])
+            detail.setStyleSheet("color: #c0c0d0; font-size: 11px;")
+            detail.setWordWrap(True)
+            left.addWidget(detail)
+
+        # AI runtime compatibility warning (Python 3.14, etc.)
+        support = self._ai_runtime_support_info(info)
+        if support and not support["supported"]:
+            warn = QLabel(support["message"])
+            warn.setStyleSheet("color: #f39c12; font-size: 11px; font-weight: bold;")
+            warn.setWordWrap(True)
+            left.addWidget(warn)
+
+        outer.addLayout(left, stretch=1)
+
+        # Columna derecha: badge principal + (opcional) "Update available"
+        right = QVBoxLayout()
+        right.setSpacing(6)
+
+        badge_row = QHBoxLayout()
+        badge_row.setSpacing(6)
+        badge_row.setAlignment(Qt.AlignmentFlag.AlignRight)
+
+        badge = QLabel(self._badge_text(info.get("status")))
+        status = info.get("status")
+        fg_bg = _STATUS_COLORS.get(status, ("#a0a0b0", "#0f0f1a"))
+        badge.setStyleSheet(
+            f"#StatusBadge {{ background-color: {fg_bg[0]}; color: {fg_bg[1]}; }}"
+        )
+        badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        badge.setObjectName("StatusBadge")
+        badge.setMaximumWidth(140)
+        badge_row.addWidget(badge)
+
+        # Insignia secundaria "Update available" cuando aplica
+        if info.get("update_available") is True:
+            ua = QLabel("UPDATE AVAILABLE")
+            ua.setObjectName("UpdateBadge")
+            ua.setStyleSheet(
+                "#UpdateBadge { background-color: #f39c12; color: #0f0f1a; "
+                "border-radius: 9px; padding: 2px 10px; font-weight: bold; font-size: 11px; }"
+            )
+            ua.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            badge_row.addWidget(ua)
+        elif info.get("upstream_error"):
+            ua = QLabel("OFFLINE")
+            ua.setObjectName("UpdateBadge")
+            ua.setStyleSheet(
+                "#UpdateBadge { background-color: #2c3e50; color: #a0a0b0; "
+                "border-radius: 9px; padding: 2px 10px; font-weight: bold; font-size: 11px; }"
+            )
+            ua.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            ua.setToolTip("Could not reach the upstream URL.\n" + str(info["upstream_error"]))
+            badge_row.addWidget(ua)
+
+        right.addLayout(badge_row)
+
+        btn_row = QHBoxLayout()
+        btn_row.setSpacing(6)
+
+        primary_label = self._primary_label(info)
+        support = self._ai_runtime_support_info(info)
+        self.btn_primary = QPushButton(primary_label)
+        self.btn_primary.setEnabled(self._primary_enabled(info, support=support))
+        if info.get("update_available") is True:
+            self.btn_primary.setStyleSheet(
+                "QPushButton { background-color: #f39c12; color: #0f0f1a; "
+                "border: none; border-radius: 6px; padding: 6px 12px; font-weight: bold; }"
+                "QPushButton:hover { background-color: #f5b041; }"
+                "QPushButton:disabled { background-color: #2c3e50; color: #5f6f7f; }"
+            )
+        self.btn_primary.clicked.connect(
+            lambda: self.redownload_requested.emit(info.get("id") or info.get("display_name"))
+        )
+        btn_row.addWidget(self.btn_primary)
+
+        self.btn_open = QPushButton("Open folder")
+        self.btn_open.setEnabled(bool(info.get("install_dir")))
+        self.btn_open.clicked.connect(lambda: self._open_path(info.get("install_dir")))
+        btn_row.addWidget(self.btn_open)
+
+        right.addLayout(btn_row)
+        right.addStretch()
+        outer.addLayout(right)
+
+    def _badge_text(self, status):
+        return {
+            dependencies.STATUS_INSTALLED: "INSTALLED",
+            dependencies.STATUS_MISSING: "MISSING",
+            dependencies.STATUS_ERROR: "ERROR",
+            dependencies.STATUS_COMING_SOON: "COMING SOON",
+        }.get(status, status or "—")
+
+    def _primary_label(self, info):
+        # Si upstream sugiere build más reciente y está instalado,
+        # el botón principal pasa a ser "Update" en lugar de "Reinstall".
+        if (
+            info.get("status") == dependencies.STATUS_INSTALLED
+            and info.get("update_available") is True
+        ):
+            return "Update"
+        if info.get("status") == dependencies.STATUS_INSTALLED:
+            return "Reinstall"
+        if info.get("status") == dependencies.STATUS_MISSING:
+            return "Install"
+        if info.get("status") == dependencies.STATUS_ERROR:
+            return "Retry"
+        return "Unavailable"
+
+    def _primary_enabled(self, info, support=None):
+        if not info.get("is_updatable"):
+            return False
+        # AI runtimes cannot be installed on Python versions without wheels.
+        if support is None:
+            support = self._ai_runtime_support_info(info)
+        if support and not support["supported"]:
+            return False
+        return True
+
+    def _ai_runtime_support_info(self, info):
+        """Return support info for AI runtime rows (torch/onnxruntime)."""
+        if info.get("kind") != dependencies.KIND_RUNTIME:
+            return None
+        dep_id = info.get("id") or ""
+        if dep_id in ("torch", "onnxruntime"):
+            return _get_python_support_info()
+        return None
+
+    def _open_path(self, path):
+        if not path:
+            return
+        try:
+            os.makedirs(path, exist_ok=True)
+        except Exception:
+            pass
+        try:
+            if platform.system() == "Windows":
+                os.startfile(path)  # noqa: S606
+            elif platform.system() == "Darwin":
+                subprocess.Popen(["open", path])
+            else:
+                subprocess.Popen(["xdg-open", path])
+        except Exception as exc:
+            QMessageBox.warning(self, "Open folder", f"No se pudo abrir la carpeta:\n{exc}")
+
+
+class DependenciesDialog(QDialog):
+    """Diálogo modal con la lista de dependencias externas."""
+
+    def __init__(self, parent=None, initial_tab=None):
+        super().__init__(parent)
+        self.setWindowTitle("Manage Dependencies — DRAGGY ENCODER")
+        self.setMinimumSize(820, 560)
+        self.resize(960, 640)
+        self.setStyleSheet(
+            "QDialog { background-color: #0f0f1a; color: #e0e0e0; }"
+            " QLabel { color: #e0e0e0; }"
+            " QScrollArea { background-color: #0f0f1a; border: none; }"
+        )
+        self._row_widgets = []
+        self._active_worker = None
+        self._upstream_worker = None
+        self._check_force_next = False
+        # Workers de la pestaña AI Engines (lazy init en cada handler:
+        # el destructor del QThread libera solo).
+        self._git_worker = None
+        self._onnx_worker = None
+        # Worker de descarga de FFmpeg "full" para FSR 2.0 (libplacebo).
+        self._fsr2_worker = None
+        # Tab a enfocar en el primer paint ("ai_engines" o "binaries").
+        self._initial_tab = initial_tab
+        # Escuchamos el bus de estado para repintar la pestaña AI Engines
+        # aunque las mutaciones ocurran en otra ventana (workflow widget,
+        # followup al cerrar, etc.). UniqueConnection evita handlers
+        # duplicados si el dialog se reconstruye en tests.
+        try:
+            _state_bus.state_changed.connect(
+                lambda _id: self._refresh_engines_tab(),
+                Qt.ConnectionType.UniqueConnection,
+            )
+        except Exception:
+            pass
+        # Timer único para disparo automático; se (re)programa desde
+        # _schedule_check(delay_ms, force).
+        self._check_timer = QTimer(self)
+        self._check_timer.setSingleShot(True)
+        self._check_timer.timeout.connect(self._run_upstream_check)
+        self._build()
+
+    def _build(self):
+        layout = QVBoxLayout(self)
+        layout.setSpacing(10)
+        layout.setContentsMargins(16, 14, 16, 14)
+
+        title = QLabel("Dependencies")
+        title_font = QFont()
+        title_font.setPointSize(16)
+        title_font.setBold(True)
+        title.setFont(title_font)
+        title.setStyleSheet("color: #00d2d3;")
+        layout.addWidget(title)
+
+        subtitle = QLabel(
+            "Binarios, runtimes y modelos se almacenan dentro de la carpeta "
+            "del programa (bin/). El panel consulta el upstream una vez cada "
+            "24 h y muestra una insignia 'UPDATE AVAILABLE' cuando hay una "
+            "build más reciente; pulsa 'Update' para traerla."
+        )
+        subtitle.setStyleSheet("color: #a0a0b0;")
+        subtitle.setWordWrap(True)
+        layout.addWidget(subtitle)
+
+        # Pestañas: una para el registro binario/runtime existente y otra
+        # nueva para AI Engines (catálogo HuggingFace). Compartir un mismo
+        # QDialog con QTabWidget es más limpio que un QSplitter (que obligaría
+        # al usuario a gestionar el ancho de los dos paneles).
+        self.tabs = QTabWidget()
+        self.tabs.setStyleSheet(
+            "QTabWidget::pane { border: 1px solid #2c3e50; border-radius: 6px; background-color: #0f0f1a; }"
+            "QTabBar::tab { background-color: #16213e; color: #a0a0b0; padding: 8px 16px; border-top-left-radius: 6px; border-top-right-radius: 6px; }"
+            "QTabBar::tab:selected { background-color: #00d2d3; color: #0f0f1a; font-weight: bold; }"
+        )
+
+        # --- Tab 1: Runtimes & Binaries (comportamiento existente) ---
+        binaries_tab = QWidget()
+        binaries_layout = QVBoxLayout(binaries_tab)
+        binaries_layout.setSpacing(8)
+        binaries_layout.setContentsMargins(8, 8, 8, 8)
+        self.scroll = QScrollArea()
+        self.scroll.setWidgetResizable(True)
+        self.container = QWidget()
+        self.container_layout = QVBoxLayout(self.container)
+        self.container_layout.setSpacing(10)
+        self.container_layout.setContentsMargins(0, 0, 0, 0)
+        self.container_layout.addStretch()
+        self.scroll.setWidget(self.container)
+        binaries_layout.addWidget(self.scroll, stretch=1)
+        self.tabs.addTab(binaries_tab, "Runtimes & Binaries")
+
+        # --- Tab 2: AI Engines (modelos HuggingFace) ---
+        self.engines_tab = self._create_engines_tab()
+        self.tabs.addTab(self.engines_tab, "AI Engines")
+
+        layout.addWidget(self.tabs, stretch=1)
+
+        bottom = QHBoxLayout()
+        self.btn_refresh = QPushButton("Refresh")
+        self.btn_refresh.setToolTip("Re-checks the FFmpeg upstream cache and redraws the Binaries tab.")
+        self.btn_refresh.clicked.connect(self._refresh)
+        self.btn_logs = QPushButton("Open logs")
+        self.btn_logs.clicked.connect(self._open_logs)
+        self.btn_close = QPushButton("Close")
+        self.btn_close.clicked.connect(self.accept)
+        bottom.addWidget(self.btn_refresh)
+        bottom.addWidget(self.btn_logs)
+        bottom.addStretch()
+        bottom.addWidget(self.btn_close)
+        layout.addLayout(bottom)
+
+        self._populate()
+
+        # Auto-check inicial en background: respeta cache de 24 h, espera
+        # 1.5 s para no estorbar la animación de apertura del diálogo.
+        self._schedule_upstream_check(delay_ms=1500, force=False)
+
+        # Si el llamador pidió enfocar una pestaña concreta (p.ej. el
+        # workflow widget cuando el usuario hace click en "no engines — open
+        # AI Engines Manager"), la activamos tras el build.
+        if self._initial_tab == "ai_engines" and self.tabs.count() >= 2:
+            self.tabs.setCurrentIndex(1)
+
+    def _create_engines_tab(self):
+        """Create the AI Engines tab, with a graceful fallback on error."""
+
+        class _EnginesTabErrorWidget(QWidget):
+            """Placeholder shown when the real AI Engines tab fails to build."""
+
+            def __init__(self, exc, parent=None):
+                super().__init__(parent)
+                layout = QVBoxLayout(self)
+                layout.setContentsMargins(16, 16, 16, 16)
+                error_lbl = QLabel(
+                    f"Could not build the AI Engines panel:\n\n{exc}\n\n"
+                    "Check bin/logs for details."
+                )
+                error_lbl.setStyleSheet("color: #e74c3c; font-size: 12px;")
+                error_lbl.setWordWrap(True)
+                layout.addWidget(error_lbl)
+                tb = QLabel(traceback.format_exc())
+                tb.setStyleSheet(
+                    "color: #707080; font-family: Consolas, monospace; font-size: 10px;"
+                )
+                tb.setWordWrap(True)
+                layout.addWidget(tb)
+                layout.addStretch()
+
+            def repopulate(self):
+                """No-op so ``_refresh_engines_tab`` does not crash."""
+
+        try:
+            tab = EnginesTab(self)
+            tab.install_requested.connect(self._on_engine_install)
+            tab.fsr2_download_requested.connect(self._on_fsr2_download)
+            tab.convert_requested.connect(self._on_engine_convert)
+            tab.open_folder.connect(self._on_engine_open_folder)
+            return tab
+        except Exception as exc:
+            logger.exception("Failed to build AI Engines tab")
+            return _EnginesTabErrorWidget(exc, self)
+
+    def _populate(self):
+        # Limpiar filas existentes
+        for w in self._row_widgets:
+            w.setParent(None)
+            w.deleteLater()
+        self._row_widgets.clear()
+
+        for info in dependencies.list_all():
+            row = _DepRow(info, parent=self.container)
+            row.redownload_requested.connect(self._on_redownload_requested)
+            self.container_layout.insertWidget(self.container_layout.count() - 1, row)
+            self._row_widgets.append(row)
+
+    def _schedule_upstream_check(self, delay_ms=1500, force=False):
+        """(Re)programa un único check upstream.
+
+        - ``force=False``: respeta cache de 24 h. Para auto-check al abrir y
+          tras una reinstalación exitosa (queremos comparar contra el
+          upstream inmediatamente para validar la nueva build).
+        - ``force=True``: bypass del cache, HEAD fresco. Para el botón
+          'Refresh' manual.
+        Cancela cualquier timer pendiente antes de programar el nuevo.
+
+        IMPORTANTE: este método debe invocarse sólo desde el hilo de la GUI.
+        El flag ``_check_force_next`` lo lee después el worker para construir
+        el ``_UpstreamCheckWorker(force=...)``, así que una llamada desde un
+        hilo no-GUI introduciría una carrera.
+        """
+        self._check_force_next = force
+        try:
+            self._check_timer.stop()
+        except Exception:
+            pass
+        self._check_timer.start(delay_ms)
+
+    def _run_upstream_check(self):
+        if self._upstream_worker and self._upstream_worker.isRunning():
+            return
+        self._upstream_worker = _UpstreamCheckWorker(
+            force=self._check_force_next, parent=self
+        )
+        self._upstream_worker.done.connect(self._on_check_finished)
+        # finished = QThread terminado correctamente (cleanup)
+        self._upstream_worker.finished.connect(self._on_check_thread_finished)
+        self._upstream_worker.start()
+
+    def _on_check_finished(self):
+        # ``done`` se emite desde el run() del worker; aquí repoblamos.
+        self._populate()
+
+    def _on_check_thread_finished(self):
+        # Libera referencia una vez el QThread queda idle.
+        self._upstream_worker = None
+
+    def _refresh(self):
+        # Refresh manual: repobla inmediatamente + fuerza un HEAD fresco.
+        self._populate()
+        self._schedule_upstream_check(delay_ms=0, force=True)
+
+    def _open_logs(self):
+        log_dir = get_logs_dir()
+        try:
+            os.makedirs(log_dir, exist_ok=True)
+        except Exception:
+            pass
+        try:
+            if platform.system() == "Windows":
+                os.startfile(log_dir)  # noqa: S606
+            elif platform.system() == "Darwin":
+                subprocess.Popen(["open", log_dir])
+            else:
+                subprocess.Popen(["xdg-open", log_dir])
+        except Exception as exc:
+            QMessageBox.warning(self, "Open logs", f"No se pudo abrir la carpeta de logs:\n{exc}")
+
+    def _on_redownload_requested(self, dep_id):
+        if not dep_id:
+            return
+        if self._active_worker and self._active_worker.isRunning():
+            QMessageBox.information(self, "Busy", "Otra descarga está en curso. Espera a que termine.")
+            return
+        # Confirmación rápida
+        confirm = QMessageBox.question(
+            self,
+            "Reinstall dependency",
+            f"¿Volver a descargar e instalar '{dep_id}'?\n"
+            "La instalación actual será reemplazada.",
+        )
+        if confirm != QMessageBox.StandardButton.Yes:
+            return
+
+        progress = QProgressDialog(
+            f"Reinstalando {dep_id}...", None, 0, 100, self
+        )
+        progress.setWindowModality(Qt.WindowModality.WindowModal)
+        progress.setMinimumDuration(0)
+        progress.setAutoClose(False)
+
+        self._active_worker = _ReinstallWorker(dep_id, parent=self)
+        self._active_worker.progress.connect(progress.setValue)
+        self._active_worker.finished_ok.connect(
+            lambda did: self._on_redownload_finished(did, progress)
+        )
+        self._active_worker.failed.connect(
+            lambda did, msg: self._on_redownload_failed(did, msg, progress)
+        )
+        self._active_worker.start()
+
+    def _on_redownload_finished(self, dep_id, progress):
+        progress.close()
+        self._active_worker = None
+        # Invalidar el cache upstream para que el siguiente check traiga una
+        # huella fresca, no la anterior a esta reinstalación.
+        try:
+            clear_cache()
+        except Exception:
+            pass
+        QMessageBox.information(
+            self, "Done", f"'{dep_id}' se ha reinstalado correctamente."
+        )
+        self._populate()
+        # Tras reinstalar queremos comparar la nueva build contra el upstream
+        # (forzar — el cache fue limpiado, el siguiente check lo repuebla).
+        self._schedule_upstream_check(delay_ms=1500, force=True)
+
+    def _on_redownload_failed(self, dep_id, msg, progress):
+        progress.close()
+        self._active_worker = None
+        QMessageBox.critical(
+            self, "Reinstall failed",
+            f"No se pudo reinstalar '{dep_id}':\n\n{msg}",
+        )
+
+    # ====================================================================
+    # AI Engines tab handlers
+    # ====================================================================
+    #
+    # Las cuatro señales emitidas por ``EnginesTab`` se enrutan aquí. Cada
+    # handler es responsable de:
+    #   - resolver el engine_id a su metadata (hf_url, install_dir, etc.)
+    #   - actualizar el estado persistente (engines.json) ANTES y DESPUÉS
+    #   - lanzar el QThread apropiado o mutar el widget appropriate
+    #
+    # Decisión: cada acción (install / convert / toggle) REPUEBLA sólo el
+    # tab AI Engines (/ self.engines_tab._rebuild() si existiera). El tab
+    # de binarios no se toca porque su contenido no cambió.
+    # --------------------------------------------------------------------
+
+    @staticmethod
+    def _find_engine(engine_id):
+        for entry in CATALOG:
+            if entry.get("engine_id") == engine_id:
+                return entry
+        return None
+
+    def _refresh_engines_tab(self):
+        """Repaints the engines tab after a state-changing action.
+
+        Preferred path: ``EnginesTab.repopulate()`` re-emits every row
+        from disk while preserving the user's scroll position in the
+        same QScrollArea. Fallback: rebuild the tab if repopulate
+        raises (for example if the layout has been corrupted).
+        """
+        try:
+            self.engines_tab.repopulate()
+            return
+        except Exception:
+            pass
+
+        try:
+            current_index = self.tabs.indexOf(self.engines_tab)
+        except Exception:
+            current_index = 1
+        self.tabs.removeTab(current_index)
+        self.engines_tab = EnginesTab(self)
+        self.engines_tab.install_requested.connect(self._on_engine_install)
+        self.engines_tab.fsr2_download_requested.connect(self._on_fsr2_download)
+        self.engines_tab.convert_requested.connect(self._on_engine_convert)
+        self.engines_tab.open_folder.connect(self._on_engine_open_folder)
+        self.tabs.insertTab(current_index, self.engines_tab, "AI Engines")
+        self.tabs.setCurrentIndex(current_index)
+
+    def _on_engine_install(self, engine_id):
+        if not engine_id:
+            return
+        if self._git_worker and self._git_worker.isRunning():
+            QMessageBox.information(
+                self, "Busy",
+                "Another engine installation is in progress."
+            )
+            return
+
+        engine = self._find_engine(engine_id)
+        if not engine:
+            QMessageBox.warning(self, "Engine not found",
+                                f"Unknown engine_id: {engine_id}")
+            return
+        if not engine.get("is_implemented"):
+            QMessageBox.information(
+                self, "Coming soon",
+                f"{engine.get('display_name', engine_id)} - backend integration pending. "
+                "We will surface the install button when the runtime hook is wired."
+            )
+            return
+
+        target_dir = get_engine_dir(engine_id)
+        if os.path.isdir(target_dir) and os.listdir(target_dir):
+            confirm = QMessageBox.question(
+                self, "Engine already installed",
+                f"The directory for {engine.get('display_name', engine_id)} already "
+                f"exists at:\n{target_dir}\n\nRe-clone may fail if it is not empty. "
+                "Continue?",
+            )
+            if confirm != QMessageBox.StandardButton.Yes:
+                return
+
+        # Choose download strategy: prefer huggingface_hub (no git needed),
+        # fall back to git clone if huggingface_hub is not installed.
+        use_hf_hub = is_hf_hub_available()
+        repo_id = engine.get("hf_repo_id", "")
+
+        if use_hf_hub and repo_id:
+            # Direct download via huggingface_hub — no git required.
+            progress = QProgressDialog(
+                f"Downloading {engine.get('display_name', engine_id)} from HuggingFace...",
+                None, 0, 100, self,
+            )
+            progress.setWindowModality(Qt.WindowModality.WindowModal)
+            progress.setMinimumDuration(0)
+            progress.setAutoClose(False)
+
+            self._git_worker = HFDownloadWorker(repo_id, target_dir, parent=self)
+            self._git_worker.progress.connect(progress.setValue)
+            self._git_worker.finished_ok.connect(
+                lambda td: self._on_engine_install_ok(engine_id, td, progress)
+            )
+            self._git_worker.failed.connect(
+                lambda msg: self._on_engine_install_failed(engine_id, msg, progress)
+            )
+            self._git_worker.start()
+        elif is_git_available():
+            # Git fallback.
+            url = engine.get("hf_url", "")
+            progress = QProgressDialog(
+                f"Cloning {engine.get('display_name', engine_id)} from HuggingFace...",
+                None, 0, 100, self,
+            )
+            progress.setWindowModality(Qt.WindowModality.WindowModal)
+            progress.setMinimumDuration(0)
+            progress.setAutoClose(False)
+
+            self._git_worker = GitCloneWorker(url, target_dir, parent=self)
+            self._git_worker.progress.connect(progress.setValue)
+            self._git_worker.finished_ok.connect(
+                lambda td: self._on_engine_install_ok(engine_id, td, progress)
+            )
+            self._git_worker.failed.connect(
+                lambda msg: self._on_engine_install_failed(engine_id, msg, progress)
+            )
+            self._git_worker.start()
+        else:
+            # Neither huggingface_hub nor git available.
+            QMessageBox.warning(
+                self, "No download method available",
+                "Neither Git nor huggingface_hub is available.\n\n"
+                "Install one of:\n"
+                "  pip install huggingface_hub\n"
+                "  git (from git-scm.com)\n\n"
+                "Or manually download the model files into:\n"
+                f"  {target_dir}",
+            )
+
+    def _on_engine_install_ok(self, engine_id, target_dir, progress):
+        progress.close()
+        try:
+            engines_mark_installed(engine_id, install_path=target_dir)
+        except Exception:
+            pass
+        self._git_worker = None
+        self._refresh_engines_tab()
+        QMessageBox.information(
+            self, "Engine added",
+            f"'{engine_id}' installed successfully into:\n{target_dir}\n\n"
+            "Select it from the workflow node to use it.",
+        )
+
+    def _on_engine_install_failed(self, engine_id, msg, progress):
+        progress.close()
+        try:
+            engines_mark_failed(engine_id, msg)
+        except Exception:
+            pass
+        self._git_worker = None
+        self._refresh_engines_tab()
+        hint = "\n\nHints:"
+        if not is_git_available() and not is_hf_hub_available():
+            hint += "\n  - Neither Git nor huggingface_hub is available."
+            hint += "\n  - Install: pip install huggingface_hub"
+            hint += "\n  - Or install Git from git-scm.com."
+        elif not is_git_available():
+            hint += "\n  - Git is not on PATH. Install it from git-scm.com."
+        hint += "\n  - Or drop the model files manually into:"
+        hint += f"\n    {get_engine_dir(engine_id)}"
+        hint += "\n    and re-open the AI Engines tab so it detects them."
+
+        # Check if this is an auth-related failure (403/401/Access Denied).
+        is_auth_error = any(
+            kw in msg for kw in ("401", "403", "Access Denied", "token")
+        )
+        if is_auth_error:
+            from PySide6.QtWidgets import QMessageBox as _MB
+            box = _MB(self)
+            box.setIcon(_MB.Icon.Critical)
+            box.setWindowTitle("Add Engine failed")
+            box.setText(f"Could not install '{engine_id}':\n\n{msg}{hint}")
+            btn_get_token = box.addButton("Open Token Page", _MB.ButtonRole.ActionRole)
+            box.addButton(_MB.StandardButton.Ok)
+            box.exec()
+            if box.clickedButton() == btn_get_token:
+                import webbrowser
+                webbrowser.open("https://huggingface.co/settings/tokens")
+        else:
+            QMessageBox.critical(
+                self, "Add Engine failed",
+                f"Could not install '{engine_id}':\n\n{msg}{hint}",
+            )
+
+    # -----------------------------------------------------------------
+    # FSR 2.0 install flow (downloads FFmpeg full + libplacebo)
+    # -----------------------------------------------------------------
+
+    _FSR2_ENGINE_IDS = (
+        "upscale-fsr-2x-v2",
+        "upscale-fsr-3x-v2",
+        "upscale-fsr-4x-v2",
+    )
+
+    def _on_fsr2_download(self, engine_id: str) -> None:
+        """Handle 'Download FFmpeg' click on any FSR 2.0 row.
+
+        All three FSR 2.0 engines share the same FFmpeg-full binary at
+        ``bin/ffmpeg-full/ffmpeg.exe``. A single download marks all three
+        rows as installed.
+        """
+        if engine_id not in self._FSR2_ENGINE_IDS:
+            return
+        if self._fsr2_worker and self._fsr2_worker.isRunning():
+            QMessageBox.information(
+                self, "Busy",
+                "A FFmpeg-full download is already in progress.",
+            )
+            return
+
+        # If the binary is already on disk AND has libplacebo, just mark
+        # all three as ready without re-downloading.
+        existing = get_local_ffmpeg_full_path()
+        if os.path.exists(existing) and has_libplacebo_support(existing):
+            self._mark_fsr2_ready()
+            QMessageBox.information(
+                self, "FSR 2.0 ready",
+                "FFmpeg full with libplacebo is already installed.\n"
+                "All FSR 2.0 engines are ready to use.",
+            )
+            return
+
+        progress = QProgressDialog(
+            "Downloading FFmpeg full (with libplacebo for FSR 2.0)...",
+            None, 0, 100, self,
+        )
+        progress.setWindowModality(Qt.WindowModality.WindowModal)
+        progress.setMinimumDuration(0)
+        progress.setAutoClose(False)
+        progress.setWindowTitle("Downloading FFmpeg full")
+
+        self._fsr2_worker = FFmpegFullDownloadWorker(parent=self)
+        self._fsr2_worker.progress.connect(progress.setValue)
+        self._fsr2_worker.finished_ok.connect(
+            lambda _path: self._on_fsr2_download_ok(progress)
+        )
+        self._fsr2_worker.failed.connect(
+            lambda msg: self._on_fsr2_download_failed(msg, progress)
+        )
+        self._fsr2_worker.start()
+
+    def _on_fsr2_download_ok(self, progress: QProgressDialog) -> None:
+        progress.close()
+        self._fsr2_worker = None
+        # Verify libplacebo before marking ready.
+        ffmpeg_full = get_local_ffmpeg_full_path()
+        if not (os.path.exists(ffmpeg_full) and has_libplacebo_support(ffmpeg_full)):
+            self._on_fsr2_download_failed(
+                "Downloaded binary does not expose libplacebo. Aborting.", progress
+            )
+            return
+        self._mark_fsr2_ready()
+        QMessageBox.information(
+            self, "FSR 2.0 ready",
+            "FFmpeg full with libplacebo installed at:\n"
+            f"{ffmpeg_full}\n\n"
+            "All FSR 2.0 engines (x2 / x3 / x4) are ready to use.",
+        )
+
+    def _on_fsr2_download_failed(self, msg: str, progress: QProgressDialog) -> None:
+        progress.close()
+        self._fsr2_worker = None
+        # Mark all three engines with the same error so the row UI shows it.
+        for eid in self._FSR2_ENGINE_IDS:
+            try:
+                engines_state_patch(
+                    eid,
+                    installed=False,
+                    last_error="FFmpeg full download failed: {}".format(msg),
+                )
+            except Exception:
+                pass
+        self._refresh_engines_tab()
+        QMessageBox.critical(
+            self, "Download FFmpeg failed",
+            "Could not download FFmpeg full (libplacebo).\n\n"
+            "{}\n\n"
+            "Hints:\n"
+            "  - Check your internet connection.\n"
+            "  - All three upstream mirrors (BtbN lgpl-shared, BtbN gpl-shared, "
+            "johnvansickle.com) failed.\n"
+            "  - You can also drop a custom build with libplacebo at:\n"
+            "    {}".format(msg, get_local_ffmpeg_full_path()),
+        )
+
+    def _mark_fsr2_ready(self) -> None:
+        """Mark all three FSR 2.0 engines as installed+enabled in engines.json."""
+        ffmpeg_full = get_local_ffmpeg_full_path()
+        for eid in self._FSR2_ENGINE_IDS:
+            try:
+                engines_state_patch(
+                    eid,
+                    installed=True,
+                    enabled=True,
+                    installed_at_iso=datetime.now(timezone.utc).isoformat(),
+                    install_path=ffmpeg_full,
+                    last_error=None,
+                )
+            except Exception:
+                pass
+        self._refresh_engines_tab()
+
+    def _on_engine_convert(self, engine_id):
+        if not engine_id:
+            return
+        if self._onnx_worker and self._onnx_worker.isRunning():
+            QMessageBox.information(
+                self, "Busy",
+                "Another conversion is already running."
+            )
+            return
+
+        engine = self._find_engine(engine_id)
+        if not engine:
+            return
+        state = engines_state_get(engine_id)
+        if not state.get("installed"):
+            QMessageBox.information(
+                self, "Install first",
+                f"Install '{engine.get('display_name', engine_id)}' before converting "
+                "its weights to ONNX."
+            )
+            return
+
+        target_dir = state.get("install_path") or get_engine_dir(engine_id)
+
+        progress = QProgressDialog(
+            f"Converting {engine.get('display_name', engine_id)} to ONNX...",
+            None, 0, 100, self,
+        )
+        progress.setWindowModality(Qt.WindowModality.WindowModal)
+        progress.setMinimumDuration(0)
+        progress.setAutoClose(False)
+
+        self._onnx_worker = OnnxConvertWorker(
+            engine_id,
+            target_dir,
+            engine.get("category", ""),
+            parent=self,
+        )
+        self._onnx_worker.progress.connect(progress.setValue)
+        self._onnx_worker.finished_ok.connect(
+            lambda out: self._on_engine_convert_ok(engine_id, out, progress)
+        )
+        self._onnx_worker.failed.connect(
+            lambda msg: self._on_engine_convert_failed(engine_id, msg, progress)
+        )
+        self._onnx_worker.start()
+
+    def _on_engine_convert_ok(self, engine_id, out_path, progress):
+        progress.close()
+        try:
+            engines_mark_onnx(engine_id, onnx_path=out_path, converted=True)
+        except Exception:
+            pass
+        self._onnx_worker = None
+        self._refresh_engines_tab()
+        QMessageBox.information(
+            self, "ONNX conversion finished",
+            f"'{engine_id}' -> ONNX at:\n{out_path}",
+        )
+
+    def _on_engine_convert_failed(self, engine_id, msg, progress):
+        progress.close()
+        try:
+            engines_mark_onnx(engine_id, onnx_path=None, converted=False)
+        except Exception:
+            pass
+        self._onnx_worker = None
+        self._refresh_engines_tab()
+        QMessageBox.critical(
+            self, "Conversion failed",
+            f"{msg}",
+        )
+
+    def _on_engine_open_folder(self, engine_id):
+        engine = self._find_engine(engine_id)
+        if not engine:
+            return
+        path = get_engine_dir(engine_id)
+        try:
+            os.makedirs(path, exist_ok=True)
+        except Exception:
+            pass
+        try:
+            if platform.system() == "Windows":
+                os.startfile(path)  # noqa: S606
+            elif platform.system() == "Darwin":
+                subprocess.Popen(["open", path])
+            else:
+                subprocess.Popen(["xdg-open", path])
+        except Exception as exc:
+            QMessageBox.warning(self, "Open folder",
+                                f"Could not open the engine folder:\n{exc}")
+
+    # ====================================================================
+    # Dialog lifecycle / worker cancellation
+    # ====================================================================
+    #
+    # QThread is parented to ``self``, but ``subprocess.Popen`` keeps
+    # the underlying OS process alive past QThread.terminate() because
+    # the Python loop doesn't act on Qt's terminate signal. Adding
+    # explicit cancel hooks here stops the active git / optimum-cli
+    # subprocess before the dialog tears down so the OS process is
+    # never orphaned.
+    # --------------------------------------------------------------------
+
+    def accept(self):
+        self._kill_workers()
+        super().accept()
+
+    def reject(self):
+        self._kill_workers()
+        super().reject()
+
+    def _kill_workers(self):
+        for w_attr in ("_git_worker", "_onnx_worker", "_fsr2_worker"):
+            w = getattr(self, w_attr, None)
+            if w is None:
+                continue
+            try:
+                if w.isRunning():
+                    try:
+                        w.cancel()
+                    except Exception:
+                        pass
+                    try:
+                        w.wait(2000)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            setattr(self, w_attr, None)

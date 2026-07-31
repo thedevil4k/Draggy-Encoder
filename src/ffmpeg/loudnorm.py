@@ -1,0 +1,134 @@
+"""
+Two-pass loudnorm measurement for EBU R128 broadcast precision.
+
+Pass 1 (measure):
+    ffmpeg -hide_banner -nostats -i INPUT \
+           -af loudnorm=I=-16:TP=-1.5:LRA=11:print_format=json \
+           -f null -
+The loudnorm filter prints a JSON block to stderr with measured stats of the
+source audio.
+
+Pass 2 uses ``build_args(...)`` with these measured values to apply
+linear-mode loudnorm, which gives significantly more accurate normalization
+than the single-pass with default values.
+
+NOTE: This module only imports ``_run_kwargs`` from ``src.ffmpeg.runner``.
+It must NOT import anything back from pipeline.py or anything that imports
+pipeline.py, to avoid a circular dependency.
+"""
+
+import json
+import os
+import re
+import subprocess
+from datetime import datetime
+
+from src.config import get_bin_dir
+from src.ffmpeg.runner import _run_kwargs
+
+
+def _log_dir():
+    """Directorio de logs (mismo patrón que codec_tester)."""
+    log_dir = os.path.join(get_bin_dir(), "logs")
+    try:
+        os.makedirs(log_dir, exist_ok=True)
+    except Exception:
+        pass
+    return log_dir
+
+
+def _append_log(status, detail):
+    """Anexa una línea a bin/logs/loudnorm.log con timestamp."""
+    try:
+        log_file = os.path.join(_log_dir(), "loudnorm.log")
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        with open(log_file, "a", encoding="utf-8") as f:
+            f.write(f"[{ts}] {status} {detail}\n")
+    except Exception:
+        pass
+
+
+def measure_loudness(ffmpeg_path, input_path, timeout_seconds=600,
+                       start_time=None, end_time=None, status_callback=None):
+    """Run pass-1 loudnorm measurement and return parsed JSON dict, or None.
+
+    Returns a dict with keys: input_i, input_tp, input_lra, input_thresh,
+    target_offset (all strings with the measured LUFS / dB values).
+    Returns None if:
+        - The ffmpeg process errors out
+        - No audio stream is present
+        - The JSON block cannot be located in stderr
+        - The process times out
+
+    Optional ``start_time`` / ``end_time`` (seconds) let you measure a clip
+    instead of the whole file (used by preview).
+    """
+    if not ffmpeg_path or not input_path:
+        _append_log("SKIP", f"missing ffmpeg_path or input_path ({input_path})")
+        return None
+
+    if status_callback:
+        status_callback("Analyzing audio levels...")
+
+    cmd = [ffmpeg_path, "-hide_banner", "-nostats"]
+    if start_time is not None:
+        cmd.extend(["-ss", str(start_time)])
+    cmd.extend(["-i", input_path])
+    # -t goes after the input so it applies to the output segment
+    if start_time is not None and end_time is not None:
+        try:
+            duration = max(1, float(end_time) - float(start_time))
+            cmd.extend(["-t", str(duration)])
+        except (ValueError, TypeError):
+            pass
+    elif end_time is not None:
+        cmd.extend(["-to", str(end_time)])
+    cmd.extend([
+        "-af", "loudnorm=I=-16:TP=-1.5:LRA=11:print_format=json",
+        "-f", "null",
+        "-",
+    ])
+
+    try:
+        result = subprocess.run(cmd, timeout=timeout_seconds, **_run_kwargs())
+    except subprocess.TimeoutExpired:
+        _append_log("FAIL", f"timeout after {timeout_seconds}s ({input_path})")
+        return None
+    except Exception as exc:
+        _append_log("FAIL", f"subprocess exception: {exc} ({input_path})")
+        return None
+
+    if result.returncode != 0:
+        # Truncar stderr para no saturar el log
+        short = (result.stderr or "").strip().splitlines()[-3:]
+        reason = " || ".join(s.strip() for s in short if s.strip())[:300]
+        _append_log("FAIL", f"rc={result.returncode} | {reason}")
+        return None
+
+    stderr = result.stderr or ""
+    # El filtro loudnorm imprime siempre un único bloque JSON cuyo primer key
+    # es ``input_i``. Un match no-greedy nos mantiene dentro de ese bloque
+    # incluso si ffmpeg imprime texto adicional después.
+    match = re.search(r'\{\s*"input_i".*?\}', stderr, re.DOTALL)
+    if not match:
+        _append_log("FAIL", "no JSON block in stderr")
+        return None
+
+    try:
+        data = json.loads(match.group(0))
+    except (ValueError, TypeError) as exc:
+        _append_log("FAIL", f"JSON decode error: {exc}")
+        return None
+
+    required = ("input_i", "input_tp", "input_lra", "input_thresh")
+    if not all(k in data for k in required):
+        _append_log("FAIL", f"missing keys: {sorted(set(required) - set(data.keys()))}")
+        return None
+
+    _append_log(
+        "OK",
+        f"I={data['input_i']} TP={data['input_tp']} LRA={data['input_lra']} "
+        f"thresh={data['input_thresh']} offset={data.get('target_offset', '?')}",
+    )
+    return data
+
