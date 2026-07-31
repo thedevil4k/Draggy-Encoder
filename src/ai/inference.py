@@ -168,7 +168,7 @@ class ONNXRUNTIMEInferenceEngine(AIInferenceEngine):
         except ImportError:
             logger.error(
                 "ONNX Runtime is not installed. Open Manage Dependencies → "
-                "Runtimes & Binaries to install it, or use Python 3.11–3.13 "
+                "Runtimes & Binaries to install it, or use Python 3.11–3.14 "
                 "for automatic download."
             )
             return False
@@ -436,7 +436,7 @@ class PyTorchInferenceEngine(AIInferenceEngine):
         except ImportError:
             logger.error(
                 "PyTorch is not installed. Open Manage Dependencies → "
-                "Runtimes & Binaries to install it, or use Python 3.11–3.13 "
+                "Runtimes & Binaries to install it, or use Python 3.11–3.14 "
                 "for automatic download."
             )
             return False
@@ -637,7 +637,15 @@ class FSR2Engine(AIInferenceEngine):
             return False
 
     def process_frame(self, frame: np.ndarray) -> np.ndarray:
-        """Upscale a BGR uint8 frame using FFmpeg libplacebo filter."""
+        """Upscale a BGR uint8 frame using FFmpeg libplacebo filter.
+
+        Rendimiento: lanza un proceso ffmpeg por frame. Intentamos un pipe
+        persistente (un solo Popen reutilizado) pero ``libplacebo`` es un
+        filtro con estado temporal (acumula frames para su ``frame_mixer``),
+        por lo que no emite salida hasta recibir más de un frame y el lector
+        bloquea. Hasta que el pipeline use la API por-lotes de libplacebo,
+        Popen por frame es la única vía correcta.
+        """
         if not self._loaded or not self._ffmpeg_path:
             raise RuntimeError("FSR 2.0 engine not loaded")
 
@@ -1002,8 +1010,23 @@ def create_inference_engine(
 
     # FSR engines don't need model files — pure algorithmic upscale
     if engine_id and engine_id.startswith("upscale-fsr"):
-        # FSR 2.0 requires FFmpeg full with libplacebo
-        if engine_id.endswith("-v2"):
+        if "fsr31" in engine_id:
+            # FSR 3.1: mode derivado del sufijo del engine id.
+            if engine_id.endswith("-interp"):
+                mode = "interpolate"
+            elif engine_id.endswith("-both"):
+                mode = "both"
+            else:
+                mode = "upscale"
+            try:
+                engine = FSR31Engine(model_path, engine_id, mode=mode)
+                if engine.load():
+                    return engine
+            except Exception as exc:
+                last_error = f"FSR 3.1 engine failed: {exc}"
+                logger.error(last_error)
+        elif engine_id.endswith("-v2"):
+            # FSR 2.0 requires FFmpeg full with libplacebo
             try:
                 engine = FSR2Engine(model_path, engine_id)
                 if engine.load():

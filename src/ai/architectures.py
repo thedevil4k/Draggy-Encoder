@@ -42,7 +42,7 @@ def _require_torch():
     if not _TORCH_AVAILABLE:
         raise ImportError(
             "PyTorch is not installed.  Install it from Manage Dependencies → "
-            "Runtimes & Binaries, or use Python 3.11–3.13 for automatic download."
+            "Runtimes & Binaries, or use Python 3.11–3.14 for automatic download."
         )
 
 

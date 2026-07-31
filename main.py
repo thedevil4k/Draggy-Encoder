@@ -4,6 +4,14 @@ import os
 # Asegurar que src/ esté en el path para imports
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+# Completar borrados pendientes (archivos DLL bloqueados por Windows en la
+# sesión anterior) ANTES de que nada importe torch/onnxruntime.
+try:
+    from src.dependencies import process_pending_cleanup
+    process_pending_cleanup()
+except Exception:
+    pass
+
 # Inyectar runtimes de IA locales (bin/runtimes/ai_modules) antes de que
 # cualquier otro módulo importe torch/onnxruntime. Así el usuario no
 # necesita instalarlos manualmente con pip.

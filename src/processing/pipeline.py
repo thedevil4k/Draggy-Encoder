@@ -109,7 +109,11 @@ def compress_video(ffmpeg_path, input_path, output_path, settings,
         except Exception as exc:
             logger.warning("ai_engines plumbing failed: %s", exc)
 
-    loudnorm_meas = _measure_if_needed(ffmpeg_path, input_path, settings, status_callback=status_callback)
+    loudnorm_meas = _measure_if_needed(
+        ffmpeg_path, input_path, settings, status_callback=status_callback,
+        start_time=settings.get("start_time"),
+        end_time=settings.get("end_time"),
+    )
     args = build_args(input_path, output_path, settings, loudnorm_meas=loudnorm_meas)
     return run_ffmpeg(
         ffmpeg_path,

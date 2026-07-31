@@ -135,10 +135,11 @@ def is_hf_hub_available() -> bool:
 
 
 class HFDownloadWorker(QThread):
-    """Download a HuggingFace repo via ``huggingface_hub.snapshot_download``.
+    """Download a HuggingFace repo via ``huggingface_hub``.
 
-    No git required. Handles LFS automatically. Supports resume (if the
-    download is interrupted, re-running will pick up where it left off).
+    No git required. Handles LFS automatically. Files are downloaded one
+    by one (``hf_hub_download``) so cancellation is honored between
+    files instead of only at the end of one big ``snapshot_download``.
 
     Signals:
         status(str)       - status text the UI renders near the button.
@@ -167,7 +168,7 @@ class HFDownloadWorker(QThread):
             return
 
         try:
-            from huggingface_hub import snapshot_download
+            from huggingface_hub import HfApi, hf_hub_download
         except ImportError:
             self.failed.emit(
                 "huggingface_hub is not installed.\n\n"
@@ -198,49 +199,55 @@ class HFDownloadWorker(QThread):
         except Exception:
             _token = None
 
-        # Pre-validate: some repos require a token for LFS files.
         if not _token:
-            self.status.emit("No HuggingFace token set — checking repo access...")
-            try:
-                from huggingface_hub import HfApi
-                _api = HfApi()
-                _info = _api.model_info(self.repo_id, files_metadata=True)
-                _siblings = getattr(_info, "siblings", []) or []
-                _has_lfs = any(getattr(s, "lfs", None) for s in _siblings)
-                if _has_lfs:
-                    self.failed.emit(
-                        f"The repo '{self.repo_id}' contains LFS files that "
-                        f"require authentication.\n\n"
-                        f"Go to Preferences > Behavior and add your free "
-                        f"HuggingFace token.\n\n"
-                        f"Get your token at:\n"
-                        f"https://huggingface.co/settings/tokens"
-                    )
-                    return
-            except Exception as exc:
-                err_msg = str(exc).lower()
-                if "does not support image input" in err_msg or "image.png" in err_msg:
-                    self.status.emit("Checking repo files (fallback)...")
-                    try:
-                        _files = _api.list_repo_files(self.repo_id)
-                        _siblings = list(_files) if _files else []
-                        _has_lfs = False
-                    except Exception:
-                        pass
-                # For other errors, proceed and let snapshot_download fail
-                # with a clear error message.
+            self.status.emit("No HuggingFace token set — public repos only.")
 
         try:
-            # Use local_dir to download directly into target_dir.
-            # allow_patterns=["*"] downloads all files including LFS.
-            # resume_download=True enables resumption of partial downloads.
-            result_path = snapshot_download(
-                repo_id=self.repo_id,
-                local_dir=self.target_dir,
-                local_dir_use_symlinks=False,
-                resume_download=True,
-                token=_token,
-            )
+            # Enumerate the repo's files so we can download them one by one
+            # (cancellable between files) instead of one big snapshot call.
+            repo_files = HfApi(token=_token).list_repo_files(self.repo_id)
+        except Exception as exc:
+            _cleanup_partial(self.target_dir)
+            exc_str = str(exc)
+            # Provide helpful hint for auth-related failures.
+            if "401" in exc_str or "403" in exc_str or "Access Denied" in exc_str:
+                exc_str += (
+                    "\n\nTip: This HuggingFace repo requires a token for "
+                    "LFS file downloads.\n\n"
+                    "1. Go to https://huggingface.co/settings/tokens\n"
+                    "2. Create a free token (read access is enough)\n"
+                    "3. Paste it in Preferences > Behavior > HuggingFace API Token"
+                )
+            self.failed.emit(f"Could not read repo file list: {exc_str}")
+            return
+
+        if not repo_files:
+            _cleanup_partial(self.target_dir)
+            self.failed.emit("Repo contains no files to download.")
+            return
+
+        total = len(repo_files)
+        try:
+            for idx, filename in enumerate(repo_files):
+                if self._cancel.is_set():
+                    _cleanup_partial(self.target_dir)
+                    self.failed.emit("cancelled by user")
+                    return
+                if total > 1:
+                    self.status.emit(
+                        f"Downloading {filename} ({idx + 1}/{total})..."
+                    )
+                else:
+                    self.status.emit(f"Downloading {self.repo_id}...")
+                self.progress.emit(5 + int(90 * idx / total))
+                # hf_hub_download handles LFS transparently and resumes
+                # partial files by default via the local cache.
+                hf_hub_download(
+                    repo_id=self.repo_id,
+                    filename=filename,
+                    local_dir=self.target_dir,
+                    token=_token,
+                )
         except Exception as exc:
             _cleanup_partial(self.target_dir)
             exc_str = str(exc)

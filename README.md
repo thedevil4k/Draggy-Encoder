@@ -60,7 +60,7 @@ DRAGGY_ENCODER/
 
 ## Requirements
 
-- Python 3.9–3.13
+- Python 3.9–3.14
 - GPU recommended for AI upscaling (NVIDIA CUDA or AMD Vulkan)
 - Git (for model downloads; fallback to huggingface_hub if unavailable)
 

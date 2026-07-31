@@ -128,6 +128,7 @@ class EngineRow(QFrame):
     fsr2_download_requested = Signal(str)
     convert_requested = Signal(str)
     open_folder = Signal(str)
+    remove_requested = Signal(str)
 
     def __init__(self, engine: dict, parent=None):
         super().__init__(parent)
@@ -158,6 +159,19 @@ class EngineRow(QFrame):
             color: #0f0f1a;
         }
         #EngineRow QPushButton:disabled {
+            background-color: #2c3e50;
+            color: #5f6f7f;
+        }
+        #EngineRow QPushButton#removeBtn {
+            background-color: #3a1620;
+            color: #ff6b6b;
+            border: 1px solid #6e2233;
+        }
+        #EngineRow QPushButton#removeBtn:hover {
+            background-color: #e74c3c;
+            color: #ffffff;
+        }
+        #EngineRow QPushButton#removeBtn:disabled {
             background-color: #2c3e50;
             color: #5f6f7f;
         }
@@ -296,7 +310,7 @@ class EngineRow(QFrame):
         is_fsr2 = eng.get("engine_id", "").endswith("-v2")
         is_fsr31 = "fsr31" in eng.get("engine_id", "")
 
-        state_text = self._state_label(installed, converted, is_fsr, is_fsr2)
+        state_text = self._state_label(installed, converted, is_fsr, is_fsr2, is_fsr31)
         state_lbl = QLabel(state_text)
         # Inline the stylesheet so a stale .pyc or import problem cannot
         # trigger "'EngineRow' object has no attribute '_state_stylesheet'".
@@ -345,11 +359,20 @@ class EngineRow(QFrame):
         right.setSpacing(6)
 
         # Primary: Add Engine / Reinstall / Open Folder
-        self.btn_install = QPushButton(self._install_label(installed, is_fsr, is_fsr2))
+        self.btn_install = QPushButton(self._install_label(installed, is_fsr, is_fsr2, is_fsr31))
         self.btn_install.setObjectName("primaryBtn")
         if not implemented:
             self.btn_install.setEnabled(False)
             self.btn_install.setText("Coming soon")
+        elif is_fsr31:
+            if installed:
+                self.btn_install.setEnabled(False)
+                self.btn_install.setText("Ready")
+                self.btn_install.setToolTip("FSR 3.1 is ready — FFmpeg full with libplacebo is available.")
+            else:
+                self.btn_install.setEnabled(True)
+                self.btn_install.setText("Download FFmpeg")
+                self.btn_install.setToolTip("FSR 3.1 requires FFmpeg full with libplacebo. Click to download.")
         elif is_fsr and not is_fsr2:
             self.btn_install.setEnabled(False)
             self.btn_install.setText("Built-in")
@@ -390,6 +413,24 @@ class EngineRow(QFrame):
         self.btn_open.clicked.connect(self._on_open_clicked)
         right.addWidget(self.btn_open)
 
+        # Remove installed weights / binary (borrar desde la app).
+        is_fsr1 = is_fsr and not is_fsr2 and not is_fsr31
+        can_remove = installed and not is_fsr1
+        self.btn_remove = QPushButton("Remove")
+        self.btn_remove.setObjectName("removeBtn")
+        self.btn_remove.setEnabled(can_remove)
+        if is_fsr2 or is_fsr31:
+            self.btn_remove.setToolTip(
+                "Removes the FFmpeg full (libplacebo) build and uninstalls "
+                "this engine (affects all FSR 2.0 / FSR 3.1 engines)."
+            )
+        else:
+            self.btn_remove.setToolTip(
+                "Deletes the downloaded model weights from the program folder."
+            )
+        self.btn_remove.clicked.connect(self._on_remove_clicked)
+        right.addWidget(self.btn_remove)
+
         # "View similar on OpenModelDB" — solo si el catalog entry declara
         # ``similar_models_url``. Abre la URL en el navegador del usuario
         # para descubrir variantes / forks / nuevos escalados del mismo
@@ -418,21 +459,21 @@ class EngineRow(QFrame):
 
     # -- helpers ----------------------------------------------------------
 
-    def _state_label(self, installed: bool, converted: bool, is_fsr: bool = False, is_fsr2: bool = False) -> str:
+    def _state_label(self, installed: bool, converted: bool, is_fsr: bool = False, is_fsr2: bool = False, is_fsr31: bool = False) -> str:
         if not installed:
             return "NOT INSTALLED"
+        if is_fsr31:
+            return "FSR 3.1 (GPU)"
         if is_fsr2:
             return "FSR 2.0 (GPU)"
-        if is_fsr and "fsr31" in (self.engine.get("engine_id", "")):
-            return "FSR 3.1 (GPU)"
         if is_fsr:
             return "FSR 1.0 (CPU)"
         if converted:
             return "INSTALLED · ONNX"
         return "INSTALLED"
 
-    def _install_label(self, installed: bool, is_fsr: bool = False, is_fsr2: bool = False) -> str:
-        if is_fsr and "fsr31" in (self.engine.get("engine_id", "")):
+    def _install_label(self, installed: bool, is_fsr: bool = False, is_fsr2: bool = False, is_fsr31: bool = False) -> str:
+        if is_fsr31:
             return "Download FFmpeg" if not installed else "Ready"
         if is_fsr and not is_fsr2:
             return "Built-in"
@@ -465,6 +506,9 @@ class EngineRow(QFrame):
 
     def _on_convert_clicked(self) -> None:
         self.convert_requested.emit(self.engine.get("engine_id", ""))
+
+    def _on_remove_clicked(self) -> None:
+        self.remove_requested.emit(self.engine.get("engine_id", ""))
 
     def _on_open_clicked(self) -> None:
         path = self.engine.get("install_dir") or ""

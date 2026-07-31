@@ -25,6 +25,8 @@ from PySide6.QtWidgets import (
 )
 
 import logging
+import platform
+import subprocess
 
 from src.ai.hf_search import get_inference_engines, search_catalog_models
 from src.ui.model_search_result import ModelSearchResult
@@ -43,6 +45,13 @@ class _SearchWorker(QThread):
         self._engine = engine_filter
         self._category = category_filter
         self._query = query
+        self._cancel = False
+
+    def cancel(self) -> None:
+        """Solicita la cancelación. ``search_catalog_models`` no es
+        interrumpible a mitad (bloquea en la API de HF), pero con el flag
+        no emitimos resultados tras un cierre del diálogo."""
+        self._cancel = True
 
     def run(self) -> None:
         try:
@@ -52,6 +61,8 @@ class _SearchWorker(QThread):
                 query=self._query or "",
                 engine_id=self._engine or None,
             )
+            if self._cancel:
+                return
             logger.info("SearchWorker: got %d results", len(results or []))
             self.done.emit(results or [])
         except Exception as exc:
@@ -218,10 +229,22 @@ class ModelSearchDialog(QDialog):
         category = self.combo_category.currentData()
         query = self.search_input.text().strip()
 
-        self._worker = _SearchWorker(engine_filter=engine_id, category_filter=category, query=query)
+        self._worker = _SearchWorker(engine_filter=engine_id, category_filter=category, query=query, parent=self)
         self._worker.done.connect(self._on_results)
         self._worker.error.connect(self._on_error)
         self._worker.start()
+
+    def done(self, result: int) -> None:
+        """Cualquier cierre del diálogo (X, Esc, aceptar, reject) debe
+        cancelar el worker de búsqueda y esperarlo: con ``WA_DeleteOnClose``
+        un QThread vivo destruido por Qt crashea ("QThread destroyed while
+        still running"). La búsqueda no es interrumpible a mitad, así que
+        esperamos un tiempo acotado y seguimos."""
+        worker = self._worker
+        if worker is not None and worker.isRunning():
+            worker.cancel()
+            worker.wait(3000)
+        super().done(result)
 
     def _on_results(self, results: list[dict]) -> None:
         logger.info("ModelSearchDialog: received %d raw results", len(results))
@@ -303,6 +326,9 @@ class ModelSearchDialog(QDialog):
         for m in models:
             card = ModelSearchResult(m)
             card.install_requested.connect(self._on_install)
+            card.convert_requested.connect(self._on_convert)
+            card.enable_toggled.connect(self._on_enable_toggled)
+            card.open_folder.connect(self._on_open_folder)
             self.results_layout.addWidget(card)
 
         self.results_layout.addStretch()
@@ -314,6 +340,39 @@ class ModelSearchDialog(QDialog):
                 self.model_selected.emit(m)
                 self.accept()
                 return
+
+    def _on_convert(self, engine_id: str) -> None:
+        """Convert: reusa el flujo de selección — el modelo se devuelve y
+        el caller abre el DependenciesDialog, donde está el botón de
+        conversión para el estado real del engine."""
+        self._on_install(engine_id)
+
+    def _on_enable_toggled(self, engine_id: str, checked: bool) -> None:
+        """Persistir el toggle Enabled directamente (sin cerrar el dialog)."""
+        try:
+            from src.ai.engines_state import patch
+            patch(engine_id, enabled=bool(checked))
+        except Exception as exc:
+            logger.warning("Failed to persist enable toggle for %s: %s", engine_id, exc)
+
+    def _on_open_folder(self, engine_id: str) -> None:
+        """Abrir la carpeta local del modelo sin cerrar el dialog."""
+        try:
+            from src.ai.registry import get_engine_dir
+            path = get_engine_dir(engine_id)
+        except Exception:
+            path = None
+        if not path or not os.path.isdir(path):
+            return
+        try:
+            if platform.system() == "Windows":
+                os.startfile(path)  # noqa: S606
+            elif platform.system() == "Darwin":
+                subprocess.Popen(["open", path])
+            else:
+                subprocess.Popen(["xdg-open", path])
+        except Exception as exc:
+            logger.warning("Failed to open folder for %s: %s", engine_id, exc)
 
     def _show_loading(self, loading: bool) -> None:
         if loading:

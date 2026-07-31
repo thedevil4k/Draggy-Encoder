@@ -208,7 +208,7 @@ def get_fingerprint(platform_name=None, force=False):
         return cache
 
     resp = _head(url)
-    if resp.status_code >= 400:
+    if resp.status_code == 0 or resp.status_code >= 400:
         # Red caída / upstream caído → conservar cache, anotar error con
         # mensaje accionable (excepción subyacente si la hay).
         cache["url"] = url
@@ -262,6 +262,13 @@ def is_update_available(local_manifest, fingerprint):
     # Sin datos upstream → no podemos decidir
     if not (upstream_lm or upstream_cl or upstream_etag):
         return None
+
+    # Instalación manual (el usuario copió el binario a mano): no hay
+    # referencia de huella instalada ni modo de comparar — no declarar
+    # "update available" para siempre. El manifest manual se distingue
+    # de un manifest vacío {} (que sí sugiere update conservador).
+    if (local_manifest or {}).get("source") == "manual-copy":
+        return False
 
     # Sin huella de instalación Y tenemos huella upstream → conservador: Sí,
     # salvo que sepamos que el upstream estuvo caído (en ese caso no mentimos).

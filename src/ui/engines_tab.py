@@ -34,6 +34,7 @@ class _CategorySection(QWidget):
     fsr2_download_requested = Signal(str)
     convert_requested = Signal(str)
     open_folder = Signal(str)
+    remove_requested = Signal(str)
 
     def __init__(self, category: str, engines: list[dict], parent=None):
         super().__init__(parent)
@@ -55,6 +56,7 @@ class _CategorySection(QWidget):
                 row.fsr2_download_requested.connect(self.fsr2_download_requested.emit)
                 row.convert_requested.connect(self.convert_requested.emit)
                 row.open_folder.connect(self.open_folder.emit)
+                row.remove_requested.connect(self.remove_requested.emit)
                 layout.addWidget(row)
             except Exception as exc:
                 # A single broken engine row must not break the whole panel.
@@ -78,6 +80,7 @@ class EnginesTab(QWidget):
     fsr2_download_requested = Signal(str)      # engine_id (FSR 2.0)
     convert_requested = Signal(str)            # engine_id
     open_folder = Signal(str)                  # engine_id
+    remove_requested = Signal(str)             # engine_id
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -134,6 +137,7 @@ class EnginesTab(QWidget):
                 section.fsr2_download_requested.connect(self.fsr2_download_requested.emit)
                 section.convert_requested.connect(self.convert_requested.emit)
                 section.open_folder.connect(self.open_folder.emit)
+                section.remove_requested.connect(self.remove_requested.emit)
                 container_layout.addWidget(section)
                 self._section_widgets.append(section)
             except Exception as exc:
@@ -196,8 +200,10 @@ class EnginesTab(QWidget):
             try:
                 section = _CategorySection(cat, groups[cat], parent=container)
                 section.install_requested.connect(self.install_requested.emit)
+                section.fsr2_download_requested.connect(self.fsr2_download_requested.emit)
                 section.convert_requested.connect(self.convert_requested.emit)
                 section.open_folder.connect(self.open_folder.emit)
+                section.remove_requested.connect(self.remove_requested.emit)
                 layout.addWidget(section)
                 self._section_widgets.append(section)
             except Exception as exc:

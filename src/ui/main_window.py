@@ -258,7 +258,7 @@ class CompressionWorker(QThread):
                                 errors.append(
                                     "PyTorch is not installed (required to convert .pth models to ONNX). "
                                     "Install via Manage Dependencies → Runtimes & Binaries, "
-                                    "or use Python 3.11-3.13 for automatic download."
+                                    "or use Python 3.11-3.14 for automatic download."
                                 )
 
                         # 3) If ONNX didn't work, try PyTorch direct (needs torch).
@@ -959,6 +959,20 @@ class MainWindow(QMainWindow):
             self._abort_running_worker(cleanup_partial_output=True)
             self._cleanup_after_abort()
 
+        # Banner FFmpeg update en vuelo: NO destruir el QThread mientras
+        # corre. Marcamos _close_pending para que _on_banner_update_finished
+        # cierre limpio al terminar (o informe del fallo y cierre igualmente).
+        # Este guard va ANTES de _collect_pending_close_updates para que el
+        # dialog de update-chain no arranque una descarga concurrente del
+        # mismo binario.
+        if (
+            getattr(self, "_banner_update_worker", None) is not None
+            and self._banner_update_worker.isRunning()
+        ):
+            self._close_pending = True
+            event.ignore()
+            return
+
         if self._close_followup_complete:
             super().closeEvent(event)
             return
@@ -1237,6 +1251,7 @@ class MainWindow(QMainWindow):
                         job_settings,
                         job_mode,
                         ai_engines=job_ai_engines,
+                        input_path=input_path,
                     )
                     return
                 # input_path desapareció mid-update: skip silencioso del
@@ -1586,14 +1601,19 @@ class MainWindow(QMainWindow):
         )
         self._run_worker(None, settings, mode="preview", ai_engines=ai_engines)
 
-    def _run_worker(self, output_path, settings, mode, ai_engines=None):
+    def _run_worker(self, output_path, settings, mode, ai_engines=None, input_path=None):
         self.btn_compress.setEnabled(False)
         self.btn_preview.setEnabled(False)
         self.btn_abort.setEnabled(True)
         self.progress.setValue(0)
 
+        # Normal path: the currently selected video. Followup path: the
+        # job's original input (the selection may have changed while the
+        # update chain was running).
+        src = input_path if input_path is not None else self.input_path
+
         self.worker = CompressionWorker(
-            self.ffmpeg_path, self.input_path, output_path, settings,
+            self.ffmpeg_path, src, output_path, settings,
             mode=mode, ai_engines=ai_engines,
         )
         self.worker.progress.connect(self.progress.setValue)

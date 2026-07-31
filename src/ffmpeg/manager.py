@@ -517,6 +517,34 @@ def _manifest_from_binary(ffmpeg_path):
     }
 
 
+def uninstall(parent=None):
+    """Borra la instalación local de FFmpeg (binarios + manifest + cache).
+
+    La app lo re-descarga automáticamente en el próximo arranque
+    (``app.py`` → ``ensure_ffmpeg``). Si algún archivo está bloqueado
+    (render en curso), ``dependencies._rmtree_force`` lo programa para
+    el próximo arranque.
+    """
+    try:
+        from src.dependencies import _rmtree_force
+    except Exception:
+        return
+    ffmpeg_dir = get_ffmpeg_dir()
+    if os.path.isdir(ffmpeg_dir):
+        _rmtree_force(ffmpeg_dir)
+
+
+def uninstall_full(parent=None):
+    """Borra la instalación de FFmpeg 'full' (libplacebo, FSR 2.0/3.1)."""
+    try:
+        from src.dependencies import _rmtree_force
+    except Exception:
+        return
+    full_dir = get_ffmpeg_full_dir()
+    if os.path.isdir(full_dir):
+        _rmtree_force(full_dir)
+
+
 # ---------------------------------------------------------------------------
 # Compatibilidad con código existente
 # ---------------------------------------------------------------------------

@@ -87,13 +87,13 @@ def _is_python_version_supported() -> bool:
 
     PyTorch y ONNX Runtime suelen tardar en publicar wheels para las
     versiones más nuevas de Python. A día de hoy (2026) el soporte
-    estable es 3.9–3.13. Python 3.14 todavía puede no tener wheels.
+    estable es 3.9–3.14.
     """
     major = sys.version_info.major
     minor = sys.version_info.minor
     if major != 3:
         return False
-    return 9 <= minor <= 13
+    return 9 <= minor <= 14
 
 
 def get_python_support_info() -> dict:
@@ -111,7 +111,7 @@ def get_python_support_info() -> dict:
         "short": short,
         "message": (
             f"Python {short} is NOT supported by official PyTorch/ONNX wheels yet. "
-            "Please use Python 3.11–3.13, or build the PyInstaller bundle with one of those versions. "
+            "Please use Python 3.11–3.14, or build the PyInstaller bundle with one of those versions. "
             "AI upscaling/interpolation/colorize will be disabled."
         ),
     }
@@ -122,13 +122,26 @@ def get_python_support_info() -> dict:
 # ---------------------------------------------------------------------------
 
 
+def _default_gpu_variant() -> str:
+    """Variant CUDA por defecto según la versión de Python en uso.
+
+    PyTorch publica wheels CUDA por versión de Python: en 3.14 los wheels
+    oficiales son cu126/cu130; en 3.9–3.13 seguimos en cu121 (comportamiento
+    histórico, no romper a usuarios existentes).
+    """
+    minor = sys.version_info.minor
+    if minor >= 14:
+        return "cuda130"
+    return "cuda121"
+
+
 def _resolve_variant(variant: str) -> str:
-    """Resuelve 'auto' a cpu/cuda121/cuda118."""
+    """Resuelve 'auto' a cpu/cuda121/cuda118/cuda126/cuda130."""
     if variant == "auto":
         if _has_nvidia_gpu():
-            return "cuda121"
+            return _default_gpu_variant()
         return "cpu"
-    if variant in ("cpu", "cuda118", "cuda11.8", "cuda121"):
+    if variant in ("cpu", "cuda118", "cuda11.8", "cuda121", "cuda126", "cuda130"):
         if variant == "cuda11.8":
             return "cuda118"
         return variant
@@ -142,6 +155,10 @@ def _build_pytorch_command(variant: str) -> list[str]:
         index_url = "https://download.pytorch.org/whl/cpu"
     elif variant == "cuda118":
         index_url = "https://download.pytorch.org/whl/cu118"
+    elif variant == "cuda126":
+        index_url = "https://download.pytorch.org/whl/cu126"
+    elif variant == "cuda130":
+        index_url = "https://download.pytorch.org/whl/cu130"
     else:  # cuda121
         index_url = "https://download.pytorch.org/whl/cu121"
 
@@ -229,7 +246,7 @@ def _raise_unsupported_python() -> None:
     short = _python_short()
     raise RuntimeError(
         f"Python {short} no tiene wheels oficiales de PyTorch/ONNX todavía. "
-        "Por favor, usa Python 3.9–3.13 para que la descarga funcione, "
+        "Por favor, usa Python 3.9–3.14 para que la descarga funcione, "
         "o instala torch/onnxruntime manualmente en este entorno."
     )
 
@@ -242,12 +259,12 @@ def install_runtimes(
     """Instala PyTorch y ONNX Runtime en ``bin/runtimes/ai_modules``.
 
     Args:
-        variant: "cpu", "cuda118", "cuda121" o "auto".
+        variant: "cpu", "cuda118", "cuda121", "cuda126", "cuda130" o "auto".
         progress_callback: callable(percent, message) -> None.
         parent: QWidget padre (no usado actualmente, reservado).
 
     Returns:
-        El variant real usado ("cpu", "cuda121", ...).
+        El variant real usado ("cpu", "cuda121", "cuda130", ...).
     """
     if not _is_python_version_supported():
         _raise_unsupported_python()
@@ -345,6 +362,21 @@ def onnx_status() -> dict:
 def install_all(progress_callback=None, parent=None, variant: str = "auto") -> None:
     """Instala PyTorch + ONNX en un solo comando."""
     install_runtimes(variant=variant, progress_callback=progress_callback, parent=parent)
+
+
+def uninstall_local_runtimes(parent=None) -> None:
+    """Borra el store local de runtimes (``bin/runtimes/ai_modules``) completo.
+
+    PyTorch y ONNX Runtime se instalan juntos ahí, así que el borrado es
+    conjunto. En Windows, si algún DLL está cargado (runtime ya importado),
+    ``dependencies._rmtree_force`` lo programa para el próximo arranque.
+    """
+    try:
+        from src.dependencies import _rmtree_force
+    except Exception:
+        return
+    if os.path.isdir(RUNTIME_MODULES_DIR):
+        _rmtree_force(RUNTIME_MODULES_DIR)
 
 
 def get_status() -> dict:

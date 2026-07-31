@@ -24,7 +24,7 @@ import subprocess
 from datetime import datetime
 
 from src.config import get_bin_dir
-from src.ffmpeg.runner import _run_kwargs
+from src.ffmpeg.runner import _parse_time_to_seconds, _run_kwargs
 
 
 def _log_dir():
@@ -71,18 +71,18 @@ def measure_loudness(ffmpeg_path, input_path, timeout_seconds=600,
         status_callback("Analyzing audio levels...")
 
     cmd = [ffmpeg_path, "-hide_banner", "-nostats"]
-    if start_time is not None:
-        cmd.extend(["-ss", str(start_time)])
+    # Normalizar a segundos con el mismo parser que build_args para que el
+    # recorte medido coincida exactamente con el segmento a codificar
+    # (soporta "HH:MM:SS" y números).
+    start_sec = _parse_time_to_seconds(start_time)
+    end_sec = _parse_time_to_seconds(end_time)
+    if start_sec is not None:
+        cmd.extend(["-ss", str(start_sec)])
     cmd.extend(["-i", input_path])
-    # -t goes after the input so it applies to the output segment
-    if start_time is not None and end_time is not None:
-        try:
-            duration = max(1, float(end_time) - float(start_time))
-            cmd.extend(["-t", str(duration)])
-        except (ValueError, TypeError):
-            pass
-    elif end_time is not None:
-        cmd.extend(["-to", str(end_time)])
+    if start_sec is not None and end_sec is not None and end_sec > start_sec:
+        cmd.extend(["-t", str(end_sec - start_sec)])
+    elif end_sec is not None:
+        cmd.extend(["-to", str(end_sec)])
     cmd.extend([
         "-af", "loudnorm=I=-16:TP=-1.5:LRA=11:print_format=json",
         "-f", "null",

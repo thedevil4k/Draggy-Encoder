@@ -233,10 +233,10 @@ class ModelSearchResult(QFrame):
         middle.addLayout(pop_row)
 
         # State badge
-        state_text = self._state_label(installed, enabled, onnx_converted, is_fsr, is_fsr2)
+        state_text = self._state_label(installed, enabled, onnx_converted, is_fsr, is_fsr2, is_fsr31)
         state_lbl = QLabel(state_text)
         state_lbl.setObjectName("stateBadge")
-        state_lbl.setStyleSheet(self._state_stylesheet(installed, enabled, onnx_converted, is_fsr, is_fsr2))
+        state_lbl.setStyleSheet(self._state_stylesheet(installed, enabled, onnx_converted, is_fsr, is_fsr2, is_fsr31))
         state_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
         state_lbl.setMaximumWidth(180)
         middle.addWidget(state_lbl, alignment=Qt.AlignmentFlag.AlignLeft)
@@ -248,20 +248,20 @@ class ModelSearchResult(QFrame):
         right.setSpacing(6)
 
         # Primary button: Install / Re-clone / Open folder
-        self.btn_install = QPushButton(self._install_label(installed, is_fsr, is_fsr2, is_fsr3))
+        self.btn_install = QPushButton(self._install_label(installed, is_fsr, is_fsr2, is_fsr31))
         self.btn_install.setObjectName("primaryBtn")
         if not eng.get("is_implemented", False):
             self.btn_install.setEnabled(False)
             self.btn_install.setText("Coming soon")
-        elif is_fsr311:
+        elif is_fsr31:
             if installed:
                 self.btn_install.setEnabled(False)
                 self.btn_install.setText("Ready")
-                self.btn_install.setToolTip("FSR 3.0 is ready — FFmpeg full with libplacebo is available.")
+                self.btn_install.setToolTip("FSR 3.1 is ready — FFmpeg full with libplacebo is available.")
             else:
                 self.btn_install.setEnabled(True)
                 self.btn_install.setText("Download FFmpeg")
-                self.btn_install.setToolTip("FSR 3.0 requires FFmpeg full with libplacebo. Click to download.")
+                self.btn_install.setToolTip("FSR 3.1 requires FFmpeg full with libplacebo. Click to download.")
         elif is_fsr and not is_fsr2:
             self.btn_install.setEnabled(False)
             self.btn_install.setText("Built-in")

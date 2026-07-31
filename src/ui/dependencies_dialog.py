@@ -67,6 +67,19 @@ _STATUS_COLORS = {
 }
 
 
+def _fmt_bytes(n):
+    """Formatea bytes a una unidad legible (B/KB/MB/GB/TB)."""
+    try:
+        n = float(n or 0)
+    except (TypeError, ValueError):
+        return "0 B"
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if abs(n) < 1024.0 or unit == "TB":
+            return f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}"
+        n /= 1024.0
+    return f"{n:.1f} PB"
+
+
 def _format_latest_line(info):
     """Devuelve el texto "Latest: … · last check: …" para la columna Latest."""
     fp = info.get("latest_fingerprint") or {}
@@ -120,6 +133,43 @@ class _ReinstallWorker(QThread):
             self.failed.emit(self.dep_id, str(exc))
 
 
+class _UninstallWorker(QThread):
+    """Hilo separado para borrar una dependencia sin congelar la UI."""
+
+    finished_ok = Signal(str)         # dep_id
+    failed = Signal(str, str)         # dep_id, mensaje
+
+    def __init__(self, dep_id, parent=None):
+        super().__init__(parent)
+        self.dep_id = dep_id
+
+    def run(self):
+        try:
+            dependencies.uninstall(self.dep_id, parent=self.parent())
+            self.finished_ok.emit(self.dep_id)
+        except Exception as exc:
+            self.failed.emit(self.dep_id, str(exc))
+
+
+class _EngineRemoveWorker(QThread):
+    """Borra los archivos de un motor IA (modelos / FFmpeg full) en segundo plano."""
+
+    finished_ok = Signal(str)         # engine_id
+    failed = Signal(str, str)         # engine_id, mensaje
+
+    def __init__(self, engine_id, remove_fn, parent=None):
+        super().__init__(parent)
+        self.engine_id = engine_id
+        self.remove_fn = remove_fn
+
+    def run(self):
+        try:
+            self.remove_fn()
+            self.finished_ok.emit(self.engine_id)
+        except Exception as exc:
+            self.failed.emit(self.engine_id, str(exc))
+
+
 class _UpstreamCheckWorker(QThread):
     """Hilo independiente para refrescar la huella del upstream."""
 
@@ -148,6 +198,7 @@ class _DepRow(QFrame):
     """Una fila con el estado + versión + acciones de una dependencia."""
 
     redownload_requested = Signal(str)
+    uninstall_requested = Signal(str)
 
     def __init__(self, info, parent=None):
         super().__init__(parent)
@@ -175,6 +226,19 @@ class _DepRow(QFrame):
             color: #0f0f1a;
         }
         #DepRow QPushButton:disabled {
+            background-color: #2c3e50;
+            color: #5f6f7f;
+        }
+        #DepRow QPushButton#uninstallBtn {
+            background-color: #3a1620;
+            color: #ff6b6b;
+            border: 1px solid #6e2233;
+        }
+        #DepRow QPushButton#uninstallBtn:hover {
+            background-color: #e74c3c;
+            color: #ffffff;
+        }
+        #DepRow QPushButton#uninstallBtn:disabled {
             background-color: #2c3e50;
             color: #5f6f7f;
         }
@@ -301,6 +365,10 @@ class _DepRow(QFrame):
         support = self._ai_runtime_support_info(info)
         self.btn_primary = QPushButton(primary_label)
         self.btn_primary.setEnabled(self._primary_enabled(info, support=support))
+        if info.get("kind") == dependencies.KIND_MODEL:
+            self.btn_primary.setToolTip(
+                "Add or remove individual engines from the 'AI Engines' tab."
+            )
         if info.get("update_available") is True:
             self.btn_primary.setStyleSheet(
                 "QPushButton { background-color: #f39c12; color: #0f0f1a; "
@@ -318,6 +386,24 @@ class _DepRow(QFrame):
         self.btn_open.clicked.connect(lambda: self._open_path(info.get("install_dir")))
         btn_row.addWidget(self.btn_open)
 
+        # Desinstalar / borrar lo instalado (binarios, runtimes, modelos).
+        can_uninstall = bool(info.get("deletable")) and info.get(
+            "status"
+        ) == dependencies.STATUS_INSTALLED
+        self.btn_uninstall = QPushButton("Uninstall")
+        self.btn_uninstall.setObjectName("uninstallBtn")
+        self.btn_uninstall.setEnabled(can_uninstall)
+        if not can_uninstall:
+            self.btn_uninstall.setToolTip(
+                "Nothing installed to remove, or it cannot be removed from the app."
+            )
+        self.btn_uninstall.clicked.connect(
+            lambda: self.uninstall_requested.emit(
+                info.get("id") or info.get("display_name")
+            )
+        )
+        btn_row.addWidget(self.btn_uninstall)
+
         right.addLayout(btn_row)
         right.addStretch()
         outer.addLayout(right)
@@ -331,6 +417,12 @@ class _DepRow(QFrame):
         }.get(status, status or "—")
 
     def _primary_label(self, info):
+        # Ranuras que no tienen instalador automático desde este panel:
+        # los modelos se gestionan en la pestaña AI Engines.
+        if not info.get("is_updatable"):
+            if info.get("kind") == dependencies.KIND_MODEL:
+                return "Unavailable"
+            return "Unavailable"
         # Si upstream sugiere build más reciente y está instalado,
         # el botón principal pasa a ser "Update" en lugar de "Reinstall".
         if (
@@ -398,6 +490,7 @@ class DependenciesDialog(QDialog):
         )
         self._row_widgets = []
         self._active_worker = None
+        self._uninstall_worker = None
         self._upstream_worker = None
         self._check_force_next = False
         # Workers de la pestaña AI Engines (lazy init en cada handler:
@@ -406,6 +499,8 @@ class DependenciesDialog(QDialog):
         self._onnx_worker = None
         # Worker de descarga de FFmpeg "full" para FSR 2.0 (libplacebo).
         self._fsr2_worker = None
+        # Worker de borrado de motores IA (modelos / FFmpeg full).
+        self._remove_worker = None
         # Tab a enfocar en el primer paint ("ai_engines" o "binaries").
         self._initial_tab = initial_tab
         # Escuchamos el bus de estado para repintar la pestaña AI Engines
@@ -542,6 +637,7 @@ class DependenciesDialog(QDialog):
             tab.fsr2_download_requested.connect(self._on_fsr2_download)
             tab.convert_requested.connect(self._on_engine_convert)
             tab.open_folder.connect(self._on_engine_open_folder)
+            tab.remove_requested.connect(self._on_engine_remove)
             return tab
         except Exception as exc:
             logger.exception("Failed to build AI Engines tab")
@@ -557,6 +653,7 @@ class DependenciesDialog(QDialog):
         for info in dependencies.list_all():
             row = _DepRow(info, parent=self.container)
             row.redownload_requested.connect(self._on_redownload_requested)
+            row.uninstall_requested.connect(self._on_uninstall_requested)
             self.container_layout.insertWidget(self.container_layout.count() - 1, row)
             self._row_widgets.append(row)
 
@@ -680,6 +777,77 @@ class DependenciesDialog(QDialog):
             f"No se pudo reinstalar '{dep_id}':\n\n{msg}",
         )
 
+    # -----------------------------------------------------------------
+    # Uninstall (borrar lo instalado: binarios / runtimes / modelos)
+    # -----------------------------------------------------------------
+
+    def _render_in_progress(self) -> bool:
+        """True si MainWindow tiene un CompressionWorker activo."""
+        try:
+            mw = self.parent()
+            w = getattr(mw, "worker", None)
+            if w is not None and w.isRunning():
+                return True
+        except Exception:
+            pass
+        return False
+
+    def _on_uninstall_requested(self, dep_id):
+        if not dep_id:
+            return
+        if self._uninstall_worker and self._uninstall_worker.isRunning():
+            QMessageBox.information(
+                self, "Busy", "Otro borrado está en curso. Espera a que termine."
+            )
+            return
+        if self._render_in_progress():
+            QMessageBox.warning(
+                self, "Render in progress",
+                "No se puede desinstalar mientras hay un render/compresión en curso.\n"
+                "Espera a que termine antes de continuar.",
+            )
+            return
+
+        info = next(
+            (d for d in dependencies.list_all() if d.get("id") == dep_id), None
+        )
+        path = (info or {}).get("install_dir") or dep_id
+        size = (info or {}).get("size_bytes", 0) or 0
+        size_txt = f" (~{_fmt_bytes(size)})" if size else ""
+
+        confirm = QMessageBox.question(
+            self,
+            "Uninstall dependency",
+            f"¿Seguro que quieres borrar '{dep_id}'?\n\n"
+            f"Se eliminará de forma permanente desde:\n  {path}{size_txt}\n\n"
+            "Esta acción no se puede deshacer.",
+        )
+        if confirm != QMessageBox.StandardButton.Yes:
+            return
+
+        self._uninstall_worker = _UninstallWorker(dep_id, parent=self)
+        self._uninstall_worker.finished_ok.connect(self._on_uninstall_finished)
+        self._uninstall_worker.failed.connect(self._on_uninstall_failed)
+        self._uninstall_worker.start()
+
+    def _on_uninstall_finished(self, dep_id):
+        self._uninstall_worker = None
+        QMessageBox.information(
+            self, "Done", f"'{dep_id}' se ha desinstalado correctamente."
+        )
+        self._populate()
+        self._refresh_engines_tab()
+
+    def _on_uninstall_failed(self, dep_id, msg):
+        self._uninstall_worker = None
+        QMessageBox.critical(
+            self, "Uninstall failed",
+            f"No se pudo desinstalar '{dep_id}':\n\n{msg}\n\n"
+            "Si algún archivo está en uso, el borrado se completará en el "
+            "próximo arranque de la aplicación.",
+        )
+        self._populate()
+
     # ====================================================================
     # AI Engines tab handlers
     # ====================================================================
@@ -726,6 +894,7 @@ class DependenciesDialog(QDialog):
         self.engines_tab.fsr2_download_requested.connect(self._on_fsr2_download)
         self.engines_tab.convert_requested.connect(self._on_engine_convert)
         self.engines_tab.open_folder.connect(self._on_engine_open_folder)
+        self.engines_tab.remove_requested.connect(self._on_engine_remove)
         self.tabs.insertTab(current_index, self.engines_tab, "AI Engines")
         self.tabs.setCurrentIndex(current_index)
 
@@ -1085,6 +1254,107 @@ class DependenciesDialog(QDialog):
             QMessageBox.warning(self, "Open folder",
                                 f"Could not open the engine folder:\n{exc}")
 
+    # -----------------------------------------------------------------
+    # Remove engine (borrar modelos / FFmpeg full desde la app)
+    # -----------------------------------------------------------------
+
+    def _on_engine_remove(self, engine_id):
+        if not engine_id:
+            return
+        if self._remove_worker and self._remove_worker.isRunning():
+            QMessageBox.information(
+                self, "Busy", "Otro borrado está en curso. Espera a que termine."
+            )
+            return
+        if self._render_in_progress():
+            QMessageBox.warning(
+                self, "Render in progress",
+                "No se puede borrar un modelo mientras hay un render/compresión en curso.\n"
+                "Espera a que termine antes de continuar.",
+            )
+            return
+
+        engine = self._find_engine(engine_id)
+        name = (engine or {}).get("display_name", engine_id)
+        state = engines_state_get(engine_id)
+        if not state.get("installed"):
+            return
+
+        is_fsr2 = engine_id.endswith("-v2")
+        is_fsr31 = "fsr31" in engine_id
+        is_fsr1 = (
+            engine_id.startswith("upscale-fsr") and not is_fsr2 and not is_fsr31
+        )
+        if is_fsr1:
+            QMessageBox.information(
+                self, "Built-in",
+                "FSR 1.0 está integrado en la aplicación y no se puede borrar.",
+            )
+            return
+
+        if is_fsr2 or is_fsr31:
+            # Borra el build FFmpeg full (libplacebo) compartido por todos
+            # los motores FSR 2.0 / FSR 3.1.
+            from src.config import get_ffmpeg_full_dir
+            target_dir = get_ffmpeg_full_dir()
+            what = "FFmpeg full (libplacebo)\n  " + target_dir
+            affected = [
+                e["engine_id"] for e in CATALOG
+                if e["engine_id"].endswith("-v2") or "fsr31" in e["engine_id"]
+            ]
+            extra = "\n\nEsto afectará a todos los motores FSR 2.0 / FSR 3.1."
+        else:
+            target_dir = state.get("install_path") or get_engine_dir(engine_id)
+            what = "model weights\n  " + target_dir
+            affected = [engine_id]
+            extra = ""
+
+        size = dependencies._safe_dir_size(target_dir)
+        size_txt = f" (~{_fmt_bytes(size)})" if size else ""
+
+        confirm = QMessageBox.question(
+            self,
+            "Remove engine",
+            f"¿Borrar '{name}'?\n\n"
+            f"Se eliminará de forma permanente:{size_txt}\n  {what}{extra}\n\n"
+            "Esta acción no se puede deshacer.",
+        )
+        if confirm != QMessageBox.StandardButton.Yes:
+            return
+
+        def _remove():
+            dependencies.remove_local_path(target_dir)
+            for eid in affected:
+                try:
+                    engines_mark_uninstalled(eid)
+                except Exception:
+                    pass
+
+        self._remove_worker = _EngineRemoveWorker(engine_id, _remove, parent=self)
+        self._remove_worker.finished_ok.connect(self._on_engine_remove_ok)
+        self._remove_worker.failed.connect(self._on_engine_remove_failed)
+        self._remove_worker.start()
+
+    def _on_engine_remove_ok(self, engine_id):
+        self._remove_worker = None
+        QMessageBox.information(
+            self, "Engine removed",
+            f"'{engine_id}' se ha eliminado correctamente.",
+        )
+        self._refresh_engines_tab()
+        self._populate()
+
+    def _on_engine_remove_failed(self, engine_id, msg):
+        self._remove_worker = None
+        QMessageBox.critical(
+            self, "Remove failed",
+            f"No se pudo eliminar '{engine_id}':\n\n{msg}\n\n"
+            "Si algún archivo está en uso, el borrado se completará en el "
+            "próximo arranque de la aplicación.",
+        )
+        self._refresh_engines_tab()
+        self._populate()
+
     # ====================================================================
     # Dialog lifecycle / worker cancellation
     # ====================================================================
@@ -1106,7 +1376,8 @@ class DependenciesDialog(QDialog):
         super().reject()
 
     def _kill_workers(self):
-        for w_attr in ("_git_worker", "_onnx_worker", "_fsr2_worker"):
+        for w_attr in ("_git_worker", "_onnx_worker", "_fsr2_worker",
+                       "_uninstall_worker", "_remove_worker"):
             w = getattr(self, w_attr, None)
             if w is None:
                 continue

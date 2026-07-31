@@ -184,6 +184,41 @@ def get_state(engine_id: str) -> dict:
             state["installed"] = False
             state["enabled"] = False
             state["last_error"] = "Cannot check FFmpeg full availability"
+
+    # Sensor veraz contra disco: si el estado dice "instalado" pero el
+    # directorio del modelo ya no existe (el usuario borró/trasladó los
+    # pesos a mano, o un borrado quedó a medias), reportamos installed=False
+    # y corregimos engines.json para que la UI nunca muestre un INSTALLED
+    # fantasma. FSR 1.0/2.0/3.1 se excluyen: no usan directorio de modelos
+    # (2.0/3.1 usan el binario FFmpeg full, que ya se validó arriba).
+    if (
+        engine_id
+        and state.get("installed")
+        and not engine_id.startswith("upscale-fsr")
+    ):
+        try:
+            from src.ai.registry import get_engine_dir
+            model_dir = state.get("install_path") or get_engine_dir(engine_id)
+            if not model_dir or not os.path.isdir(model_dir):
+                state["installed"] = False
+                state["enabled"] = False
+                state["onnx_converted"] = False
+                state["onnx_path"] = None
+                try:
+                    patch(
+                        engine_id,
+                        installed=False,
+                        enabled=False,
+                        installed_at_iso=None,
+                        install_path=None,
+                        onnx_converted=False,
+                        onnx_path=None,
+                        last_error="Model folder missing on disk.",
+                    )
+                except Exception:
+                    pass
+        except Exception:
+            pass
     return state
 
 
