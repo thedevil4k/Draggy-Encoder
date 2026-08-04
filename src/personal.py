@@ -19,8 +19,10 @@ from __future__ import annotations
 import json
 import os
 
+from src import config
 
-_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "personal")
+
+_DIR = os.path.join(config.get_base_dir(), "personal")
 _HF_TOKEN_FILE = "hf_token.json"
 
 
@@ -40,11 +42,18 @@ def _read_json(filename: str) -> dict:
 def _write_json(filename: str, data: dict) -> bool:
     _ensure_dir()
     path = os.path.join(_DIR, filename)
+    tmp = path + ".tmp"
     try:
-        with open(path, "w", encoding="utf-8") as f:
+        with open(tmp, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2)
+        os.replace(tmp, path)
         return True
     except Exception:
+        try:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        except Exception:
+            pass
         return False
 
 

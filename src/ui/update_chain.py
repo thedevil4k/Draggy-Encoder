@@ -154,7 +154,7 @@ class _DependencyUpdateWorker(QThread):
                     # housekeeping (ej. limpiar cache upstream de FFmpeg).
                     pass
 
-            def _progress(v: int) -> None:
+            def _progress(v: int, _message: str = "") -> None:
                 self.progress.emit(int(v))
 
             def _status(text: str) -> None:
@@ -200,6 +200,9 @@ class _UpdateChainController(QObject):
         self._worker: Optional[_DependencyUpdateWorker] = None
         self._results: list[dict] = []
         self._running = False
+        # Cuando el usuario aborta la cadena (request_stop), ningun paso
+        # nuevo debe arrancarse aunque queden deps por procesar.
+        self._stopped = False
         # Estado por paso en vuelo para alimentar el mini-stats banner y el
         # historial persistente. La clave es ``dep_id`` (unica por paso).
         # Valores: {"pre_bytes": int|None, "pre_version": str|None,
@@ -208,8 +211,9 @@ class _UpdateChainController(QObject):
 
     # -------------------- public API --------------------
     def start(self) -> None:
-        """Arranca la cadena. Idempotente: si ya esta corriendo no hace nada."""
-        if self._running:
+        """Arranca la cadena. Idempotente: si ya esta corriendo o si se
+        marcó _stopped, no hace nada."""
+        if self._running or self._stopped:
             return
         if not self._deps:
             self.chain_finished.emit({"ok": 0, "failed": 0, "total": 0})
@@ -230,14 +234,22 @@ class _UpdateChainController(QObject):
     def request_stop(self, wait_ms: int = 2000) -> None:
         """Best-effort: pide al worker que pare si sigue corriendo.
 
-        Hoy ``_DependencyUpdateWorker.run()`` NO polea ``isInterruptionRequested()``,
-        asi que este metodo es un soft cancel: el hint llega al thread pero
-        ``force_redownload`` (bloqueante de red) no lo consulta. El thread
-        termina por cuenta propia al acabar la descarga; ``wait(wait_ms)``
-        solo se asegura de no soltar la referencia mientras Qt reapa la
-        jerarquia. Cuando se anada polling dentro de ``run()`` (siguiente
-        milestone), este metodo se convierte automaticamente en cancel real.
+        Marca ``_stopped`` para que ningún paso nuevo arranque aunque
+        el slot ``_advance`` se dispare por la señal ``finished`` del
+        hilo que acaba de morir.
+
+        Hoy ``_DependencyUpdateWorker.run()`` NO polea
+        ``isInterruptionRequested()``, asi que este metodo es un soft
+        cancel: el hint llega al thread pero ``force_redownload``
+        (bloqueante de red) no lo consulta. El thread termina por
+        cuenta propia al acabar la descarga; ``wait(wait_ms)`` solo se
+        asegura de no soltar la referencia mientras Qt reapa la
+        jerarquia.
         """
+        self._stopped = True
+        # Cade lateral: aunque el slot _advance se disparara con cola
+        # llena, sin deps no hay paso posible que arrancar.
+        self._deps = []
         if self._worker is None:
             return
         if not self._worker.isRunning():
@@ -254,6 +266,20 @@ class _UpdateChainController(QObject):
     # -------------------- internals --------------------
     def _advance(self) -> None:
         self._index += 1
+        if self._stopped:
+            # Cadena abortada por el usuario (request_stop): no arrancar
+            # ningún paso nuevo aunque queden deps pendientes.
+            self._running = False
+            self.chain_finished.emit(
+                {
+                    "ok": sum(1 for r in self._results if r["ok"]),
+                    "failed": sum(1 for r in self._results if not r["ok"]),
+                    "total": len(self._results),
+                    "results": list(self._results),
+                    "stopped": True,
+                }
+            )
+            return
         if self._index >= len(self._deps):
             self._running = False
             ok_count = sum(1 for r in self._results if r["ok"])

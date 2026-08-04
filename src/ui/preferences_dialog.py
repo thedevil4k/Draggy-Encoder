@@ -309,9 +309,12 @@ class PreferencesDialog(QDialog):
         self.txt_hf_token.setPlaceholderText("hf_xxxxxxxxxxxxxxxxxxxx")
         self.txt_hf_token.setMinimumWidth(300)
         token_row.addWidget(self.txt_hf_token, stretch=1)
-        self.btn_toggle_token = QPushButton("Show")
-        self.btn_toggle_token.setFixedWidth(60)
+        self.btn_toggle_token = QPushButton("Mostrar/Ocultar")
+        self.btn_toggle_token.setFixedWidth(120)
         self.btn_toggle_token.setCheckable(True)
+        self.btn_toggle_token.setToolTip(
+            "Muestra u oculta el token de HuggingFace mientras lo escribes/pegas."
+        )
         self.btn_toggle_token.toggled.connect(self._on_toggle_token)
         token_row.addWidget(self.btn_toggle_token)
         hf_group_layout.addLayout(token_row)
@@ -321,12 +324,12 @@ class PreferencesDialog(QDialog):
         return page
 
     def _on_toggle_token(self, checked):
+        # La etiqueta es fija ("Mostrar/Ocultar"): describe la acción, el
+        # estado real lo da el echo mode del campo + el pressed del botón.
         if checked:
             self.txt_hf_token.setEchoMode(QLineEdit.EchoMode.Normal)
-            self.btn_toggle_token.setText("Hide")
         else:
             self.txt_hf_token.setEchoMode(QLineEdit.EchoMode.Password)
-            self.btn_toggle_token.setText("Show")
 
     def _build_section(self, title_text, body_text):
         """Construye un ``QGroupBox`` con título y descripción de sección.
@@ -554,8 +557,13 @@ class PreferencesDialog(QDialog):
                 if isinstance(data, dict):
                     data.pop(_AUTO_UPDATE_KEY_LEGACY, None)
                     ensure_runtime_dirs()
-                    with open(path, "w", encoding="utf-8") as f:
+                    # Atómico (tmp + replace): preferences.json se escribe
+                    # en cada aceptar; un corte de energía mid-write no
+                    # debería volver todas las preferencias a default.
+                    tmp = path + ".tmp"
+                    with open(tmp, "w", encoding="utf-8") as f:
                         json.dump(data, f, indent=2)
+                    os.replace(tmp, path)
         except (OSError, json.JSONDecodeError):
             # I/O o corrupcion del JSON: no podemos persistir el cambio,
             # pero tampoco queremos romper el cierre del dialogo.

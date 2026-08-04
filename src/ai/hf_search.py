@@ -5,16 +5,22 @@ Este módulo proporciona:
     con soporte GPU.
   - Búsqueda de modelos del catálogo en HuggingFace para obtener metadata
     (downloads, tamaño, archivos).
+  - Búsqueda libre en el Hub de HuggingFace (``search_hub_models``) que
+    devuelve modelos arbitrarios compatibles con los motores de inferencia.
   - Verificación de compatibilidad entre un modelo y un motor de inferencia.
 
-La búsqueda se limita a los modelos declarados en ``src.ai.registry.CATALOG``
-para la categoría solicitada. No se devuelven modelos externos al catálogo.
+La búsqueda del catálogo se limita a los modelos declarados en
+``src.ai.registry.CATALOG``. La búsqueda del Hub consulta la API pública
+``/api/models`` de HuggingFace y filtra por archivos de pesos, soporte de
+imagen y heurísticas de categoría (upscale/interpolación/colorización/...).
 """
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
+import re
 from typing import Optional
 
 logger = logging.getLogger(__name__)
@@ -356,6 +362,291 @@ def search_catalog_models(
 
 
 # ---------------------------------------------------------------------------
+# Búsqueda libre en el Hub de HuggingFace
+# ---------------------------------------------------------------------------
+
+# Heurística de categoría: palabras clave buscadas en el id del repo, sus
+# tags, pipeline_tag y library_name. Cada categoría tiene sinónimos amplios;
+# el orden importa porque la primera categoría con match gana.
+_CATEGORY_KEYWORDS: dict[str, tuple[str, ...]] = {
+    "Upscale": (
+        "super-resolution", "super resolution", "superresolution", "upscale",
+        "upscaling", "esrgan", "realesrgan", "realesr", "swinir", "realcugan",
+        "cugan", "srgan", "omnisr", "waifu", "anime4k", "srcnn", "edsr",
+        "rcan", "span", "aesr", "carcass", "4x-ultrasharp", "4x-animesharp",
+    ),
+    "Interpolate": (
+        "rife", "frame interpolation", "frame-interpolation", "interpolation",
+        "frame interpolation", "vfi", "video interpolation", "flowframe",
+        "gmfss", "film",
+    ),
+    "Colorize": (
+        "colorize", "colorization", "colorizer", "deoldify", "ddcolor",
+    ),
+    "Denoise": (
+        "denoise", "denoising", "nafnet", "dncnn", "scunet", "real denoising",
+        "denoiser",
+    ),
+    "FaceRestore": (
+        "gfpgan", "codeformer", "gpen", "face restore", "face-restore",
+        "face restoration", "face enhancement", "faceenhance", "faceenhencement",
+        "biniou-facerestore",
+    ),
+}
+
+# Requisito mínimo de señal de imagen para incluir un repo "incierto" (sin
+# match de categoría). Evita que modelos de texto/LLM (también usan .bin y
+# .safetensors) se cuelen en el buscador.
+_IMAGE_SIGNAL_TAGS = ("image", "super-resolution", "upscale", "sr")
+
+
+def _repo_text(repo_id: str, tags: list[str], pipeline_tag: Optional[str],
+               library_name: Optional[str]) -> str:
+    """Texto plano de un modelo del Hub para buscar keywords de categoría."""
+    parts = [repo_id or "", pipeline_tag or "", library_name or ""]
+    parts.extend(tags or [])
+    return " ".join(parts).lower()
+
+
+def _detect_category(repo_id: str, tags: list[str],
+                     pipeline_tag: Optional[str],
+                     library_name: Optional[str] = None) -> Optional[str]:
+    """Devuelve la categoría más probable para un repo, o None si no matchea
+    ninguna heurística."""
+    text = _repo_text(repo_id, tags, pipeline_tag, library_name)
+    for category, keywords in _CATEGORY_KEYWORDS.items():
+        if any(kw in text for kw in keywords):
+            return category
+    return None
+
+
+def user_engine_id(category: str, repo_id: str) -> str:
+    """Genera un ``engine_id`` slug-safe y determinista para un modelo del Hub.
+
+    Formato: ``user-<categoría>-<owner>-<name>-<hash8>``. Cumple
+    ``_SLUG_RE`` (``[a-z0-9]+(-[a-z0-9]+)*``) para que ``get_engine_dir``,
+    ``engines_state.patch`` y el sensor de disco funcionen igual que con el
+    catálogo. El hash corto (SHA-1) evita colisiones entre repos con el mismo
+    nombre y estabiliza el id entre búsquedas.
+    """
+    cat = re.sub(r"[^a-z0-9]+", "-", (category or "").lower()).strip("-") or "other"
+    owner, _, name = (repo_id or "").lower().strip().partition("/")
+    slug_parts = []
+    for part in (owner, name):
+        cleaned = re.sub(r"[^a-z0-9]+", "-", part).strip("-")[:40]
+        if cleaned:
+            slug_parts.append(cleaned)
+    slug = re.sub(r"-{2,}", "-", "-".join(slug_parts)).strip("-")
+    digest = hashlib.sha1((repo_id or "").encode("utf-8")).hexdigest()[:8]
+    return f"user-{cat}-{slug}-{digest}"
+
+
+def _hub_file_list(model) -> list[str]:
+    """Lista de nombres de archivo del modelo (vía ``siblings``)."""
+    try:
+        return [s.rfilename for s in (model.siblings or [])]
+    except Exception:
+        return []
+
+
+def _has_weight_files(files: list[str]) -> bool:
+    lower = [f.lower() for f in files]
+    return any(
+        f.endswith(ext) for f in lower
+        for ext in _ONNX_WEIGHT_EXTS + _TORCH_WEIGHT_EXTS
+    )
+
+
+def _hub_cache_key(category, query, engine_id, page, limit):
+    return ("hub", category, query or "", engine_id, page, limit)
+
+
+_HUB_CACHE: dict = {}
+
+
+def search_hub_models(
+    category: str = "Upscale",
+    query: str = "",
+    engine_id: Optional[str] = None,
+    page: int = 0,
+    limit: int = 30,
+    use_cache: bool = True,
+) -> list[dict]:
+    """Busca modelos arbitrarios en el Hub de HuggingFace.
+
+    Consulta ``/api/models`` (``HfApi.list_models``) con ``search=``,
+    ``sort=downloads`` y ``expand=["siblings", "cardData"]``, y filtra:
+
+      - Que el repo tenga archivos de pesos compatibles
+        (``.safetensors/.pth/.pt/.onnx``).
+      - Compatibilidad con ``engine_id`` (si se indica), vía
+        ``check_model_compatibility``.
+      - Categoría: la heurística debe matchear la categoría pedida O el repo
+        debe tener señal clara de imagen (pipeline/tags) para mostrarse con
+        una insignia "categoría no confirmada".
+
+    Args:
+        category: Categoría objetivo ("Upscale", "Interpolate", ...) a
+            filtrar; ``None`` = cualquier categoría detectada.
+        query: Texto de búsqueda (libre, como en la web de HF).
+        engine_id: Motor para filtrar compatibilidad (None = todos).
+        page: Página (0-based) para paginar; cada página hace una llamada API.
+        limit: Modelos por página (máx. HF ~100).
+
+    Returns:
+        Lista de dicts con la misma forma que ``search_catalog_models`` más
+        los campos ``is_user_model`` (True) y ``category_confidence``.
+    """
+    key = _hub_cache_key(category, query, engine_id, page, limit)
+    if use_cache and key in _HUB_CACHE:
+        return list(_HUB_CACHE[key])
+
+    from huggingface_hub import HfApi
+
+    try:
+        from src.personal import get_token as _get_token
+        _token = _get_token() or None
+    except Exception:
+        _token = None
+
+    api = HfApi(token=_token)
+    try:
+        models = api.list_models(
+            search=query or None,
+            sort="downloads",
+            direction=-1,
+            offset=page * limit,
+            limit=limit,
+            expand=["siblings", "cardData"],
+        )
+    except Exception as exc:
+        logger.warning("HF list_models failed: %s", exc)
+        raise
+
+    results = []
+    for model in (models or []):
+        try:
+            repo_id = getattr(model, "modelId", None) or getattr(model, "id", None)
+            if not repo_id:
+                continue
+            files = _hub_file_list(model)
+            if not _has_weight_files(files):
+                continue
+            tags = list(getattr(model, "tags", None) or [])
+            pipeline_tag = getattr(model, "pipeline_tag", None)
+            library_name = getattr(model, "library_name", None)
+
+            detected = _detect_category(repo_id, tags, pipeline_tag, library_name)
+            if detected is not None and category is not None and detected != category:
+                continue
+            if detected is None:
+                # Repo sin categoría clara: solo entra si tiene señal de
+                # imagen (evita LLM y repos de texto con .bin/.safetensors).
+                if not _has_image_signal(pipeline_tag, tags):
+                    continue
+                category_match = False
+                effective_category = category or "Other"
+            else:
+                category_match = True
+                effective_category = detected
+
+            hf_info = {
+                "repo_id": repo_id,
+                "downloads": getattr(model, "downloads", 0) or 0,
+                "pipeline_tag": pipeline_tag,
+                "tags": tags,
+                "last_modified": getattr(model, "lastModified", None),
+                "siblings": files,
+            }
+
+            compatibility = None
+            if engine_id:
+                compatibility = check_model_compatibility(repo_id, engine_id, hf_info)
+                if not compatibility.get("compatible", False):
+                    continue
+
+            generated_id = user_engine_id(effective_category, repo_id)
+            state = _get_engine_state(generated_id)
+
+            card = {
+                "engine_id": generated_id,
+                "display_name": _humanize_repo_name(repo_id),
+                "category": effective_category,
+                "hf_repo_id": repo_id,
+                "hf_url": f"https://huggingface.co/{repo_id}",
+                "size_estimate": "",
+                "size_mb": None,
+                "downloads": hf_info["downloads"],
+                "likes": getattr(model, "likes", 0) or 0,
+                "license": _model_license(model),
+                "quality_score": 0,
+                "popularity_score": _downloads_to_score(hf_info["downloads"]),
+                "is_implemented": True,
+                "lfs_warning": False,
+                "last_modified": hf_info["last_modified"],
+                "files": files,
+                "installed": bool(state.get("installed", False)),
+                "enabled": bool(state.get("enabled", False)),
+                "onnx_converted": bool(state.get("onnx_converted", False)),
+                "install_path": state.get("install_path"),
+                "compatibility": compatibility,
+                "is_user": True,
+                "category_confidence": category_match,
+                "detected_category": detected,
+            }
+            results.append(card)
+        except Exception as exc:
+            logger.warning("Skipping hub model %s: %s", getattr(model, "modelId", "?"), exc)
+
+    if use_cache:
+        _HUB_CACHE[key] = results
+    return results
+
+
+def _has_image_signal(pipeline_tag: Optional[str], tags: list[str]) -> bool:
+    if pipeline_tag and pipeline_tag in _IMAGE_INPUT_TAGS:
+        return True
+    lowered = " ".join(tags or []).lower()
+    return any(sig in lowered for sig in ("image", "super-resolution", "upscale"))
+
+
+def _humanize_repo_name(repo_id: str) -> str:
+    """Convierte ``owner/4x-UltraSharp`` en ``4x UltraSharp``."""
+    _, _, name = (repo_id or "").partition("/")
+    cleaned = re.sub(r"[-_]+", " ", name or repo_id or "").strip()
+    return cleaned[:60] or (repo_id or "")
+
+
+def _model_license(model) -> str:
+    """Lee la licencia del cardData del modelo si está disponible."""
+    try:
+        card = getattr(model, "cardData", None)
+        lic = getattr(card, "license", None) or getattr(card, "classify_license", None)
+        return lic or ""
+    except Exception:
+        return ""
+
+
+def _downloads_to_score(downloads: int) -> int:
+    """Proxy 0-100 de popularidad desde downloads del repo."""
+    try:
+        d = max(0, int(downloads))
+    except Exception:
+        return 0
+    if d >= 1_000_000:
+        return 100
+    if d >= 100_000:
+        return 80
+    if d >= 10_000:
+        return 60
+    if d >= 1_000:
+        return 40
+    if d >= 100:
+        return 20
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # Verificación de compatibilidad
 # ---------------------------------------------------------------------------
 
@@ -459,6 +750,7 @@ def clear_cache() -> None:
     _cache.clear()
     _cache_keys.clear()
     _MODEL_INFO_CACHE.clear()
+    _HUB_CACHE.clear()
 
 
 def get_cached_search(

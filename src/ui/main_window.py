@@ -105,6 +105,52 @@ class _BannerCheckWorker(QThread):
         self.done.emit()
 
 
+def resolve_fsr3_engine(upscale_info, interp_info):
+    """Resolve the FSR 3.1 engine id / model path / mode from workflow nodes.
+
+    FSR 3.1 decouples upscaling from frame interpolation. The user activates
+    FSR in the Upscale node and/or the Interp node; the underlying engine
+    runs both features when both nodes are active:
+
+      - Upscale(FSR31) + Interp(FSR31) -> mode ``"both"``
+      - Upscale(FSR31) alone            -> mode ``"upscale"``
+      - Interp(FSR31) alone             -> mode ``"interpolate"``
+      - anything else                   -> (upscale engine id, None, "upscale")
+
+    Returns ``(engine_id, model_path, mode)``.
+    """
+    upscale_engine_id = None
+    upscale_model_path = None
+    upscale_scale_info = {}
+    if isinstance(upscale_info, dict):
+        upscale_engine_id = upscale_info.get("engine_id", "")
+        upscale_model_path = upscale_info.get("model_path")
+        upscale_scale_info = upscale_info
+    elif upscale_info:
+        upscale_engine_id = upscale_info
+
+    interp_engine_id = None
+    interp_scale_info = {}
+    if isinstance(interp_info, dict):
+        interp_engine_id = interp_info.get("engine_id", "")
+        interp_scale_info = interp_info
+    elif interp_info:
+        interp_engine_id = interp_info
+
+    fsr3_mode = "upscale"
+    fsr3_engine_id = upscale_engine_id
+    fsr3_model_path = upscale_model_path
+    if upscale_engine_id and "fsr31" in upscale_engine_id:
+        fsr3_mode = upscale_scale_info.get("mode", "upscale")
+        if interp_engine_id and "fsr31" in interp_engine_id:
+            fsr3_mode = "both"
+    elif interp_engine_id and "fsr31" in interp_engine_id:
+        fsr3_mode = "interpolate"
+        fsr3_engine_id = interp_engine_id
+        fsr3_model_path = interp_scale_info.get("model_path")
+    return fsr3_engine_id, fsr3_model_path, fsr3_mode
+
+
 class CompressionWorker(QThread):
     """Worker para ejecutar compresión o preview en segundo plano."""
 
@@ -163,47 +209,72 @@ class CompressionWorker(QThread):
                 if upscale_engine_id:
                     use_ai = True
 
+            # The Interp node may carry an FSR 3.1 engine (frame
+            # interpolation). FSR 3.1 decouples upscaling from frame
+            # generation: activating FSR in the Upscale node AND in the
+            # Interp node runs both features; activating only the Interp
+            # node runs interpolation alone.
+            interp_info_raw = (self.ai_engines or {}).get("Interpolate") or {}
+            interp_engine_id = interp_info_raw.get("engine_id", "") if isinstance(interp_info_raw, dict) else interp_info_raw
+            if interp_engine_id and "fsr31" in interp_engine_id:
+                use_ai = True
+
             # Inyectar ai_scale en settings para que pipeline.py lo use
             # al calcular la resolución del encoder.
             if upscale_scale is not None:
                 self.settings["ai_scale"] = upscale_scale
 
+            # FSR 3.1 mode resolution across both workflow nodes (see
+            # ``resolve_fsr3_engine``): Upscale(FSR31) + Interp(FSR31)
+            # -> "both", Upscale(FSR31) alone -> "upscale",
+            # Interp(FSR31) alone -> "interpolate".
+            fsr3_engine_id, fsr3_model_path, fsr3_mode = resolve_fsr3_engine(
+                (self.ai_engines or {}).get("Upscale"),
+                interp_info_raw,
+            )
+
             if self.mode == "compress" and use_ai:
                 # Build inference engine from the selected model.
-                # Strategy: prefer ONNX Runtime (works without torch, supports
-                # GPU via CUDAExecutionProvider).  If no .onnx file exists and
-                # torch is available, convert .pth -> .onnx on the fly.  If
-                # torch is not installed and no .onnx exists, fail with a clear
-                # message explaining what to do.
+                # Strategy: prefer ONNX Runtime when it has an ACTIVE GPU
+                # provider (CUDA/TensorRT).  If ONNX only runs on CPU and
+                # torch with CUDA is available, prefer PyTorch (GPU) —
+                # otherwise the render would run on CPU silently.  If no
+                # .onnx exists and torch is available, convert .pth -> .onnx
+                # on the fly.  If nothing works, fail with a clear message.
                 try:
                     from src.ai.inference import (
                         create_inference_engine,
                         get_model_path,
                         convert_pth_to_onnx,
+                        PyTorchInferenceEngine,
                     )
                     from src.ai.architectures import is_torch_available
 
-                    status_cb(f"Loading AI model: {upscale_engine_id}...")
+                    status_cb(f"Loading AI model: {fsr3_engine_id or upscale_engine_id}...")
 
                     inference_engine = None
                     errors = []
 
                     # FSR engines don't need model files — pure algorithmic upscale
-                    if upscale_engine_id.startswith("upscale-fsr"):
-                        if "fsr31" in upscale_engine_id:
-                            # FSR 3.0 (FSR 2.0 upscaling + frame interpolation)
-                            # The mode (upscale/interpolate/both) comes from
-                            # the workflow dropdown data.
-                            fsr3_mode = upscale_scale_info.get("mode", "upscale")
+                    if fsr3_engine_id and fsr3_engine_id.startswith("upscale-fsr"):
+                        if "fsr31" in fsr3_engine_id:
+                            # FSR 3.1 (FSR 2.0 upscaling + frame interpolation).
+                            # The mode (upscale/interpolate/both) is resolved
+                            # from both workflow nodes above (fsr3_mode).
                             status_cb(f"FSR 3.1 engine (mode={fsr3_mode}, GPU via libplacebo)...")
                             try:
-                                from src.ai.inference import FSR3Engine
-                                inference_engine = FSR3Engine(
-                                    upscale_model_path or "",
-                                    upscale_engine_id,
+                                from src.ai.inference import FSR31Engine
+                                inference_engine = FSR31Engine(
+                                    fsr3_model_path or "",
+                                    fsr3_engine_id,
                                     mode=fsr3_mode,
                                 )
-                                status_cb(f"AI model loaded — using GPU (FSR 3.1, mode={fsr3_mode})")
+                                if inference_engine.load():
+                                    status_cb(f"AI model loaded — using GPU (FSR 3.1, mode={fsr3_mode})")
+                                else:
+                                    errors.append(
+                                        "FSR 3.1 requires FFmpeg full with libplacebo support"
+                                    )
                             except Exception as exc:
                                 errors.append(f"FSR 3.1 engine failed: {exc}")
                         elif upscale_engine_id.endswith("-v2"):
@@ -222,6 +293,16 @@ class CompressionWorker(QThread):
                                 status_cb("AI model loaded — using CPU (FSR 1.0)")
                             except Exception as exc:
                                 errors.append(f"FSR engine failed: {exc}")
+
+                        if inference_engine is None or not getattr(inference_engine, "is_loaded", False):
+                            detail = " | ".join(errors) if errors else "FSR engine failed to load."
+                            raise RuntimeError(
+                                f"Could not load inference engine for {fsr3_engine_id}.\n"
+                                f"Details: {detail}\n\n"
+                                "FSR 1.0 needs no downloads; FSR 2.0/3.1 need "
+                                "FFmpeg full with libplacebo (Manage Dependencies → "
+                                "Runtimes & Binaries)."
+                            )
                     else:
                         pth_path = upscale_model_path  # Prefer the exact path from UI
 
@@ -240,9 +321,38 @@ class CompressionWorker(QThread):
                         if onnx_path:
                             status_cb(f"Found ONNX model, using ONNX Runtime (GPU if available)...")
                             try:
-                                inference_engine = create_inference_engine("onnxruntime", onnx_path)
+                                engine_candidate = create_inference_engine("onnxruntime", onnx_path)
                             except Exception as exc:
                                 errors.append(f"ONNX Runtime failed: {exc}")
+                            else:
+                                active_providers = getattr(engine_candidate, "get_active_providers", None)
+                                active = (
+                                    active_providers()
+                                    if callable(active_providers)
+                                    else getattr(engine_candidate, "_providers", [])
+                                )
+                                # ONNX ativo solo en CPU: si torch puede usar
+                                # CUDA, preferimos PyTorch (GPU) antes que
+                                # procesar el video entero en CPU.
+                                if (
+                                    "CUDAExecutionProvider" not in active
+                                    and "TensorrtExecutionProvider" not in active
+                                    and pth_path
+                                    and is_torch_available()
+                                ):
+                                    status_cb("ONNX Runtime sin GPU — cambiando a PyTorch (CUDA)...")
+                                    try:
+                                        torch_engine = PyTorchInferenceEngine(pth_path, upscale_engine_id)
+                                        if torch_engine.load():
+                                            inference_engine = torch_engine
+                                        else:
+                                            errors.append("PyTorch load failed; keeping ONNX Runtime (CPU)")
+                                            inference_engine = engine_candidate
+                                    except Exception as exc:
+                                        errors.append(f"PyTorch (CUDA) failed: {exc}")
+                                        inference_engine = engine_candidate
+                                else:
+                                    inference_engine = engine_candidate
 
                         # 2) If no ONNX yet, try converting .pth -> .onnx (needs torch).
                         if inference_engine is None or not getattr(inference_engine, "is_loaded", False):
@@ -272,21 +382,56 @@ class CompressionWorker(QThread):
 
                         if inference_engine is None or not getattr(inference_engine, "is_loaded", False):
                             detail = " | ".join(errors) if errors else "No model weights found."
+                            hint = ""
+                            if not errors or "No model weights" in detail:
+                                hint = (
+                                    "\n\nThis engine has no weight files installed. Open "
+                                    "Manage Dependencies → Runtimes & Binaries and click "
+                                    "'Add Engine' on the model row to download them."
+                                )
                             raise RuntimeError(
                                 f"Could not load inference engine for {upscale_engine_id}.\n"
                                 f"Details: {detail}\n\n"
                                 "Ensure ONNX Runtime or PyTorch is installed via "
                                 "Manage Dependencies → Runtimes & Binaries."
+                                + hint
                             )
 
                         # Show which provider is actually active.
                         providers = getattr(inference_engine, "_providers", [])
-                        if "CUDAExecutionProvider" in providers:
+                        device = getattr(inference_engine, "_device", None)
+                        if "CUDAExecutionProvider" in providers or "TensorrtExecutionProvider" in providers:
                             status_cb("AI model loaded — using GPU (CUDA)")
-                        elif "TensorrtExecutionProvider" in providers:
-                            status_cb("AI model loaded — using GPU (TensorRT)")
+                        elif device is not None and "cuda" in str(device).lower():
+                            status_cb("AI model loaded — using GPU (CUDA) via PyTorch")
                         else:
                             status_cb("AI model loaded — using CPU (no GPU)")
+
+                    # ETA pre-render con el benchmark cacheado del engine
+                    # (si existe; se mide tras cada instalación). Solo un
+                    # ffprobe barato: fps del source + duración del job.
+                    try:
+                        if inference_engine is not None:
+                            bench_eid = fsr3_engine_id or upscale_engine_id or ""
+                            if bench_eid:
+                                from src.ai.benchmark import estimate_status_line
+                                info = get_video_info(self.ffmpeg_path, self.input_path) or {}
+                                fps = None
+                                rfr = info.get("r_frame_rate", "")
+                                if "/" in rfr:
+                                    try:
+                                        num_s, den_s = rfr.split("/", 1)
+                                        num, den = float(num_s), float(den_s)
+                                        fps = num / den if den else None
+                                    except Exception:
+                                        fps = None
+                                if fps and fps > 0:
+                                    dur = self.settings.get("duration_seconds") or 0
+                                    line = estimate_status_line(bench_eid, int(dur * fps))
+                                    if line:
+                                        status_cb(line)
+                    except Exception:
+                        pass
                 except Exception as exc:
                     self.success = False
                     self.error_message = f"Failed to load AI model: {exc}"
@@ -889,14 +1034,48 @@ class MainWindow(QMainWindow):
 
         Opens the DependenciesDialog on the AI Engines tab and triggers
         installation of the selected engine.
+
+        Los modelos del Hub (``is_user``) se registran aquí en
+        ``user_models`` antes de abrir el diálogo: el flujo de instalación
+        (``DependenciesDialog._find_engine``) resuelve el engine_id contra
+        el catálogo + registro, y si el id no existiera mostraría
+        "Unknown engine_id". El registro es inofensivo sin pesos en disco
+        (el sensor de instalado sigue necesitando mark_installed).
         """
         engine_id = model.get("engine_id", "")
         if not engine_id:
             return
+        if model.get("is_user"):
+            self._register_user_model(model)
         dialog = DependenciesDialog(self, initial_tab="ai_engines")
         # Trigger installation after the dialog is shown.
         dialog._on_engine_install(engine_id)
         dialog.exec()
+
+    def _register_user_model(self, model: dict):
+        """Persiste el registro de un motor de usuario (buscador del Hub)."""
+        try:
+            from src.ai.user_models import register as _register
+            weight_file = ""
+            for f in (model.get("files") or []):
+                low = str(f).lower()
+                if low.endswith((".safetensors", ".pth", ".pt", ".onnx")):
+                    weight_file = str(f)
+                    break
+            _register(
+                model.get("engine_id", ""),
+                display_name=model.get("display_name", ""),
+                category=model.get("category") or "Other",
+                hf_repo_id=model.get("hf_repo_id", ""),
+                hf_url=model.get("hf_url", ""),
+                weight_file=weight_file,
+                license=model.get("license", ""),
+                popularity_score=model.get("popularity_score", 0),
+                quality_score=model.get("quality_score", 0),
+            )
+        except Exception as exc:
+            logger.warning("Failed to register user model %s: %s",
+                           model.get("engine_id"), exc)
 
     def _show_preferences(self):
         dialog = PreferencesDialog(self)
@@ -944,18 +1123,25 @@ class MainWindow(QMainWindow):
         #    the X button alone. Without this short-circuit, ffmpeg
         #    would be left running as a child of the dying Qt process.
         #
-        # Guard:
-        #   _close_followup_job is None  → not a followup chain
-        #   not _close_followup_complete  → not the post-success close
-        #     reentry of a followup that just succeeded (in which
-        #     case the worker finished cleanly and we should NOT
-        #     abort + delete the file).
+        # If a render is in flight, first confirm with the user. A stray
+        # click on X during a 30+ minute encode silently aborting the job
+        # is the worst UX; the Abort button already exists for that.
         if (
             self._close_followup_job is None
             and not self._close_followup_complete
             and getattr(self, "worker", None) is not None
             and self.worker.isRunning()
         ):
+            ret = QMessageBox.question(
+                self,
+                "Render in progress",
+                "A render is in progress. Abort it and close?",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            if ret != QMessageBox.Yes:
+                event.ignore()
+                return
             self._abort_running_worker(cleanup_partial_output=True)
             self._cleanup_after_abort()
 
@@ -1547,6 +1733,14 @@ class MainWindow(QMainWindow):
         return os.path.join(self.output_dir, f"{output_name}.{fmt}")
 
     def _compress(self):
+        # Guard de reentrada: si ya hay un CompressionWorker corriendo,
+        # no volver a snapshottear ni lanzar un segundo pipeline. El
+        # boton se deshabilita en _run_worker() al final de su
+        # construcción, pero los modals interactivos (p.ej. salud de
+        # ffmpeg) bombean eventos y permiten un segundo click antes de
+        # llegar allí.
+        if getattr(self, "worker", None) is not None and self.worker.isRunning():
+            return
         if not self.input_path:
             QMessageBox.warning(self, "No video", "Please select a video first.")
             return
@@ -1581,6 +1775,10 @@ class MainWindow(QMainWindow):
         self._run_worker(output_path, settings, mode="compress", ai_engines=ai_engines)
 
     def _preview(self):
+        # Mismo guard que en _compress: no permitir un segundo worker
+        # mientras el primero sigue corriendo.
+        if getattr(self, "worker", None) is not None and self.worker.isRunning():
+            return
         if not self.input_path:
             QMessageBox.warning(self, "No video", "Please select a video first.")
             return
@@ -1606,6 +1804,8 @@ class MainWindow(QMainWindow):
         self.btn_preview.setEnabled(False)
         self.btn_abort.setEnabled(True)
         self.progress.setValue(0)
+        self.progress.setFormat("%p%")
+        self._worker_started = time.time()
 
         # Normal path: the currently selected video. Followup path: the
         # job's original input (the selection may have changed while the
@@ -1616,17 +1816,36 @@ class MainWindow(QMainWindow):
             self.ffmpeg_path, src, output_path, settings,
             mode=mode, ai_engines=ai_engines,
         )
-        self.worker.progress.connect(self.progress.setValue)
+        self.worker.progress.connect(self._on_worker_progress)
         self.worker.status_message.connect(self.status_label.setText)
         # Direct slot + QueuedConnection: el callback SIEMPRE corre en el
         # hilo de la GUI. Lambda en hilo secundario fallaria silenciosamente.
         self.worker.finished.connect(self._on_worker_finished, Qt.ConnectionType.QueuedConnection)
         self.worker.start()
 
+    def _on_worker_progress(self, value):
+        """Actualiza la barra + ETA estimado a partir del throughput medido."""
+        self.progress.setValue(value)
+        try:
+            elapsed = time.time() - getattr(self, "_worker_started", time.time())
+            if value > 1 and elapsed > 2:
+                remaining = elapsed * (100 - value) / value
+                mm, ss = divmod(int(remaining), 60)
+                hh, mm = divmod(mm, 60)
+                if hh:
+                    self.progress.setFormat(f"%p%  ·  ETA ~{hh}h {mm:02d}m {ss:02d}s")
+                else:
+                    self.progress.setFormat(f"%p%  ·  ETA ~{mm:02d}:{ss:02d}")
+            else:
+                self.progress.setFormat("%p%")
+        except Exception:
+            pass
+
     def _on_worker_finished(self):
         self.btn_compress.setEnabled(True)
         self.btn_preview.setEnabled(True)
         self.btn_abort.setEnabled(False)
+        self.progress.setFormat("%p%")
 
         worker = getattr(self, "worker", None)
         if not worker:
@@ -1729,6 +1948,12 @@ class MainWindow(QMainWindow):
         mode = getattr(worker, "mode", "compress")
 
         if not worker.success:
+            # Un fallo de encode deja el output parcial (truncado/incompleto)
+            # en el disko si no lo borramos; antes esto solo pasaba con los
+            # aborts explícitos. Asegúrate de no inducir falsa confianza.
+            output_path = getattr(worker, "output_path", None)
+            if output_path and os.path.exists(output_path):
+                self._try_remove(output_path)
             self.status_label.setText(f"Error: {worker.error_message or 'Operation failed'}")
             QMessageBox.critical(self, "Error", f"Operation failed: {worker.error_message or 'Unknown error'}")
             return

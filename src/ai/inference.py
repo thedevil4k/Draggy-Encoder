@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import subprocess
 import sys
 from typing import Optional
@@ -233,6 +234,20 @@ class ONNXRUNTIMEInferenceEngine(AIInferenceEngine):
             self._output_name = outputs[0].name
             self._output_shape = outputs[0].shape
 
+        # El pipeline siempre alimenta frames BGR de 3 canales. Si el modelo
+        # ONNX tiene un canal fijo distinto (p.ej. 12) rechazamos la carga
+        # ANTES de empezar el render: un crash a mitad de video es opaco
+        # ("Got: 3 Expected: 12") y confunde al usuario.
+        if self._input_shape and len(self._input_shape) >= 2:
+            in_ch = self._input_shape[1]
+            if isinstance(in_ch, int) and in_ch != 3:
+                logger.error(
+                    "ONNX model %s expects %d input channels; the frame "
+                    "pipeline always feeds 3-channel BGR. Refusing to load.",
+                    os.path.basename(self.model_path), in_ch,
+                )
+                return False
+
         # En modo Auto con CUDA, hacemos una inferencia de prueba para
         # forzar el fallo de cuDNN (si existe) ANTES de que el pipeline
         # comience. Si falla, recreamos la sesión con CPU. Así el usuario
@@ -258,6 +273,19 @@ class ONNXRUNTIMEInferenceEngine(AIInferenceEngine):
             )
         return True
 
+    def get_active_providers(self) -> list:
+        """Devuelve los providers REALMENTE activos en la sesión.
+
+        ORT puede descartar CUDA silenciosamente (DLLs ausentes, driver,
+        cuDNN), por lo que ``_providers`` no basta: hay que mirar la sesión.
+        """
+        try:
+            if self._session is not None:
+                return list(self._session.get_providers())
+        except Exception:
+            pass
+        return []
+
     def _try_cpu_fallback(self, ort, source=""):
         """Recreate the session with CPU provider and run a dummy inference.
 
@@ -280,6 +308,15 @@ class ONNXRUNTIMEInferenceEngine(AIInferenceEngine):
             if outputs:
                 self._output_name = outputs[0].name
                 self._output_shape = outputs[0].shape
+            if self._input_shape and len(self._input_shape) >= 2:
+                in_ch = self._input_shape[1]
+                if isinstance(in_ch, int) and in_ch != 3:
+                    logger.error(
+                        "ONNX model %s expects %d input channels (CPU session); "
+                        "refusing to load.",
+                        os.path.basename(self.model_path), in_ch,
+                    )
+                    return False
             self._dummy_inference()
             logger.info("CPU fallback successful")
             return True
@@ -455,11 +492,34 @@ class PyTorchInferenceEngine(AIInferenceEngine):
 
         try:
             from src.ai.architectures import build_model_from_state_dict
-            state_dict = torch.load(self.model_path, map_location="cpu", weights_only=False)
+            if self.model_path.lower().endswith(".safetensors"):
+                from safetensors.torch import load_file
+                state_dict = load_file(self.model_path, device="cpu")
+            else:
+                state_dict = torch.load(self.model_path, map_location="cpu", weights_only=False)
             if not isinstance(state_dict, dict):
                 logger.error("Unexpected checkpoint format: %s", type(state_dict))
                 return False
             model = build_model_from_state_dict(state_dict)
+
+            # El pipeline alimenta frames BGR de 3 canales; rechazar modelos
+            # con otra entrada fija (p.ej. RRDBNet de 12 canales) antes de
+            # gastar GPU y de reventar a mitad de render.
+            try:
+                first_conv = next(
+                    m for m in model.modules()
+                    if isinstance(m, torch.nn.Conv2d)
+                )
+                in_ch = first_conv.in_channels
+            except Exception:
+                in_ch = None
+            if in_ch is not None and in_ch != 3:
+                logger.error(
+                    "Model %s expects %d input channels; the frame pipeline "
+                    "always feeds 3-channel BGR. Refusing to load.",
+                    os.path.basename(self.model_path), in_ch,
+                )
+                return False
 
             try:
                 model = model.to(self._device)
@@ -509,15 +569,19 @@ class PyTorchInferenceEngine(AIInferenceEngine):
 
         input_tensor = torch.from_numpy(input_data).to(self._device)
 
+        autocast = (torch.cuda.is_available() and self._device.type == "cuda")
         with torch.no_grad():
-            output_tensor = self._model(input_tensor)
+            if autocast:
+                with torch.autocast("cuda", dtype=torch.float16):
+                    output_tensor = self._model(input_tensor)
+            else:
+                output_tensor = self._model(input_tensor)
 
-        # CHW → HWC, clamp, RGB → BGR, uint8
-        output = output_tensor.squeeze(0).cpu().numpy()
-        output = np.transpose(output, (1, 2, 0))  # HWC
-        output = np.clip(output * 255.0, 0, 255).astype(np.uint8)
-        output = output[:, :, ::-1]  # RGB → BGR
-        output = np.ascontiguousarray(output)
+        # CHW → HWC, clamp, scale and convert on device (fp16 numpy ops are
+        # extremely slow), then RGB → BGR, uint8
+        output = (output_tensor.squeeze(0).clamp(0, 1) * 255.0).to(torch.uint8)
+        output = output.permute(1, 2, 0).cpu().numpy()
+        output = np.ascontiguousarray(output[:, :, ::-1])  # RGB → BGR
         return output
 
     def get_scale_factor(self) -> int:
@@ -1105,7 +1169,22 @@ def create_inference_engine(
             f"Could not load PyTorch engine for {model_path}. {details}"
         )
     else:
-        raise RuntimeError(f"Unknown inference engine: {engine_id}")
+        # Ids de catálogo (p.ej. "upscale-realesr-animevideov3") que
+        # llegan aquí sin un ONNX convertible: intentamos PyTorch como
+        # última vía antes de rendirnos.
+        torch_exc = None
+        if model_path and model_path.endswith((".pth", ".pt", ".safetensors")):
+            try:
+                engine = PyTorchInferenceEngine(model_path, engine_id)
+                if engine.load():
+                    return engine
+                torch_exc = "PyTorch load returned False (check the log for the underlying exception)"
+            except Exception as exc:
+                torch_exc = f"PyTorch load failed: {exc}"
+        details = " ".join(str(x) for x in [last_error, torch_exc] if x)
+        raise RuntimeError(
+            f"Could not load inference engine for {engine_id}. {details}"
+        )
 
 
 def find_onnx_model(model_dir: str) -> Optional[str]:
@@ -1132,6 +1211,21 @@ def find_onnx_model(model_dir: str) -> Optional[str]:
     return None
 
 
+def _onnx_input_channels_ok(onnx_path: str) -> bool:
+    """Probe barata de una sesión ORT: True si el canal de entrada fijo del
+    modelo es 3 (o dinámico). Usado para no reutilizar un .onnx huérfano
+    convertido desde el archivo equivocado (p.ej. un RRDBNet de 12 canales)."""
+    try:
+        import onnxruntime as ort
+        sess = ort.InferenceSession(onnx_path, providers=["CPUExecutionProvider"])
+        shape = sess.get_inputs()[0].shape
+        if len(shape) >= 2 and isinstance(shape[1], int):
+            return shape[1] == 3
+        return True
+    except Exception:
+        return False
+
+
 def convert_pth_to_onnx(pth_path: str) -> Optional[str]:
     """Convert a .pth model to .onnx for GPU inference via ONNX Runtime.
 
@@ -1143,7 +1237,16 @@ def convert_pth_to_onnx(pth_path: str) -> Optional[str]:
 
     onnx_path = os.path.splitext(pth_path)[0] + ".onnx"
     if os.path.exists(onnx_path):
-        return onnx_path
+        # Reutilizar el .onnx solo si es compatible con el pipeline: un
+        # .onnx huérfano (convertido desde el archivo equivocado, p.ej. con
+        # 12 canales de entrada) reventaría el render. Si no sirve, se
+        # borra y se reconvierte.
+        if _onnx_input_channels_ok(onnx_path):
+            return onnx_path
+        try:
+            os.remove(onnx_path)
+        except OSError:
+            return None
 
     try:
         import torch
@@ -1161,7 +1264,11 @@ def convert_pth_to_onnx(pth_path: str) -> Optional[str]:
 
         try:
             logger.info("Converting %s to ONNX...", pth_path)
-            state_dict = torch.load(pth_path, map_location="cpu", weights_only=False)
+            if pth_path.lower().endswith(".safetensors"):
+                from safetensors.torch import load_file
+                state_dict = load_file(pth_path, device="cpu")
+            else:
+                state_dict = torch.load(pth_path, map_location="cpu", weights_only=False)
             if not isinstance(state_dict, dict):
                 return None
 
@@ -1184,6 +1291,18 @@ def convert_pth_to_onnx(pth_path: str) -> Optional[str]:
                 num_in_ch = state_dict["input.weight"].shape[1]
             else:
                 num_in_ch = 3
+
+            # El pipeline alimenta frames BGR de 3 canales: un modelo con
+            # otra entrada fija (p.ej. RRDBNet de 12 canales) convertiría a
+            # un ONNX que revienta en el primer frame real ("Expected: 12").
+            if num_in_ch != 3:
+                logger.warning(
+                    "Skipping ONNX conversion for %s: model expects %d input "
+                    "channels (the frame pipeline always feeds 3-channel BGR).",
+                    os.path.basename(pth_path), num_in_ch,
+                )
+                return None
+
             dummy = torch.randn(1, num_in_ch, 64, 64)
             torch.onnx.export(
                 model, dummy, onnx_path,
@@ -1243,12 +1362,35 @@ def get_model_path(engine_id_catalog: str, engine_id_inference: str = "onnxrunti
             # No hay ONNX disponible
             return None
         elif engine_id_inference == "torch":
-            # Buscar archivos de peso de PyTorch
+            # Buscar archivos de peso de PyTorch.
             weight_exts = (".safetensors", ".bin", ".pth", ".pt")
-            for fname in os.listdir(model_dir):
-                if fname.lower().endswith(weight_exts):
-                    return os.path.join(model_dir, fname)
-            return None
+            candidates = sorted(
+                fname for fname in os.listdir(model_dir)
+                if fname.lower().endswith(weight_exts)
+            )
+            if not candidates:
+                return None
+            # Los repos de modelos contienen varios pesos (p.ej. el repo de
+            # Real-ESRGAN trae 9 .pth). "El primero en orden de listado" era
+            # un azar: podía caer un modelo con 12 canales de entrada que
+            # reventaba el render. Puntuamos cada archivo por coincidencia
+            # con los tokens del engine_id y elegimos el mejor.
+            tokens = [
+                t for t in re.split(r"[^a-z0-9]+", engine_id_catalog.lower())
+                if t and t not in ("upscale", "interpolate", "denoise", "colorize", "facerestore")
+            ]
+            joined = "-".join(tokens)
+            best, best_score = None, -1
+            for fname in candidates:
+                n = re.sub(r"[^a-z0-9]+", "-", fname.lower()).strip("-")
+                score = sum(1 for t in tokens if t in n)
+                if joined and joined in n:
+                    score += 1
+                if score > best_score:
+                    best, best_score = fname, score
+            if best is None or best_score <= 0:
+                best = candidates[0]
+            return os.path.join(model_dir, best)
 
     except Exception as exc:
         logger.error("Failed to get model path: %s", exc)

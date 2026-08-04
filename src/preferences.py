@@ -28,21 +28,35 @@ def _path():
 
 
 def _load():
+    p = None
     try:
         ensure_runtime_dirs()
-        with open(_path(), "r", encoding="utf-8") as f:
+        p = _path()
+        with open(p, "r", encoding="utf-8") as f:
             return json.load(f) or {}
     except Exception:
+        if p and os.path.exists(p):
+            try:
+                os.replace(p, p + ".bak")
+            except Exception:
+                pass
         return {}
 
 
 def _save(data):
     try:
         ensure_runtime_dirs()
-        with open(_path(), "w", encoding="utf-8") as f:
+        tmp = _path() + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2)
+        os.replace(tmp, _path())
         return True
     except Exception:
+        try:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        except Exception:
+            pass
         return False
 
 

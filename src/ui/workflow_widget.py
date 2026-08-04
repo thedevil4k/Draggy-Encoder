@@ -28,6 +28,7 @@ NODE_CATEGORY = {
     "Interp":  ("Interpolate", "Frame interpolation engines (RIFE, FILM, ...)"),
     "Denoise": ("Denoise", "Denoising engines (NAFNet, ...)"),
     "Colorize": ("Colorize",   "Colorization engines (DDColor, DeOldify, ...)"),
+    "FaceRestore": ("FaceRestore", "Face restoration engines (GFPGAN, CodeFormer, ...)"),
 }
 
 
@@ -210,7 +211,7 @@ class AIWorkflowStep(QFrame):
     clicked_for_manage = Signal(str)
     engine_changed = Signal(str, str)
     active_changed = Signal(str, bool)
-    search_requested = Signal()
+    search_requested = Signal(str)  # arg = categoría del nodo
 
     def __init__(self, name, icon_path, parent=None,
                  fixed_width=200, fixed_height=130):
@@ -236,9 +237,9 @@ class AIWorkflowStep(QFrame):
         self.setFixedSize(fixed_width, fixed_height)
         self._build(icon_path)
         self.setStyleSheet(self._stylesheet())
-        # Show search button only for Upscale category.
-        if self.category == "Upscale":
-            self.btn_search.setVisible(True)
+        # La lupa (búsqueda en Hub) está disponible en TODOS los pasos
+        # AI: misma affordance que Upscale para que la UI sea uniforme.
+        self.btn_search.setVisible(True)
         self.refresh_from_registry()  # first paint
 
     # -- styling ----------------------------------------------------------
@@ -355,8 +356,9 @@ class AIWorkflowStep(QFrame):
             "border-radius: 4px; font-size: 12px; padding: 0px; }"
             "QPushButton:hover { background-color: #7d3fe0; }"
         )
-        self.btn_search.clicked.connect(self.search_requested.emit)
-        self.btn_search.setVisible(False)  # shown only for Upscale
+        self.btn_search.clicked.connect(
+            lambda: self.search_requested.emit(self.category)
+        )
         combo_row.addWidget(self.btn_search)
         layout.addLayout(combo_row)
 
@@ -408,7 +410,7 @@ class AIWorkflowStep(QFrame):
         # FSR engines: scale is encoded in the engine_id (fsr-2x, fsr-3x, fsr-4x)
         if engine_id and engine_id.startswith("upscale-fsr"):
             import re
-            from src.ai.registry import CATALOG_BY_ID
+            from src.ai.registry import get_entry
             m = re.search(r'fsr-(\d+)x', engine_id)
             scale = int(m.group(1)) if m else 2
 
@@ -417,7 +419,7 @@ class AIWorkflowStep(QFrame):
             # knows whether to interpolate frames.
             mode = "upscale"  # default
             if "fsr31" in engine_id:
-                entry = CATALOG_BY_ID.get(engine_id, {})
+                entry = get_entry(engine_id) or {}
                 mode = entry.get("mode", "upscale")
 
             self.combo_scale.addItem(f"{scale}x", {
@@ -710,7 +712,7 @@ class WorkflowWidget(QWidget):
         self.step_compress = WorkflowStep(
             "Compress", get_asset_path("Export.png"), active=True
         )
-        # AIWorkflowStep subclasses WorkflowStep's interface so the
+# AIWorkflowStep subclasses WorkflowStep's interface so the
         # rest of WorkflowWidget's logic (reorder, mouse toggle) keeps
         # working unchanged.
         self.middle_steps = [
@@ -718,6 +720,7 @@ class WorkflowWidget(QWidget):
             AIWorkflowStep("Interp",   get_asset_path("AI Interpolation.png")),
             AIWorkflowStep("Denoise",  get_asset_path("AI Denoise.png")),
             AIWorkflowStep("Colorize", get_asset_path("AI Colorize.png")),
+            AIWorkflowStep("FaceRestore", get_asset_path("AI Face Restore.png")),
         ]
         for step in self.middle_steps:
             step.clicked_for_manage.connect(self._on_step_manage_requested)
@@ -780,9 +783,15 @@ class WorkflowWidget(QWidget):
     def _on_step_manage_requested(self, category):
         self.manage_engines_requested.emit(category)
 
-    def _on_search_requested(self):
-        """Open the HuggingFace model search dialog for the Upscale node."""
-        dlg = ModelSearchDialog(parent=self)
+    def _on_search_requested(self, category):
+        """Open the HuggingFace model search dialog for the given node.
+
+        ``category`` es la categoría del nodo (Upscale, Interpolate,
+        Denoise, Colorize, FaceRestore): el diálogo pre-selecciona esa
+        categoría en ambas pestañas para que el usuario encuentre
+        modelos relevantes sin tener que filtrar a mano.
+        """
+        dlg = ModelSearchDialog(initial_category=category, parent=self)
         dlg.model_selected.connect(self.model_selected.emit)
         dlg.exec()
 

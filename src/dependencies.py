@@ -161,12 +161,17 @@ def _dir_has_files(path: str) -> bool:
 
 def _runtime_status(engine_id, display_name, source_url, manager_status_fn):
     """Estado de un runtime IA (torch/onnxruntime) usando la fuente única de
-    verdad: ``runtimes.manager``. Distingue entre copia local (app), copia del
-    entorno del sistema y ausencia total.
+    verdad: ``runtimes.manager``.
+
+    La app es autocontenida ("caracol"): SOLO cuenta el runtime descargado
+    por ella misma en ``bin/runtimes/ai_modules``. Una copia del entorno del
+    sistema (venv, otros programas) se menciona como diagnóstico en el
+    mensaje, pero NO satisface la dependencia: sin store local => MISSING,
+    aunque el sistema tenga torch/onnxruntime.
 
     Antes este sensor consultaba ``importlib.metadata`` sobre el entorno Python
     y reportaba INSTALLED aunque ``bin/runtimes/ai_modules`` estuviera vacío
-    (0 bytes). Ahora el badge refleja dónde vive el runtime realmente.
+    (0 bytes). Ahora el badge refleja únicamente el runtime local.
     """
     ensure_runtime_dirs()
     try:
@@ -176,29 +181,43 @@ def _runtime_status(engine_id, display_name, source_url, manager_status_fn):
         pass
     info = manager_status_fn() or {}
     installed = bool(info.get("installed"))
-    local = bool(info.get("local"))
     version = info.get("version") or "—"
     store = ai_runtimes_manager.get_runtime_modules_dir()
     local_bytes = _safe_dir_size(store)
     gpu = bool(info.get("gpu"))
+    system = bool(info.get("system"))
 
     if installed:
         status = STATUS_INSTALLED
-        gpu_text = " · GPU (CUDA) available" if gpu else " · CPU only"
-        if local:
+        gpu_text = " · GPU (CUDA) disponible" if gpu else " · solo CPU"
+        detail = f"Instalado en la carpeta del programa. Versión: {version}{gpu_text}"
+    elif _runtime_package_downloaded(store, engine_id):
+        # Descargado en el store local pero el import falla. Dos causas
+        # típicas: el store se instaló con OTRA versión de Python (wheels
+        # cpXY incompatibles, no inyectados por el guard de versión), o la
+        # descarga quedó a medias / faltan DLLs de CUDA.
+        if not ai_runtimes_manager.store_is_compatible_with_python():
+            status = STATUS_ERROR
             detail = (
-                f"Installed locally in the program folder. Version: {version}{gpu_text}"
+                "La descarga anterior se hizo con otra versión de Python. "
+                "Pulsa 'Reintentar' para volver a descargarlo con la versión "
+                "actual; no hace falta borrar nada."
             )
         else:
+            status = STATUS_ERROR
             detail = (
-                f"Found in the system Python environment. Version: {version}{gpu_text}. "
-                "No local copy inside the program folder; the app will use this one."
+                "La descarga quedó incompleta o interrumpida. "
+                "Pulsa 'Reintentar' para volver a descargarlo."
             )
     else:
         status = STATUS_MISSING
-        detail = (
-            "Not installed. Press 'Install' to download it into the program folder."
-        )
+        if system:
+            detail = (
+                "No está instalado en la carpeta del programa. "
+                "Pulsa 'Instalar' para descargarlo."
+            )
+        else:
+            detail = "No está instalado. Pulsa 'Instalar' para descargarlo."
 
     return {
         "id": engine_id,
@@ -206,15 +225,43 @@ def _runtime_status(engine_id, display_name, source_url, manager_status_fn):
         "kind": KIND_RUNTIME,
         "status": status,
         "version": version,
+        # install_dir: el store local. Como la app solo usa su propio
+        # runtime, el botón 'Open folder' siempre apunta ahí (la carpeta
+        # donde se descargará / vive la copia local).
         "install_dir": store,
         "source_url": source_url,
         "is_updatable": True,
         "size_bytes": local_bytes,
         "detail": detail,
-        "local": local,
-        "deletable": installed and local and local_bytes > 0,
+        "local": installed,
+        "deletable": installed and local_bytes > 0,
         "gpu_available": gpu,
     }
+
+
+def _runtime_package_downloaded(store: str, engine_id: str) -> bool:
+    """True si pip descargó el paquete del runtime en el store local.
+
+    pip install --target deja un directorio con el nombre del paquete
+    (``torch/``, ``onnxruntime/``) + su ``*.dist-info``. Comprobar la
+    existencia del directorio distingue 'descargado pero roto' (import
+    falla: DLLs CUDA, descarga a medias) de 'ni siquiera intentado'.
+    """
+    pkg_dir = {
+        "torch": "torch",
+        "onnxruntime": "onnxruntime",
+    }.get(engine_id)
+    if not pkg_dir:
+        return False
+    if not os.path.isdir(os.path.join(store, pkg_dir)):
+        return False
+    try:
+        return any(
+            os.path.isdir(os.path.join(store, e)) and e.endswith(".dist-info")
+            for e in os.listdir(store)
+        )
+    except Exception:
+        return True
 
 
 def _pytorch_status():
@@ -445,7 +492,7 @@ REGISTRY = [
         "kind": KIND_RUNTIME,
         "display_name": "PyTorch runtime",
         "status_fn": _pytorch_status,
-        "reinstall_fn": ai_runtimes_manager.install_all,
+        "reinstall_fn": ai_runtimes_manager.install_pytorch,
         "uninstall_fn": ai_runtimes_manager.uninstall_local_runtimes,
         "open_label": "Open bin/runtimes/ai_modules",
         "is_updatable": True,
@@ -455,7 +502,7 @@ REGISTRY = [
         "kind": KIND_RUNTIME,
         "display_name": "ONNX Runtime (CPU/GPU)",
         "status_fn": _onnxruntime_status,
-        "reinstall_fn": ai_runtimes_manager.install_all,
+        "reinstall_fn": ai_runtimes_manager.install_onnxruntime,
         "uninstall_fn": ai_runtimes_manager.uninstall_local_runtimes,
         "open_label": "Open bin/runtimes/ai_modules",
         "is_updatable": True,
@@ -467,12 +514,12 @@ REGISTRY = [
         "status_fn": lambda: _slot_status(
             "Upscaling models (Real-ESRGAN / SwinIR / …)",
             "Upscale",
-            os.path.join(get_models_dir(), "Upscale"),
+            os.path.join(get_models_dir(), "upscale"),
             KIND_MODEL,
         ),
         "reinstall_fn": None,
         "uninstall_fn": lambda parent=None: _uninstall_category_models("Upscale"),
-        "open_label": "Open bin/models/Upscale",
+        "open_label": "Open bin/models/upscale",
     },
     {
         "id": "interp_models",
@@ -481,12 +528,12 @@ REGISTRY = [
         "status_fn": lambda: _slot_status(
             "Interpolation models (RIFE / DAIN / …)",
             "Interpolate",
-            os.path.join(get_models_dir(), "Interpolate"),
+            os.path.join(get_models_dir(), "interpolate"),
             KIND_MODEL,
         ),
         "reinstall_fn": None,
         "uninstall_fn": lambda parent=None: _uninstall_category_models("Interpolate"),
-        "open_label": "Open bin/models/Interpolate",
+        "open_label": "Open bin/models/interpolate",
     },
     {
         "id": "colorize_models",
@@ -495,12 +542,26 @@ REGISTRY = [
         "status_fn": lambda: _slot_status(
             "Colorization models (DDColor / DeOldify / …)",
             "Colorize",
-            os.path.join(get_models_dir(), "Colorize"),
+            os.path.join(get_models_dir(), "colorize"),
             KIND_MODEL,
         ),
         "reinstall_fn": None,
         "uninstall_fn": lambda parent=None: _uninstall_category_models("Colorize"),
-        "open_label": "Open bin/models/Colorize",
+        "open_label": "Open bin/models/colorize",
+    },
+    {
+        "id": "face_restore_models",
+        "kind": KIND_MODEL,
+        "display_name": "Face restoration models",
+        "status_fn": lambda: _slot_status(
+            "Face restoration models (GFPGAN / CodeFormer / GPEN / …)",
+            "FaceRestore",
+            os.path.join(get_models_dir(), "facerestore"),
+            KIND_MODEL,
+        ),
+        "reinstall_fn": None,
+        "uninstall_fn": lambda parent=None: _uninstall_category_models("FaceRestore"),
+        "open_label": "Open bin/models/facerestore",
     },
 ]
 
@@ -585,13 +646,18 @@ def remove_local_path(path: str) -> bool:
 
 
 def _uninstall_category_models(category: str, parent=None) -> None:
-    """Borra todos los motores instalados de una categoría + su estado."""
+    """Borra todos los motores instalados de una categoría + su estado.
+
+    El directorio en disco es el prefijo del engine_id en minúsculas
+    (``bin/models/upscale``, ``bin/models/facerestore``, ...), no el nombre
+    de categoría tal cual aparece en la UI ("Upscale", "FaceRestore").
+    """
     try:
         from src.ai.engines_state import all_states, mark_uninstalled
         from src.ai.registry import CATALOG
     except Exception:
         return
-    cat_dir = os.path.join(get_models_dir(), category)
+    cat_dir = os.path.join(get_models_dir(), category.lower())
     if os.path.isdir(cat_dir):
         for sub in os.listdir(cat_dir):
             target = os.path.join(cat_dir, sub)

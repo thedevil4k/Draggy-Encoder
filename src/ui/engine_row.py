@@ -134,6 +134,9 @@ class EngineRow(QFrame):
         super().__init__(parent)
         self.engine = engine
         self.setObjectName("EngineRow")
+        # Paint opaco: evita el compositing translúcido del QSS en cada
+        # repaint y reduce el lag de scroll en listas largas.
+        self.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent, True)
         self.setStyleSheet(self._stylesheet())
         self._build()
 
@@ -249,6 +252,17 @@ class EngineRow(QFrame):
         )
         badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
         title_row.addWidget(badge)
+
+        # Motores de usuario instalados desde el buscador del Hub.
+        if eng.get("is_user"):
+            hub = QLabel("HUB")
+            hub.setStyleSheet(
+                "background-color: #8e44ad; color: #ffffff; "
+                "border-radius: 8px; padding: 1px 8px; font-size: 9px; font-weight: bold;"
+            )
+            hub.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            hub.setToolTip("Community model installed from the HuggingFace Hub.")
+            title_row.addWidget(hub)
 
         if not implemented:
             cs = QLabel("COMING SOON")

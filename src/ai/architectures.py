@@ -870,6 +870,99 @@ def _build_cugan(sd: dict):
 # Public API
 # ---------------------------------------------------------------------------
 
+def detect_model_arch_and_scale(state_dict: dict):
+    """Detecta ``(arch, scale)`` de un state_dict SIN construir el modelo.
+
+    Espeja la lógica de ``build_model_from_state_dict`` pero solo inspecciona
+    claves/formas de tensores, así que no necesita torch ni GPU (un dict
+    cargado con ``torch.load(..., weights_only=True)`` o safetensors sirve).
+    Devuelve ``None`` si no reconoce la arquitectura.
+    """
+    if not isinstance(state_dict, dict) or not state_dict:
+        return None
+
+    # Unwrap de checkpoints Real-ESRGAN envueltos (params_ema/params/state_dict)
+    if "body.0.rdb1.conv1.weight" not in state_dict:
+        for wrapper_key in ("params_ema", "params", "state_dict"):
+            if wrapper_key in state_dict and isinstance(state_dict[wrapper_key], dict):
+                state_dict = state_dict[wrapper_key]
+                break
+
+    keys = list(state_dict.keys())
+
+    def _shape(key):
+        return getattr(state_dict[key], "shape", None)
+
+    # OmniSR: input.weight / output.weight / residual_layer.*
+    if ("input.weight" in keys and "output.weight" in keys
+            and any(k.startswith("residual_layer.") for k in keys)):
+        try:
+            out_per_scale = _shape("up.0.weight")[0]
+            scale = int(round((out_per_scale // 3) ** 0.5))
+        except Exception:
+            scale = 4
+        return ("omnisr", scale)
+
+    if any(k.startswith("body.") for k in keys):
+        if any("rdb" in k for k in keys):
+            # RRDBNet: scale desde número de conv_upN
+            ups = [k for k in keys if k.startswith("conv_up") and k.endswith(".weight")]
+            scale = {1: 2, 2: 4, 3: 8}.get(len(ups), 4)
+            return ("rrdb", scale)
+        # SRVGGNetCompact: última body.N.weight -> out_ch * scale^2
+        try:
+            last_key = max(
+                (k for k in keys if k.startswith("body.") and k.endswith(".weight")),
+                key=lambda k: int(k.split(".")[1]),
+            )
+            out_c = _shape(last_key)[0]
+            scale = 4
+            for s in (8, 4, 3, 2):
+                if out_c % (3 * s * s) == 0:
+                    scale = s
+                    break
+        except Exception:
+            scale = 4
+        return ("srvgg", scale)
+
+    if any(k.startswith("unet") for k in keys):
+        try:
+            scale = int(round((_shape("conv_final.weight")[0] / 3) ** 0.5))
+        except Exception:
+            scale = 2
+        return ("cugan", scale)
+
+    return None
+
+
+def detect_arch_and_scale(weight_path: str):
+    """Lee un archivo de pesos (.pth/.safetensors) y devuelve
+    ``(arch, scale)`` o ``(None, None)`` si no se puede detectar.
+
+    Uso: tras descargar un motor de usuario del Hub, para rellenar el
+    registro con arch/scale reales (el catálogo los declara estáticos).
+    """
+    import os
+    if not weight_path or not os.path.isfile(weight_path):
+        return None, None
+    try:
+        lower = weight_path.lower()
+        if lower.endswith(".safetensors"):
+            from safetensors.torch import load_file
+            sd = load_file(weight_path)
+        else:
+            import torch as _torch
+            sd = _torch.load(weight_path, map_location="cpu", weights_only=True)
+    except Exception as exc:
+        logger.info("detect_arch_and_scale: could not load %s: %s", weight_path, exc)
+        return None, None
+    detected = detect_model_arch_and_scale(sd)
+    if not detected:
+        logger.info("detect_arch_and_scale: unknown arch in %s", weight_path)
+        return None, None
+    return detected
+
+
 def build_model_from_state_dict(state_dict: dict, scale: int = 4):
     """Detect architecture from state_dict keys and build+load it.
 

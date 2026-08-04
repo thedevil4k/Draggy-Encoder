@@ -1,0 +1,13 @@
+# Dependencias del ENTORNO DE BUILD (workflow GitHub Actions).
+# Se instalan en el runner para compilar el EXE con PyInstaller.
+# El EXE resultante NO incluye torch/onnxruntime/optimum/nvidia-*:
+# la app los instala a demanda dentro de bin/runtimes/ai_modules usando el
+# Python embebido que coloca el instalador junto al ejecutable.
+# Nota: pyinstaller es del entorno de build, no va dentro del bundle.
+PySide6>=6.5.0
+psutil>=5.9.0
+requests>=2.28.0
+huggingface_hub>=0.20.0
+numpy>=1.24.0
+pillow>=10.0.0
+pyinstaller>=6.3.0

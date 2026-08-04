@@ -3,6 +3,7 @@ import os
 import platform
 import re
 import subprocess
+import sys
 import psutil
 
 
@@ -255,13 +256,82 @@ def get_recommended_device(gpus):
     return "CPU"
 
 
+def get_system_summary():
+    """Versión legible del sistema operativo y del intérprete de Python.
+
+    Pensada para soporte: el usuario informa el entorno exacto (build del
+    OS + arquitectura + intérprete concreto) sin adivinar. Funciona en
+    Windows (nombre de marketing 10/11 por build) y en Linux/macOS
+    (``platform.system()`` + ``release()``).
+    """
+    system = platform.system() or "Unknown"
+    release = platform.release() or ""
+    machine = platform.machine() or ""
+
+    os_name = system
+    win_build = ""
+    if system == "Windows":
+        try:
+            # win32_ver() -> (version, service_pack, type); release() solo
+            # devuelve "10". El build completo sale de version(), p.ej.
+            # "10.0.19045" (Win10) / "10.0.26100" (Win11).
+            win_ver = platform.win32_ver() or ()
+            family = win_ver[0] if len(win_ver) > 0 else ""
+            win_build = platform.version() or ""
+            try:
+                build_num = int(float(win_build.split(".")[-1])) if win_build else 0
+            except (ValueError, TypeError):
+                build_num = 0
+            if family == "10":
+                # Build >= 22000 == Windows 11 (los builds 10.x anteriores
+                # son Windows 10, incluido 10.0.19041/19045).
+                os_name = "Windows 11" if build_num >= 22000 else "Windows 10"
+            elif family:
+                os_name = f"Windows {family}"
+        except Exception:
+            pass
+
+    os_display = os_name
+    if release:
+        if system == "Windows":
+            # p.ej. "Windows 10 (10.0.19045)" — build completo de version().
+            os_display = f"{os_name} ({win_build or release})"
+        else:
+            os_display = f"{os_name} {release}"    # p.ej. "Linux 6.8.0-45"
+
+    try:
+        python_version = sys.version.split()[0]  # p.ej. "3.11.15"
+    except Exception:
+        python_version = (
+            f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"
+        )
+
+    return {
+        "os": os_display,
+        "os_name": os_name,
+        "os_release": release,
+        "machine": machine,
+        "python_version": python_version,
+        "python_executable": sys.executable or "",
+        "python_bits": 64 if sys.maxsize > 2**32 else 32,
+    }
+
+
 def get_hardware_summary():
     cpu = get_cpu_info()
     gpus = get_gpu_info()
+    system = get_system_summary()
     return {
         "cpu": cpu,
         "gpus": gpus,
         "recommended_device": get_recommended_device(gpus),
+        "os": system["os"],
+        "machine": system["machine"],
+        "python": {
+            "version": system["python_version"],
+            "executable": system["python_executable"],
+            "bits": system["python_bits"],
+        },
     }
 
 

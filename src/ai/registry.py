@@ -188,15 +188,15 @@ CATALOG = [
         "engine_id": "upscale-omnisr-x4",
         "display_name": "OmniSR x4 (ultra-fast)",
         "category": "Upscale",
-        "hf_repo_id": "",
-        "hf_url": "https://github.com/Francis0625/Omni-SR",
+        "hf_repo_id": "Acly/Omni-SR",
+        "hf_url": "https://huggingface.co/Acly/Omni-SR",
         "size_estimate": "~1.7 MB",
         "sample_shape": "1x3xHxW -> 1x3x(4H)x(4W)",
         "license": "Apache-2.0",
         "popularity_score": 50,
         "quality_score": 74,
         "is_implemented": True,
-        "sentinel": "README.md",
+        "sentinel": "OmniSR_X4_DIV2K.safetensors",
         "lfs_warning": False,
         "similar_models_url": "https://openmodeldb.info/?search=omnisr",
     },
@@ -320,8 +320,8 @@ CATALOG = [
     },
     {
         "engine_id": "upscale-fsr31-2x-interp",
-        "display_name": "FSR 3.1 x2 (Interpolate only, GPU)",
-        "category": "Upscale",
+        "display_name": "FSR 3.1 x2 (Interpolate, GPU)",
+        "category": "Interpolate",
         "hf_repo_id": "",
         "hf_url": "https://gpuopen.com/fsr/",
         "size_estimate": "0 MB (FFmpeg filter)",
@@ -336,25 +336,8 @@ CATALOG = [
         "similar_models_url": "https://gpuopen.com/fsr/",
     },
     {
-        "engine_id": "upscale-fsr31-2x-both",
-        "display_name": "FSR 3.1 x2 (Upscale + Interpolate, GPU)",
-        "category": "Upscale",
-        "hf_repo_id": "",
-        "hf_url": "https://gpuopen.com/fsr/",
-        "size_estimate": "0 MB (FFmpeg filter)",
-        "sample_shape": "1x3xHxW -> 1x3x(2H)x(2W) (double FPS)",
-        "license": "MIT",
-        "popularity_score": 95,
-        "quality_score": 88,
-        "is_implemented": True,
-        "sentinel": "",
-        "lfs_warning": False,
-        "mode": "both",
-        "similar_models_url": "https://gpuopen.com/fsr/",
-    },
-    {
         "engine_id": "upscale-fsr31-3x",
-        "display_name": "FSR 3.1 x3 (Upscale only, GPU)",
+        "display_name": "FSR 3.1 x3 (Upscale, GPU)",
         "category": "Upscale",
         "hf_repo_id": "",
         "hf_url": "https://gpuopen.com/fsr/",
@@ -371,8 +354,8 @@ CATALOG = [
     },
     {
         "engine_id": "upscale-fsr31-3x-interp",
-        "display_name": "FSR 3.1 x3 (Interpolate only, GPU)",
-        "category": "Upscale",
+        "display_name": "FSR 3.1 x3 (Interpolate, GPU)",
+        "category": "Interpolate",
         "hf_repo_id": "",
         "hf_url": "https://gpuopen.com/fsr/",
         "size_estimate": "0 MB (FFmpeg filter)",
@@ -387,25 +370,8 @@ CATALOG = [
         "similar_models_url": "https://gpuopen.com/fsr/",
     },
     {
-        "engine_id": "upscale-fsr31-3x-both",
-        "display_name": "FSR 3.1 x3 (Upscale + Interpolate, GPU)",
-        "category": "Upscale",
-        "hf_repo_id": "",
-        "hf_url": "https://gpuopen.com/fsr/",
-        "size_estimate": "0 MB (FFmpeg filter)",
-        "sample_shape": "1x3xHxW -> 1x3x(3H)x(3W) (double FPS)",
-        "license": "MIT",
-        "popularity_score": 86,
-        "quality_score": 82,
-        "is_implemented": True,
-        "sentinel": "",
-        "lfs_warning": False,
-        "mode": "both",
-        "similar_models_url": "https://gpuopen.com/fsr/",
-    },
-    {
         "engine_id": "upscale-fsr31-4x",
-        "display_name": "FSR 3.1 x4 (Upscale only, GPU)",
+        "display_name": "FSR 3.1 x4 (Upscale, GPU)",
         "category": "Upscale",
         "hf_repo_id": "",
         "hf_url": "https://gpuopen.com/fsr/",
@@ -422,8 +388,8 @@ CATALOG = [
     },
     {
         "engine_id": "upscale-fsr31-4x-interp",
-        "display_name": "FSR 3.1 x4 (Interpolate only, GPU)",
-        "category": "Upscale",
+        "display_name": "FSR 3.1 x4 (Interpolate, GPU)",
+        "category": "Interpolate",
         "hf_repo_id": "",
         "hf_url": "https://gpuopen.com/fsr/",
         "size_estimate": "0 MB (FFmpeg filter)",
@@ -435,23 +401,6 @@ CATALOG = [
         "sentinel": "",
         "lfs_warning": False,
         "mode": "interpolate",
-        "similar_models_url": "https://gpuopen.com/fsr/",
-    },
-    {
-        "engine_id": "upscale-fsr31-4x-both",
-        "display_name": "FSR 3.1 x4 (Upscale + Interpolate, GPU)",
-        "category": "Upscale",
-        "hf_repo_id": "",
-        "hf_url": "https://gpuopen.com/fsr/",
-        "size_estimate": "0 MB (FFmpeg filter)",
-        "sample_shape": "1x3xHxW -> 1x3x(4H)x(4W) (double FPS)",
-        "license": "MIT",
-        "popularity_score": 92,
-        "quality_score": 85,
-        "is_implemented": True,
-        "sentinel": "",
-        "lfs_warning": False,
-        "mode": "both",
         "similar_models_url": "https://gpuopen.com/fsr/",
     },
 
@@ -519,7 +468,7 @@ CATALOG = [
         "lfs_warning": False,
     },
 
-    # --- Denoising / face restoration (extras) --------------------------
+    # --- Denoising ------------------------------------------------------
     {
         "engine_id": "denoise-nafnet",
         "display_name": "NAFNet (denoise)",
@@ -535,19 +484,55 @@ CATALOG = [
         "sentinel": "README.md",
         "lfs_warning": False,
     },
+
+    # --- Face restoration ----------------------------------------------
+    # Modelos de restauración facial (GFPGAN / CodeFormer / GPEN). Son
+    # pesos ``.pth`` descargables; la conversión a ONNX y el wiring de
+    # inferencia llegan por motor en un milestone posterior (igual que
+    # Interpolate/Colorize/Denoise).
     {
-        "engine_id": "face-gfpgan",
-        "display_name": "GFPGAN (face restore)",
+        "engine_id": "facerestore-gfpgan",
+        "display_name": "GFPGAN v1.4",
         "category": "FaceRestore",
-        "hf_repo_id": "litert-community/GFPGAN-v1.4-LiteRT",
-        "hf_url": "https://huggingface.co/litert-community/GFPGAN-v1.4-LiteRT",
-        "size_estimate": "~330 MB",
+        "hf_repo_id": "nlightcho/gfpgan_v14",
+        "hf_url": "https://huggingface.co/nlightcho/gfpgan_v14",
+        "size_estimate": "~333 MB",
         "sample_shape": "1x3xHxW (face) -> 1x3xHxW (restored)",
         "license": "Apache-2.0",
-        "popularity_score": 80,
-        "quality_score": 89,
-        "is_implemented": False,
-        "sentinel": "README.md",
+        "popularity_score": 88,
+        "quality_score": 90,
+        "is_implemented": True,
+        "sentinel": "GFPGANv1.4.pth",
+        "lfs_warning": True,
+    },
+    {
+        "engine_id": "facerestore-codeformer",
+        "display_name": "CodeFormer",
+        "category": "FaceRestore",
+        "hf_repo_id": "wwy/codeformer",
+        "hf_url": "https://huggingface.co/wwy/codeformer",
+        "size_estimate": "~360 MB",
+        "sample_shape": "1x3xHxW (face) -> 1x3xHxW (restored)",
+        "license": "NTU S-Lab License 1.0",
+        "popularity_score": 94,
+        "quality_score": 92,
+        "is_implemented": True,
+        "sentinel": "codeformer.pth",
+        "lfs_warning": True,
+    },
+    {
+        "engine_id": "facerestore-gpen-512",
+        "display_name": "GPEN BFR-512",
+        "category": "FaceRestore",
+        "hf_repo_id": "akhaliq/GPEN-BFR-512",
+        "hf_url": "https://huggingface.co/akhaliq/GPEN-BFR-512",
+        "size_estimate": "~270 MB",
+        "sample_shape": "1x3xHxW (face) -> 1x3xHxW (restored)",
+        "license": "Custom (non-commercial)",
+        "popularity_score": 72,
+        "quality_score": 86,
+        "is_implemented": True,
+        "sentinel": "GPEN-BFR-512.pth",
         "lfs_warning": False,
     },
 ]
@@ -559,21 +544,46 @@ CATALOG = [
 
 
 # Built lazily on first access. Cheap, but worth being explicit.
+# Solo catálogo: los motores de usuario (Hub) se resuelven con ``get_entry``.
 CATALOG_BY_ID: dict[str, dict] = {e["engine_id"]: e for e in CATALOG}
 
 
-def _all_with_state() -> Iterator[tuple[dict, dict]]:
-    """Yield ``(entry, state)`` pairs for every catalog entry.
+def _user_catalog_entries() -> list[dict]:
+    """Entradas del registro de motores de usuario en forma de catálogo."""
+    try:
+        from src.ai.user_models import catalog_entries
+        return catalog_entries()
+    except Exception:
+        return []
 
-    State is read through ``engines_state.get_state``; if the read
-    raises (corrupt engines.json etc.) we yield an empty default so
-    the UI never crashes.
+
+def get_entry(engine_id: str) -> Optional[dict]:
+    """Resuelve un engine_id contra el catálogo estático y, si no está,
+    contra el registro de motores de usuario (Hub)."""
+    entry = CATALOG_BY_ID.get(engine_id)
+    if entry is not None:
+        return entry
+    if engine_id and engine_id.startswith("user-"):
+        for ue in _user_catalog_entries():
+            if ue["engine_id"] == engine_id:
+                return ue
+    return None
+
+
+def _all_with_state() -> Iterator[tuple[dict, dict]]:
+    """Yield ``(entry, state)`` pairs for every known engine.
+
+    Incluye el catálogo estático Y los motores de usuario registrados desde
+    el Hub (``src.ai.user_models``). State is read through
+    ``engines_state.get_state``; if the read raises (corrupt engines.json
+    etc.) we yield an empty default so the UI never crashes.
     """
     try:
         from src.ai.engines_state import get_state
     except Exception:
         get_state = lambda _id: {}  # noqa: E731
-    for entry in CATALOG:
+    entries = list(CATALOG) + _user_catalog_entries()
+    for entry in entries:
         try:
             state = get_state(entry["engine_id"]) or {}
         except Exception:
@@ -629,8 +639,12 @@ def list_enabled(category: Optional[str] = None) -> list[dict]:
 
 
 def get_engine_meta(engine_id: str) -> Optional[dict]:
-    """Cheap lookup by ``engine_id`` (used by the pipeline for labels)."""
-    entry = CATALOG_BY_ID.get(engine_id)
+    """Cheap lookup by ``engine_id`` (used by the pipeline for labels).
+
+    Resuelve contra el catálogo y, si no está, contra los motores de
+    usuario registrados desde el Hub.
+    """
+    entry = get_entry(engine_id)
     if not entry:
         return None
     try:
@@ -647,7 +661,7 @@ def get_scale_factor(engine_id: str) -> int:
     Returns 1 if the scale factor cannot be determined.
     """
     import re
-    entry = CATALOG_BY_ID.get(engine_id)
+    entry = get_entry(engine_id)
     if not entry:
         return 1
     shape = entry.get("sample_shape", "")
@@ -682,8 +696,18 @@ def get_engine_dir(engine_id: str) -> str:
 
     Layout: ``<models_dir>/<category>/<family>-<variant>``.
     Slug-validated so a malformed id can never escape ``bin/models``.
+
+    Los motores de usuario (``user-<category>-<owner>-<repo>-<hash>``)
+    mantienen el mismo layout: el primer segmento tras ``user-`` es la
+    categoría real, así que quedan bajo ``bin/models/<category>/...``
+    igual que el catálogo (``models/upscale/foo-...``).
     """
     _assert_slug(engine_id)
+    if engine_id.startswith("user-"):
+        parts = engine_id.split("-", 2)
+        cat = parts[1] if len(parts) > 1 else "user"
+        leaf = parts[2] if len(parts) > 2 else engine_id
+        return os.path.join(get_models_dir(), cat, leaf)
     cat, family, variant = split_engine_id(engine_id)
     if cat:
         leaf = "-".join(x for x in (family, variant) if x) or engine_id
@@ -692,10 +716,18 @@ def get_engine_dir(engine_id: str) -> str:
 
 
 def categories() -> list[str]:
-    """Distinct categories preserving the catalog order."""
+    """Distinct categories preserving the catalog order.
+
+    Incluye categorías presentes solo en motores de usuario, al final.
+    """
     seen: set[str] = set()
     ordered: list[str] = []
     for entry in CATALOG:
+        cat = entry.get("category") or "Other"
+        if cat not in seen:
+            seen.add(cat)
+            ordered.append(cat)
+    for entry in _user_catalog_entries():
         cat = entry.get("category") or "Other"
         if cat not in seen:
             seen.add(cat)

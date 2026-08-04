@@ -6,6 +6,7 @@ import shutil
 import subprocess
 import sys
 from datetime import datetime
+from functools import lru_cache
 
 from src.config import (
     FFMPEG_DOWNLOAD_URLS,
@@ -170,21 +171,12 @@ def get_ffmpeg_version(ffmpeg_path=None):
         return None
 
 
-def has_libplacebo_support(ffmpeg_path=None):
-    """Check if FFmpeg has libplacebo support (needed for FSR 2.0).
-
-    Returns True if libplacebo filter is available, False otherwise.
-    """
-    path = ffmpeg_path or get_local_ffmpeg_full_path()
-    if not path or not os.path.exists(path):
-        # Check standard FFmpeg as fallback
-        path = get_local_ffmpeg_path()
-        if not path or not os.path.exists(path):
-            return False
-
+@lru_cache(maxsize=32)
+def _has_libplacebo_at(ffmpeg_path: str, mtime: float) -> bool:
+    """Cached probe: (binary path, mtime) identifies a unique FFmpeg build."""
     try:
         result = subprocess.run(
-            [path, "-filters"],
+            [ffmpeg_path, "-filters"],
             stdin=subprocess.DEVNULL,
             capture_output=True,
             encoding="utf-8",
@@ -196,6 +188,29 @@ def has_libplacebo_support(ffmpeg_path=None):
         return "libplacebo" in output.lower()
     except Exception:
         return False
+
+
+def has_libplacebo_support(ffmpeg_path=None):
+    """Check if FFmpeg has libplacebo support (needed for FSR 2.0).
+
+    Returns True if libplacebo filter is available, False otherwise.
+
+    The probe is cached per (binary path, mtime), so rendering the AI
+    Engines tab / refreshing the workflow never re-spawns ffmpeg for
+    unchanged binaries, while a freshly downloaded FFmpeg full build
+    (new mtime) is re-probed automatically.
+    """
+    path = ffmpeg_path or get_local_ffmpeg_full_path()
+    if not path or not os.path.exists(path):
+        # Check standard FFmpeg as fallback
+        path = get_local_ffmpeg_path()
+        if not path or not os.path.exists(path):
+            return False
+    try:
+        mtime = os.path.getmtime(path)
+    except OSError:
+        mtime = 0.0
+    return _has_libplacebo_at(path, mtime)
 
 
 # ---------------------------------------------------------------------------

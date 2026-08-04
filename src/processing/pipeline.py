@@ -622,7 +622,17 @@ def compress_video_with_ai(
                     enc_proc.stdin.write(interp_frame.tobytes())
                 except Exception as exc:
                     logger.warning("FSR 3.0 interpolation failed at frame %d: %s", frame_num, exc)
-                    # Continue without interpolation for this frame
+                    # Cadencia comprometida: escribimos el frame previo una
+                    # segunda vez para que el fps declarado (2×) no desincronice
+                    # el A/V (sin esto el container queda a mitad de tasa).
+                    # Es mejor que pistear judder silente que hacer que el
+                    # usuario disculpe el comportamiento abriendo VLC.
+                    try:
+                        enc_proc.stdin.write(prev_frame.tobytes())
+                    except Exception:
+                        # En el peor caso el pipe ya estaba roto; dejamos que
+                        # el loop principal detecte y emita el fallo.
+                        pass
 
             # Run inference: preprocess -> model -> postprocess.
             upscaled = inference_engine.process_frame(frame)
@@ -780,6 +790,23 @@ def compress_video_with_ai(
         _save_render_log(log_file, log_entry)
 
     if abort_event and abort_event.is_set():
+        return False
+
+    # Gate de integridad: para nosotros un render "éxito" DEVUELVE ALGO.
+    # Si nunca llegó a escribir ningún frame (encoder muerto al inicio,
+    # disco lleno, libplacebo incompat) y nadie noto el abort, aquí
+    # fallamos de verdad en lugar de muxear el 0-frames y reportar True.
+    if frame_num == 0:
+        msg = (
+            f"AI pipeline returned 0 frames for '{os.path.basename(output_path)}' "
+            f"(encoder_rc={encoder_rc}); treating as failure"
+        )
+        logger.error(msg)
+        try:
+            if os.path.exists(output_path):
+                os.remove(output_path)
+        except Exception:
+            pass
         return False
 
     # --- Mux audio (passthrough) ---

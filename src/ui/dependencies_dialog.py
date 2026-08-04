@@ -40,6 +40,7 @@ from src.ai.engines_state import (
     mark_onnx as engines_mark_onnx,
     mark_uninstalled as engines_mark_uninstalled,
     patch as engines_state_patch,
+    clear_benchmark as engines_clear_benchmark,
 )
 from src.ai.fetcher import (
     GitCloneWorker,
@@ -49,6 +50,7 @@ from src.ai.fetcher import (
     is_hf_hub_available,
 )
 from src.ai.registry import CATALOG, get_engine_dir
+from src.ai.engines_state import dir_has_weights
 from src.config import get_logs_dir
 from src.ffmpeg.full_download_worker import FFmpegFullDownloadWorker
 from src.ffmpeg.manager import (
@@ -125,7 +127,7 @@ class _ReinstallWorker(QThread):
         try:
             dependencies.reinstall(
                 self.dep_id,
-                progress_callback=lambda v: self.progress.emit(v),
+                progress_callback=lambda v, m: self.progress.emit(v),
                 parent=self.parent(),
             )
             self.finished_ok.emit(self.dep_id)
@@ -170,6 +172,27 @@ class _EngineRemoveWorker(QThread):
             self.failed.emit(self.engine_id, str(exc))
 
 
+class _BenchmarkWorker(QThread):
+    """Mide ms/frame de un motor recién instalado en background.
+
+    Silencioso a propósito: solo alimenta la caché de benchmarks que usa
+    el ETA del render. Si falla (motor sin pesos, libs sin cargar) no
+    perturbamos el flujo de instalación.
+    """
+
+    def __init__(self, engine_id, target_dir, parent=None):
+        super().__init__(parent)
+        self.engine_id = engine_id
+        self.target_dir = target_dir
+
+    def run(self):
+        try:
+            from src.ai.benchmark import benchmark_engine
+            benchmark_engine(self.engine_id, target_dir=self.target_dir, use_cache=False)
+        except Exception:
+            pass
+
+
 class _UpstreamCheckWorker(QThread):
     """Hilo independiente para refrescar la huella del upstream."""
 
@@ -190,6 +213,15 @@ class _UpstreamCheckWorker(QThread):
             # La falla queda registrada en el cache (last_error); no
             # necesitamos propagarla. El panel leerá el cache y mostrará
             # el último estado conocido.
+            pass
+        # Warm-up del probe libplacebo (spawn de ``ffmpeg -filters``,
+        # ~250 ms la primera vez). Correrlo aquí evita que el primer
+        # ``get_state()`` de los engines FSR 2.0/3.1 bloquee la GUI con
+        # un subproceso síncrono en el hilo principal.
+        try:
+            from src.ffmpeg.manager import has_libplacebo_support
+            has_libplacebo_support()
+        except Exception:
             pass
         self.done.emit()
 
@@ -420,23 +452,21 @@ class _DepRow(QFrame):
         # Ranuras que no tienen instalador automático desde este panel:
         # los modelos se gestionan en la pestaña AI Engines.
         if not info.get("is_updatable"):
-            if info.get("kind") == dependencies.KIND_MODEL:
-                return "Unavailable"
-            return "Unavailable"
+            return "No disponible"
         # Si upstream sugiere build más reciente y está instalado,
         # el botón principal pasa a ser "Update" en lugar de "Reinstall".
         if (
             info.get("status") == dependencies.STATUS_INSTALLED
             and info.get("update_available") is True
         ):
-            return "Update"
+            return "Actualizar"
         if info.get("status") == dependencies.STATUS_INSTALLED:
-            return "Reinstall"
+            return "Reinstalar"
         if info.get("status") == dependencies.STATUS_MISSING:
-            return "Install"
+            return "Instalar"
         if info.get("status") == dependencies.STATUS_ERROR:
-            return "Retry"
-        return "Unavailable"
+            return "Reintentar"
+        return "No disponible"
 
     def _primary_enabled(self, info, support=None):
         if not info.get("is_updatable"):
@@ -507,11 +537,16 @@ class DependenciesDialog(QDialog):
         # aunque las mutaciones ocurran en otra ventana (workflow widget,
         # followup al cerrar, etc.). UniqueConnection evita handlers
         # duplicados si el dialog se reconstruye en tests.
+        #
+        # NOTA: una lambda enlazada al bus NO se autodesconecta cuando el
+        # diálogo muere (no es un método bound de QObject). Patrón igual
+        # que WorkflowWidget: método bound + disconnect en destroyed.
         try:
             _state_bus.state_changed.connect(
-                lambda _id: self._refresh_engines_tab(),
+                self._on_state_changed_for_engines,
                 Qt.ConnectionType.UniqueConnection,
             )
+            self.destroyed.connect(self._disconnect_state_bus_for_engines)
         except Exception:
             pass
         # Timer único para disparo automático; se (re)programa desde
@@ -520,6 +555,23 @@ class DependenciesDialog(QDialog):
         self._check_timer.setSingleShot(True)
         self._check_timer.timeout.connect(self._run_upstream_check)
         self._build()
+
+    def _on_state_changed_for_engines(self, _engine_id=None):
+        """Slot del bus de estado (método bound → autodesconexión fiable)."""
+        self._refresh_engines_tab()
+
+    def _disconnect_state_bus_for_engines(self):
+        """Al destruirse el diálogo, corta la suscripción al bus.
+
+        Sin esto el bus (process-lifetime) conserva una referencia al
+        slot del diálogo ya destruido y un ``emit`` posterior intentaría
+        repintar un widget muerto (RuntimeError de PySide6)."""
+        try:
+            _state_bus.state_changed.disconnect(
+                self._on_state_changed_for_engines
+            )
+        except Exception:
+            pass
 
     def _build(self):
         layout = QVBoxLayout(self)
@@ -535,10 +587,11 @@ class DependenciesDialog(QDialog):
         layout.addWidget(title)
 
         subtitle = QLabel(
-            "Binarios, runtimes y modelos se almacenan dentro de la carpeta "
-            "del programa (bin/). El panel consulta el upstream una vez cada "
-            "24 h y muestra una insignia 'UPDATE AVAILABLE' cuando hay una "
-            "build más reciente; pulsa 'Update' para traerla."
+            "Binarios y runtimes se almacenan dentro de la carpeta del programa "
+            "(bin/). Los modelos de IA se gestionan por motor en la pestaña "
+            "'AI Engines'. El panel consulta el upstream una vez cada 24 h y "
+            "muestra una insignia 'UPDATE AVAILABLE' cuando hay una build más "
+            "reciente; pulsa 'Update' para traerla."
         )
         subtitle.setStyleSheet("color: #a0a0b0;")
         subtitle.setWordWrap(True)
@@ -650,7 +703,12 @@ class DependenciesDialog(QDialog):
             w.deleteLater()
         self._row_widgets.clear()
 
+        # La pestaña 'Runtimes & Binaries' muestra solo binarios y runtimes.
+        # Las ranuras de modelos (KIND_MODEL) se gestionan por motor desde la
+        # pestaña 'AI Engines'; no se listan aquí para no duplicar categorías.
         for info in dependencies.list_all():
+            if info.get("kind") == dependencies.KIND_MODEL:
+                continue
             row = _DepRow(info, parent=self.container)
             row.redownload_requested.connect(self._on_redownload_requested)
             row.uninstall_requested.connect(self._on_uninstall_requested)
@@ -719,24 +777,37 @@ class DependenciesDialog(QDialog):
         except Exception as exc:
             QMessageBox.warning(self, "Open logs", f"No se pudo abrir la carpeta de logs:\n{exc}")
 
+    @staticmethod
+    def _dep_display_name(dep_id):
+        try:
+            for d in dependencies.list_all():
+                if d.get("id") == dep_id:
+                    return d.get("display_name") or dep_id
+        except Exception:
+            pass
+        return dep_id
+
     def _on_redownload_requested(self, dep_id):
         if not dep_id:
             return
         if self._active_worker and self._active_worker.isRunning():
-            QMessageBox.information(self, "Busy", "Otra descarga está en curso. Espera a que termine.")
+            QMessageBox.information(self, "Ocupado", "Otra descarga está en curso. Espera a que termine.")
             return
+        display = self._dep_display_name(dep_id)
         # Confirmación rápida
         confirm = QMessageBox.question(
             self,
-            "Reinstall dependency",
-            f"¿Volver a descargar e instalar '{dep_id}'?\n"
+            "Reinstalar dependencia",
+            f"¿Volver a descargar e instalar '{display}'?\n"
             "La instalación actual será reemplazada.",
         )
         if confirm != QMessageBox.StandardButton.Yes:
             return
 
         progress = QProgressDialog(
-            f"Reinstalando {dep_id}...", None, 0, 100, self
+            f"Descargando {display}...\n"
+            "Esto puede tardar unos minutos según tu conexión.",
+            None, 0, 100, self,
         )
         progress.setWindowModality(Qt.WindowModality.WindowModal)
         progress.setMinimumDuration(0)
@@ -761,8 +832,9 @@ class DependenciesDialog(QDialog):
             clear_cache()
         except Exception:
             pass
+        display = self._dep_display_name(dep_id)
         QMessageBox.information(
-            self, "Done", f"'{dep_id}' se ha reinstalado correctamente."
+            self, "Listo", f"'{display}' se instaló correctamente."
         )
         self._populate()
         # Tras reinstalar queremos comparar la nueva build contra el upstream
@@ -772,10 +844,18 @@ class DependenciesDialog(QDialog):
     def _on_redownload_failed(self, dep_id, msg, progress):
         progress.close()
         self._active_worker = None
-        QMessageBox.critical(
-            self, "Reinstall failed",
-            f"No se pudo reinstalar '{dep_id}':\n\n{msg}",
+        # Mensaje amigable: el usuario no tiene por qué leer la salida de
+        # pip. Los detalles técnicos quedan en "Mostrar detalles".
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Critical)
+        box.setWindowTitle("La instalación falló")
+        box.setText(
+            f"No se pudo instalar '{dep_id}'.\n\n"
+            "Revisa tu conexión a internet y vuelve a intentarlo. "
+            "Si el problema continúa, cierra la aplicación y vuelve a abrirla."
         )
+        box.setDetailedText(str(msg))
+        box.exec()
 
     # -----------------------------------------------------------------
     # Uninstall (borrar lo instalado: binarios / runtimes / modelos)
@@ -865,10 +945,10 @@ class DependenciesDialog(QDialog):
 
     @staticmethod
     def _find_engine(engine_id):
-        for entry in CATALOG:
-            if entry.get("engine_id") == engine_id:
-                return entry
-        return None
+        # Resuelve contra el catálogo estático Y el registro de motores de
+        # usuario (instalados desde el buscador del Hub).
+        from src.ai.registry import get_entry
+        return get_entry(engine_id)
 
     def _refresh_engines_tab(self):
         """Repaints the engines tab after a state-changing action.
@@ -877,26 +957,37 @@ class DependenciesDialog(QDialog):
         from disk while preserving the user's scroll position in the
         same QScrollArea. Fallback: rebuild the tab if repopulate
         raises (for example if the layout has been corrupted).
-        """
-        try:
-            self.engines_tab.repopulate()
-            return
-        except Exception:
-            pass
 
+        Guard ``_engines_rebuilding``: ``get_state()`` puede disparar un
+        self-heal (``patch`` -> bus ``state_changed``) DURANTE el propio
+        repopulate, lo que reentra en este método y reconstruye la lista
+        dos veces (el lag de apertura). El flag corta esa reentrada.
+        """
+        if getattr(self, "_engines_rebuilding", False):
+            return
+        self._engines_rebuilding = True
         try:
-            current_index = self.tabs.indexOf(self.engines_tab)
-        except Exception:
-            current_index = 1
-        self.tabs.removeTab(current_index)
-        self.engines_tab = EnginesTab(self)
-        self.engines_tab.install_requested.connect(self._on_engine_install)
-        self.engines_tab.fsr2_download_requested.connect(self._on_fsr2_download)
-        self.engines_tab.convert_requested.connect(self._on_engine_convert)
-        self.engines_tab.open_folder.connect(self._on_engine_open_folder)
-        self.engines_tab.remove_requested.connect(self._on_engine_remove)
-        self.tabs.insertTab(current_index, self.engines_tab, "AI Engines")
-        self.tabs.setCurrentIndex(current_index)
+            try:
+                self.engines_tab.repopulate()
+                return
+            except Exception:
+                pass
+
+            try:
+                current_index = self.tabs.indexOf(self.engines_tab)
+            except Exception:
+                current_index = 1
+            self.tabs.removeTab(current_index)
+            self.engines_tab = EnginesTab(self)
+            self.engines_tab.install_requested.connect(self._on_engine_install)
+            self.engines_tab.fsr2_download_requested.connect(self._on_fsr2_download)
+            self.engines_tab.convert_requested.connect(self._on_engine_convert)
+            self.engines_tab.open_folder.connect(self._on_engine_open_folder)
+            self.engines_tab.remove_requested.connect(self._on_engine_remove)
+            self.tabs.insertTab(current_index, self.engines_tab, "AI Engines")
+            self.tabs.setCurrentIndex(current_index)
+        finally:
+            self._engines_rebuilding = False
 
     def _on_engine_install(self, engine_id):
         if not engine_id:
@@ -922,7 +1013,10 @@ class DependenciesDialog(QDialog):
             return
 
         target_dir = get_engine_dir(engine_id)
-        if os.path.isdir(target_dir) and os.listdir(target_dir):
+        # Un directorio con pesos reales ya es una instalación: confirmar.
+        # Un directorio con solo código fuente (clone antiguo sin pesos) es
+        # basura a reparar: se procede directamente con la descarga.
+        if os.path.isdir(target_dir) and os.listdir(target_dir) and dir_has_weights(target_dir):
             confirm = QMessageBox.question(
                 self, "Engine already installed",
                 f"The directory for {engine.get('display_name', engine_id)} already "
@@ -990,17 +1084,118 @@ class DependenciesDialog(QDialog):
 
     def _on_engine_install_ok(self, engine_id, target_dir, progress):
         progress.close()
+        self._git_worker = None
+
+        # Validar que la descarga produjo pesos de modelo reales. Un clone
+        # de un repo de código fuente (solo .py/README) crea el directorio
+        # pero NO es una instalación válida: el render fallaría después con
+        # "No model weights found" sin explicación.
+        engine = self._find_engine(engine_id) or {}
+        sentinel = (engine.get("sentinel", "") or "").strip()
+        repo_id = (engine.get("hf_repo_id", "") or "").strip()
+        algorithmic = not repo_id and not sentinel  # FSR: nada que descargar
+        has_weights = dir_has_weights(target_dir)
+        has_sentinel = bool(sentinel) and os.path.isfile(os.path.join(target_dir, sentinel))
+        if not algorithmic and not has_weights and not has_sentinel:
+            self._on_engine_install_failed(
+                engine_id,
+                "Download finished but no model weight files were found in:\n"
+                f"  {target_dir}\n\n"
+                "The source is a code-only repository (source files, no "
+                "pretrained weights).\n\n"
+                "Options:\n"
+                "  - Try another engine from the catalog.\n"
+                "  - Or download the .pth/.safetensors/.onnx files manually "
+                "into that folder and re-open this tab.",
+                progress,
+            )
+            return
+
         try:
             engines_mark_installed(engine_id, install_path=target_dir)
         except Exception:
             pass
-        self._git_worker = None
+
+        # Motores de usuario (Hub): registrar arch/scale reales detectados
+        # de los pesos recién descargados + el archivo de pesos usado como
+        # sentinel. El id del motor de usuario se creó en la selección
+        # (main_window), así que aquí solo enriquecemos el registro.
+        try:
+            from src.ai.user_models import is_user_engine as _is_user_engine
+            if _is_user_engine(engine_id):
+                self._refresh_user_model_record(engine_id, target_dir)
+        except Exception:
+            logger.exception("Failed to enrich user model record for %s", engine_id)
+
+        # Benchmark en background: alimenta la caché ms/frame que usa el
+        # ETA del render (y la línea "Estimated AI time" del worker).
+        # Guard: si ya hay un benchmark en marcha (instalación anterior
+        # no terminó), no lanzar otro — la caché quedaría con carrera.
+        bench_running = (
+            getattr(self, "_bench_worker", None) is not None
+            and self._bench_worker.isRunning()
+        )
+        if has_weights and not bench_running:
+            self._bench_worker = _BenchmarkWorker(engine_id, target_dir, parent=self)
+            self._bench_worker.finished.connect(
+                lambda: setattr(self, "_bench_worker", None)
+            )
+            self._bench_worker.start()
+
         self._refresh_engines_tab()
         QMessageBox.information(
             self, "Engine added",
             f"'{engine_id}' installed successfully into:\n{target_dir}\n\n"
             "Select it from the workflow node to use it.",
         )
+
+    def _refresh_user_model_record(self, engine_id, target_dir):
+        """Detecta arch/scale reales de un motor de usuario ya descargado.
+
+        En la selección del Hub se registró el modelo con display_name,
+        categoría y repo; aquí se enriquece el registro con ``weight_file``,
+        ``arch`` y ``scale`` deducidos del archivo de pesos en disco.
+        """
+        try:
+            import os
+            from src.ai.user_models import get_model, register
+            from src.ai.architectures import detect_arch_and_scale
+        except Exception as exc:
+            logger.warning("user-model refresh helpers unavailable: %s", exc)
+            return
+
+        rec = get_model(engine_id) or {}
+        weight_file = (rec.get("weight_file") or "").strip()
+        weight_path = os.path.join(target_dir, weight_file) if weight_file else ""
+        if not os.path.isfile(weight_path):
+            # Sin sentinel válido: localizar el primer peso de torch del repo
+            # (prefiere .safetensors/.pth/.pt sobre .onnx, que no se detecta).
+            candidates = []
+            for root, dirs, files in os.walk(target_dir):
+                for fn in files:
+                    low = fn.lower()
+                    if low.endswith((".safetensors", ".pth", ".pt")):
+                        candidates.append((0, os.path.join(root, fn)))
+                    elif low.endswith(".onnx"):
+                        candidates.append((1, os.path.join(root, fn)))
+            candidates.sort(key=lambda c: (c[0], c[1].lower()))
+            if candidates:
+                weight_path = candidates[0][1]
+                weight_file = os.path.relpath(weight_path, target_dir)
+
+        arch, scale = (None, None)
+        if weight_path and os.path.isfile(weight_path):
+            arch, scale = detect_arch_and_scale(weight_path)
+
+        fields = {}
+        if weight_file:
+            fields["weight_file"] = weight_file.replace("\\", "/")
+        if arch:
+            fields["arch"] = arch
+        if scale:
+            fields["scale"] = int(scale)
+        if fields:
+            register(engine_id, **fields)
 
     def _on_engine_install_failed(self, engine_id, msg, progress):
         progress.close()
@@ -1329,6 +1524,13 @@ class DependenciesDialog(QDialog):
                     engines_mark_uninstalled(eid)
                 except Exception:
                     pass
+                try:
+                    from src.ai.user_models import is_user_engine as _is_user_engine
+                    from src.ai.user_models import unregister as _unregister
+                    if _is_user_engine(eid):
+                        _unregister(eid)
+                except Exception:
+                    pass
 
         self._remove_worker = _EngineRemoveWorker(engine_id, _remove, parent=self)
         self._remove_worker.finished_ok.connect(self._on_engine_remove_ok)
@@ -1337,6 +1539,10 @@ class DependenciesDialog(QDialog):
 
     def _on_engine_remove_ok(self, engine_id):
         self._remove_worker = None
+        try:
+            engines_clear_benchmark(engine_id)
+        except Exception:
+            pass
         QMessageBox.information(
             self, "Engine removed",
             f"'{engine_id}' se ha eliminado correctamente.",
@@ -1377,7 +1583,8 @@ class DependenciesDialog(QDialog):
 
     def _kill_workers(self):
         for w_attr in ("_git_worker", "_onnx_worker", "_fsr2_worker",
-                       "_uninstall_worker", "_remove_worker"):
+                       "_uninstall_worker", "_remove_worker", "_bench_worker",
+                       "_upstream_worker", "_active_worker"):
             w = getattr(self, w_attr, None)
             if w is None:
                 continue
