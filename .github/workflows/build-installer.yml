@@ -43,22 +43,29 @@ jobs:
 
       - name: Bootstrap pip in embedded Python
         run: |
+          # CRÍTICO: el python embebido trae python313._pth con `#import site`
+          # comentado. get-pip >= 26 instala pip en Scripts/ (solo wrappers),
+          # NO en Lib/site-packages, a menos que site.py se ejecute DURANTE el
+          # install. Habilitar `import site` ANTES del get-pip garantiza que
+          # los wheels de pip caigan en site-packages y que tanto
+          # `import pip` como `python.exe -m pip` funcionen en la app real.
+          $pth = Get-ChildItem "dist\DraggyEncoder\embed-python\python*._pth" | Select-Object -First 1 -ExpandProperty FullName
+          if (-not $pth) {
+            Write-Host "WARNING: no python*._pth found; pip bootstrap will likely fail"
+          } else {
+            Write-Host "patching $pth with import site"
+            ($Lines = Get-Content $pth) | Out-Null
+            $Lines = $Lines -replace '#\s*import site', 'import site'
+            # Preserva CRLF correcto (Set-Content -NoNewline deja import site
+            # sin newline final y en algunos builds el loader lo ignora).
+            [IO.File]::WriteAllLines($pth, $Lines)
+          }
           Invoke-WebRequest "https://bootstrap.pypa.io/get-pip.py" -OutFile "get-pip.py"
           .\dist\DraggyEncoder\embed-python\python.exe get-pip.py
           Remove-Item "get-pip.py"
-          # IMPORTANTE: enable import site en el ._pth del python embebido
-          # (viene comentado por defecto); sin esto `pip --version` no
-          # encuentra `Lib\site-packages` y todo lo que luego instale
-          # huggingface_hub a demanda se rompe con "pip no se encuentra
-          # disponible".
-          $pth = Get-ChildItem "dist\DraggyEncoder\embed-python\python*._pth" | Select-Object -First 1 -ExpandProperty FullName
-          if ($pth) {
-            (Get-Content $pth) -replace '#\s*import site', 'import site' | Set-Content -NoNewline $pth
-            Write-Host "patched $pth with import site"
-          } else {
-            Write-Host "WARNING: no python*._pth found; import pip may fail for embeddable python"
-          }
-          .\dist\DraggyEncoder\embed-python\python.exe -c "import pip; print('pip', pip.__version__)"
+          # Verifica con `-m pip` (modo de invocación REAL desde
+          # src/runtimes/manager.py:_run_pip).
+          .\dist\DraggyEncoder\embed-python\python.exe -m pip --version
 
       - name: Selftest the built EXE
         run: |
