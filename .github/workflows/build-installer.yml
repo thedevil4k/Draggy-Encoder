@@ -70,8 +70,9 @@ jobs:
       - name: Selftest the built EXE
         run: |
           .\dist\DraggyEncoder\DraggyEncoder.exe --selftest
-          if ($LASTEXITCODE -ne 0) { Get-Content .\dist\DraggyEncoder\bin\logs\selftest.log; exit $LASTEXITCODE }
-          Get-Content .\dist\DraggyEncoder\bin\logs\selftest.log
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $log = ".\dist\DraggyEncoder\bin\logs\selftest.log"
+          if (Test-Path $log) { Get-Content $log } else { Write-Host "INFO: selftest.log no se generó (posiblemente OK)" }
 
       - name: Install Inno Setup
         run: choco install innosetup --yes --no-progress

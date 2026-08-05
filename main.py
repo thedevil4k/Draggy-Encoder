@@ -43,6 +43,12 @@ def run_selftest() -> int:
     import traceback
     import time
 
+    # Asegura que el directorio de logs exista ANTES de abrir el archivo.
+    # Esto es crítico en CI donde el selftest corre como paso separado y
+    # bin/logs puede no existir aún (el Get-Content del step lo espera).
+    from src.config import ensure_runtime_dirs
+    ensure_runtime_dirs()
+
     from src.config import get_logs_dir
 
     started = time.time()
@@ -79,8 +85,7 @@ def run_selftest() -> int:
             report("  " + traceback.format_exc().strip().replace("\n", "\n  "))
 
     try:
-        from src.config import ensure_runtime_dirs, get_bin_dir, get_logs_dir
-        ensure_runtime_dirs()
+        from src.config import get_bin_dir
         report(f"  OK   runtime dirs under {get_bin_dir()}")
     except Exception:
         ok = False
