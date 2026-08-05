@@ -373,13 +373,19 @@ def get_python_support_info() -> dict:
 def _default_gpu_variant() -> str:
     """Variant CUDA por defecto según la versión de Python en uso.
 
-    PyTorch publica wheels CUDA por versión de Python: en 3.14 los wheels
-    oficiales son cu126/cu130; en 3.9–3.13 seguimos en cu121 (comportamiento
-    histórico, no romper a usuarios existentes).
+    PyTorch publica wheels CUDA por versión de Python:
+    - cu121: wheels para cp39–cp312 (Windows) / cp39–cp313 (Linux)
+    - cu126: wheels para cp39–cp314 (Windows + Linux) desde torch 2.6.0
+    - cu130: wheels para cp310–cp314 (Windows + Linux) desde torch 2.9.0
+
+    En Python 3.13+, cu121 NO tiene wheels Windows (solo Linux cp313),
+    así que usamos cu126 que tiene soporte completo cp313-win_amd64.
     """
     minor = sys.version_info.minor
     if minor >= 14:
         return "cuda130"
+    if minor >= 13:
+        return "cuda126"
     return "cuda121"
 
 

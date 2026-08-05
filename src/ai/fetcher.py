@@ -27,15 +27,19 @@ Workers exposed here:
 
 from __future__ import annotations
 
+import logging
 import os
 import re
 import shutil
 import subprocess
 import sys
 import threading
+import time
 from typing import Optional
 
 from PySide6.QtCore import QThread, Signal
+
+_log = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -183,12 +187,10 @@ class HFDownloadWorker(QThread):
         self.progress.emit(0)
 
         try:
-            os.makedirs(os.path.dirname(self.target_dir) or ".", exist_ok=True)
-        except Exception:
-            pass
+            os.makedirs(self.target_dir, exist_ok=True)
+        except Exception as exc:
+            _log.warning("makedirs failed for %s: %s", self.target_dir, exc)
 
-        # huggingface_hub downloads to its own cache, then we move files
-        # to the target_dir. Use local_dir for direct output.
         self.status.emit(f"Downloading {self.repo_id}...")
         self.progress.emit(5)
 
@@ -203,13 +205,10 @@ class HFDownloadWorker(QThread):
             self.status.emit("No HuggingFace token set — public repos only.")
 
         try:
-            # Enumerate the repo's files so we can download them one by one
-            # (cancellable between files) instead of one big snapshot call.
             repo_files = HfApi(token=_token).list_repo_files(self.repo_id)
         except Exception as exc:
             _cleanup_partial(self.target_dir)
             exc_str = str(exc)
-            # Provide helpful hint for auth-related failures.
             if "401" in exc_str or "403" in exc_str or "Access Denied" in exc_str:
                 exc_str += (
                     "\n\nTip: This HuggingFace repo requires a token for "
@@ -227,6 +226,9 @@ class HFDownloadWorker(QThread):
             return
 
         total = len(repo_files)
+        MAX_RETRIES = 3
+        RETRY_DELAY_BASE = 5  # seconds
+
         try:
             for idx, filename in enumerate(repo_files):
                 if self._cancel.is_set():
@@ -240,27 +242,60 @@ class HFDownloadWorker(QThread):
                 else:
                     self.status.emit(f"Downloading {self.repo_id}...")
                 self.progress.emit(5 + int(90 * idx / total))
-                # hf_hub_download handles LFS transparently and resumes
-                # partial files by default via the local cache.
-                hf_hub_download(
-                    repo_id=self.repo_id,
-                    filename=filename,
-                    local_dir=self.target_dir,
-                    token=_token,
-                )
+
+                # Retry loop per file with exponential backoff.
+                last_error = None
+                for attempt in range(MAX_RETRIES):
+                    if self._cancel.is_set():
+                        _cleanup_partial(self.target_dir)
+                        self.failed.emit("cancelled by user")
+                        return
+                    try:
+                        hf_hub_download(
+                            repo_id=self.repo_id,
+                            filename=filename,
+                            local_dir=self.target_dir,
+                            token=_token,
+                        )
+                        last_error = None
+                        break  # success
+                    except Exception as exc:
+                        last_error = exc
+                        _log.warning(
+                            "hf_hub_download attempt %d/%d failed for %s: %s",
+                            attempt + 1, MAX_RETRIES, filename, exc,
+                        )
+                        if attempt < MAX_RETRIES - 1:
+                            delay = RETRY_DELAY_BASE * (2 ** attempt)
+                            self.status.emit(
+                                f"Retry {attempt + 2}/{MAX_RETRIES} for "
+                                f"{filename} in {delay}s..."
+                            )
+                            time.sleep(delay)
+
+                if last_error is not None:
+                    _cleanup_partial(self.target_dir)
+                    exc_str = str(last_error)
+                    if "401" in exc_str or "403" in exc_str or "Access Denied" in exc_str:
+                        exc_str += (
+                            "\n\nTip: This HuggingFace repo requires a token for "
+                            "LFS file downloads.\n\n"
+                            "1. Go to https://huggingface.co/settings/tokens\n"
+                            "2. Create a free token (read access is enough)\n"
+                            "3. Paste it in Preferences > Behavior > HuggingFace API Token"
+                        )
+                    elif "NoneType" in exc_str and "write" in exc_str:
+                        exc_str += (
+                            "\n\nTip: This may be a permissions or disk space issue. "
+                            "Try running as administrator or free up disk space."
+                        )
+                    self.failed.emit(
+                        f"Download failed after {MAX_RETRIES} attempts: {exc_str}"
+                    )
+                    return
         except Exception as exc:
             _cleanup_partial(self.target_dir)
-            exc_str = str(exc)
-            # Provide helpful hint for auth-related failures.
-            if "401" in exc_str or "403" in exc_str or "Access Denied" in exc_str:
-                exc_str += (
-                    "\n\nTip: This HuggingFace repo requires a token for "
-                    "LFS file downloads.\n\n"
-                    "1. Go to https://huggingface.co/settings/tokens\n"
-                    "2. Create a free token (read access is enough)\n"
-                    "3. Paste it in Preferences > Behavior > HuggingFace API Token"
-                )
-            self.failed.emit(f"Download failed: {exc_str}")
+            self.failed.emit(f"Download failed: {exc}")
             return
 
         if self._cancel.is_set():

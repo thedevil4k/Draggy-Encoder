@@ -42,3 +42,7 @@ dist/
 # OS
 .DS_Store
 Thumbs.db
+
+# Context files (not for GitHub)
+problems.md
+features.md

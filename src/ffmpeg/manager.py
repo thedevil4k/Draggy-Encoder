@@ -565,8 +565,17 @@ def uninstall_full(parent=None):
 # ---------------------------------------------------------------------------
 
 def get_ffprobe_path():
-    """Devuelve la ruta a ffprobe local; nunca recurre al sistema."""
+    """Devuelve la ruta a ffprobe local; busca en ffmpeg dir, ffmpeg-full, y PATH."""
+    # 1. Intentar con el ffmpeg estándar (bin/ffmpeg/ffprobe.exe)
     local = get_local_ffprobe_path()
     if os.path.exists(local):
         return local
+    # 2. Intentar con el ffmpeg-full con libplacebo (bin/ffmpeg-full/ffprobe.exe)
+    full = get_local_ffprobe_full_path()
+    if os.path.exists(full):
+        return full
+    # 3. Último recurso: buscar en PATH del sistema
+    system = find_system_ffprobe()
+    if system:
+        return system
     return None

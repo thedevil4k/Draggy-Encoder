@@ -1592,6 +1592,13 @@ class MainWindow(QMainWindow):
         update_available = info.get("update_available")
         last_checked = info.get("last_check_iso")
         last_mod_iso = (info.get("latest_fingerprint") or {}).get("last_modified_iso")
+
+        # Si el usuario tiene ffmpeg-full (libplacebo), NO mostrar el banner
+        # de update del FFmpeg estándar — el usuario ya tiene la versión mejorada.
+        if info.get("libplacebo_available"):
+            self.update_banner.hide_banner()
+            return
+
         if update_available is True:
             title = "FFmpeg update available"
             detail_bits = []
