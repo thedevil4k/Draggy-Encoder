@@ -14,7 +14,13 @@ import numpy as np
 from src.ai.registry import get_engine_meta
 from src.config import get_logs_dir, resolve_codec
 from src.ffmpeg.loudnorm import measure_loudness
-from src.ffmpeg.runner import build_args, extract_frame, get_video_info, run_ffmpeg
+from src.ffmpeg.runner import (
+    _build_loudnorm_filter,
+    build_args,
+    extract_frame,
+    get_video_info,
+    run_ffmpeg,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -514,6 +520,8 @@ def compress_video_with_ai(
         "bitrate_kbps": settings.get("bitrate", 1500),
         "format": fmt,
         "pixel_format": pixel_fmt,
+        "audio_codec": settings.get("audio", "copy"),
+        "audio_boost": bool(settings.get("audio_boost", False)),
         "total_frames": total_frames,
         "fps": fps_str,
         "encoder_fps": encoder_fps_str,
@@ -818,13 +826,19 @@ def compress_video_with_ai(
             pass
         return False
 
-    # --- Mux audio (passthrough) ---
+    # --- Mux audio (passthrough o re-codificado con Audio Boost) ---
     audio_codec = settings.get("audio", "copy")
     if audio_codec != "noaudio":
         if status_callback:
             status_callback("Muxing audio...")
+        loudnorm_meas = _measure_if_needed(
+            ffmpeg_path, input_path, settings, status_callback=status_callback,
+        )
         mux_ok = _mux_audio(
             ffmpeg_path, input_path, output_path, audio_codec,
+            loudnorm_meas=loudnorm_meas,
+            audio_boost=bool(settings.get("audio_boost", False)),
+            container_format=settings.get("format", "mp4"),
             abort_event=abort_event,
         )
         # Si el mux falló sin que el usuario abortase, lo surfaceamos
@@ -941,7 +955,35 @@ def _save_render_log(path, entry):
         logger.warning("Could not write render log %s: %s", path, exc)
 
 
+def _audio_mux_args(audio_codec, loudnorm_meas, audio_boost, container_format="mp4"):
+    """Construye los argumentos de audio para el mux tras el render IA.
+
+    Replica la convención de ``build_args``: sin boost y ``copy`` → passthrough;
+    con boost (o codec explícito) → re-codifica a ``libmp3lame``/``aac`` y aplica
+    ``loudnorm`` (two-pass si ``loudnorm_meas`` es un dict, si no single-pass).
+
+    Excepción: si el contenedor es ``webm``, el codec de revenida es ``libopus``
+    (AAC/MP3 no son válidos en WebM); ``libmp3lame`` solo si el usuario pidió
+    MP3, y en ese caso el resultado no se empaqueta en webm (config inválida que
+    ya rechazaría build_args).
+    """
+    if audio_codec == "copy" and not audio_boost:
+        return ["-c:a", "copy"]
+    if audio_codec == "mp3":
+        enc_a = "libmp3lame"
+    elif str(container_format).lower() == "webm":
+        enc_a = "libopus"
+    else:
+        enc_a = "aac"
+    args = ["-c:a", enc_a, "-b:a", "192k"]
+    if audio_boost:
+        af = _build_loudnorm_filter(loudnorm_meas)
+        args.extend(["-af", af])
+    return args
+
+
 def _mux_audio(ffmpeg_path, input_path, output_path, audio_codec="copy",
+               loudnorm_meas=None, audio_boost=False, container_format="mp4",
                abort_event=None):
     """Mux audio from the original input into the upscaled output.
 
@@ -985,10 +1027,13 @@ def _mux_audio(ffmpeg_path, input_path, output_path, audio_codec="copy",
         "-map", "0:v:0",
         "-map", "1:a?",
         "-c:v", "copy",
-        "-c:a", audio_codec if audio_codec != "copy" else "copy",
-        "-shortest",
-        "-y", tmp_out,
         ]
+        cmd.extend(
+            _audio_mux_args(
+                audio_codec, loudnorm_meas, audio_boost, container_format,
+            )
+        )
+        cmd.extend(["-shortest", "-y", tmp_out])
         proc = subprocess.Popen(
             cmd,
             stdout=subprocess.PIPE,

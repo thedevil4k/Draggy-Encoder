@@ -2085,6 +2085,97 @@ def test_compress_video_with_ai_interp_writes_double_frames(nvenc_clip):
     assert "interp-step:interp" in interp_engine.order_log
 
 
+def test_audio_mux_args_copy_passthrough_without_boost():
+    """-c:a copy when boost is off (no re-encode, fastest path)."""
+    from src.processing.pipeline import _audio_mux_args
+
+    assert _audio_mux_args("copy", None, False) == ["-c:a", "copy"]
+
+
+def test_audio_mux_args_boost_uses_two_pass_loudnorm():
+    """Boost + measured loudness → re-encode AAC with linear loudnorm."""
+    from src.processing.pipeline import _audio_mux_args
+
+    meas = {
+        "input_i": "-18.5", "input_tp": "-1.1", "input_lra": "9.2",
+        "input_thresh": "-28.0", "target_offset": "0.4",
+    }
+    args = _audio_mux_args("copy", meas, True)
+    assert args[0:4] == ["-c:a", "aac", "-b:a", "192k"]
+    af = args[args.index("-af") + 1]
+    assert "loudnorm=I=-16:TP=-1.5:LRA=11" in af
+    assert "measured_I=-18.5000" in af
+    assert "linear=true" in af
+
+
+def test_audio_mux_args_boost_fallback_single_pass():
+    """Boost without measured levels → single-pass loudnorm defaults."""
+    from src.processing.pipeline import _audio_mux_args
+
+    args = _audio_mux_args("copy", None, True)
+    assert args[0:4] == ["-c:a", "aac", "-b:a", "192k"]
+    af = args[args.index("-af") + 1]
+    assert af == "loudnorm=I=-16:TP=-1.5:LRA=11"
+
+
+def test_audio_mux_args_mp3_keeps_libmp3lame():
+    """boost + audio=mp3 keeps the LAME encoder."""
+    from src.processing.pipeline import _audio_mux_args
+
+    args = _audio_mux_args("mp3", None, True)
+    assert args[0] == "-c:a" and args[1] == "libmp3lame"
+
+
+def test_audio_mux_args_webm_uses_libopus():
+    """WebM container forces libopus (AAC/MP3 are invalid in WebM)."""
+    from src.processing.pipeline import _audio_mux_args
+
+    args = _audio_mux_args("copy", None, True, container_format="webm")
+    assert args[0:2] == ["-c:a", "libopus"]
+    assert "aac" not in args[:4]
+
+
+def test_compress_video_with_ai_audio_boost_keeps_audio(nvenc_clip):
+    """Audio Boost in the AI chain must re-encode audio and keep a track."""
+    from src.processing.pipeline import compress_video_with_ai
+
+    ffmpeg, src, tmp = nvenc_clip
+    dst = os.path.join(tmp, "chain_boost.mp4")
+    status_lines = []
+    ok = compress_video_with_ai(
+        ffmpeg,
+        src,
+        dst,
+        {
+            "audio": "copy",
+            "audio_boost": True,
+            "format": "mp4",
+            "codec": "h264_nvenc",
+            "preset": "p5",
+            "bitrate": "1500",
+            "pixel_format": "yuv420p",
+            "resolution": "original",
+        },
+        inference_engines=[_FakeEngine("upscale-2x", 2)],
+        status_callback=status_lines.append,
+    )
+    assert ok is True
+    assert os.path.exists(dst) and os.path.getsize(dst) > 0
+    # Audio Boost must run the loudness measurement pass on the source.
+    assert any("Analyzing audio levels" in line for line in status_lines), status_lines
+
+    ffprobe = os.path.join(os.path.dirname(ffmpeg), "ffprobe.exe")
+    assert os.path.exists(ffprobe), "ffprobe not shipped with full build"
+    out = subprocess.run(
+        [ffprobe, "-v", "error", "-select_streams", "a:0",
+         "-show_entries", "stream=codec_name",
+         "-of", "default=noprint_wrappers=1", dst],
+        capture_output=True, text=True, timeout=30,
+    ).stdout
+    # Boost re-encodes to AAC, not a raw copy of the source track.
+    assert "aac" in out, f"expected re-encoded AAC audio, got: {out!r}"
+
+
 # ==--------------------------------------------------------------------==
 # Standalone runner (works even without pytest installed)
 # ==--------------------------------------------------------------------==
