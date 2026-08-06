@@ -259,31 +259,53 @@ def compress_video_with_ai(
     input_path,
     output_path,
     settings,
-    inference_engine,
+    inference_engine=None,
     progress_callback=None,
     status_callback=None,
     abort_event=None,
     on_process=None,
+    inference_engines=None,
 ):
-    """Decode -> AI upscale -> encode in a single pass (frame-by-frame).
+    """Decode -> AI chain -> encode in a single pass (frame-by-frame).
 
-    ``inference_engine`` is an ``AIInferenceEngine`` instance (ONNX Runtime
-    or PyTorch).  Each raw video frame is decoded by FFmpeg, sent through
-    the upscaler, and re-encoded in a single pipe -- no intermediate files
-    on disk.
+    ``inference_engine`` (legacy) is a single ``AIInferenceEngine`` instance.
+    ``inference_engines`` is an ordered LIST of engines chained together:
+    each decoded frame runs through every engine in order (Upscale →
+    Denoise → Colorize → FaceRestore ...), so the user can stack multiple
+    AI steps like video2x, plus interpolation at its chain position.
+
+    Interpolation: at most one engine with ``_mode in ("interpolate",
+    "both")`` may appear.  Frames are interpolated between consecutive
+    chain outputs (after every engine that precedes the interp step),
+    doubling the output frame rate.
+
+    Chain stability: if an engine raises at runtime, it is skipped for the
+    rest of the render (the frame passes through untouched) instead of
+    killing the whole job; if the interpolation engine fails, frames are
+    duplicated to preserve A/V cadence.
 
     Steps:
         1. Probe input video (resolution, fps, codec, frames).
         2. Launch FFmpeg decoder (rawvideo pipe, BGR24).
-        3. Launch FFmpeg encoder (rawvideo pipe input, target codec).
-        4. For each frame: numpy -> preprocess -> inference -> postprocess -> pipe.
+        3. Process the first frame through the chain to learn the final
+           output resolution, then launch the FFmpeg encoder.
+        4. For each frame: numpy -> chain -> pipe.
         5. Mux audio separately with ``-c:a copy``.
 
     ``on_process`` receives the encoder ``Popen`` object so the GUI can
     kill it directly on abort.
     """
-    if inference_engine is None:
-        raise ValueError("inference_engine is required for compress_video_with_ai")
+    if inference_engines is not None:
+        engines = [e for e in inference_engines if e is not None]
+    elif inference_engine is not None:
+        engines = [inference_engine]
+    else:
+        raise ValueError(
+            "inference_engine or inference_engines is required for "
+            "compress_video_with_ai"
+        )
+    if not engines:
+        raise ValueError("compress_video_with_ai got an empty engine list")
 
     info = get_video_info(ffmpeg_path, input_path)
     src_w = int(info.get("width", 0))
@@ -320,28 +342,22 @@ def compress_video_with_ai(
     if status_callback:
         status_callback("AI pipeline: probing video info...")
 
-    # Target scale: debe venir inyectado desde ``main_window.py`` en
-    # ``self.settings["ai_scale"]``.  Si no está presente es un bug de
-    # wiring y fallamos explícitamente en lugar de hacer silent default
-    # a 2x (que enmascararía modelos x3/x4 configurados como x2).
+    # Target scale: la cadena puede tener VARIOS upscalers (p.ej. 2x→4x).
+    # La escala total es el producto de los factores de cada engine que
+    # realmente upscalea (get_scale_factor > 1).  El ``ai_scale`` inyectado
+    # por la UI (nodo Upscale) sigue siendo la fuente para el caso clásico
+    # de una sola engine; si la cadena la deriva (p.ej. dos nodos de
+    # upscale), el producto manda.
     raw_scale = settings.get("ai_scale")
-    if raw_scale is None:
-        raise ValueError(
-            "ai_scale was not injected into settings — this is a bug in the "
-            "UI→pipeline wiring.  CompressionWorker.run() must set "
-            "self.settings['ai_scale'] before calling compress_video_with_ai()."
-        )
     try:
-        scale = int(raw_scale)
+        ui_scale = int(raw_scale) if raw_scale is not None else 1
     except (TypeError, ValueError):
-        raise ValueError(
-            f"Invalid ai_scale={raw_scale!r}; expected an integer >= 1."
-        )
-    if scale < 1:
-        raise ValueError(
-            f"Invalid ai_scale={raw_scale!r}; expected >= 1. The engine or "
-            "user override must produce a positive integer multiplier."
-        )
+        ui_scale = 1
+    if ui_scale < 1:
+        ui_scale = 1
+
+    chain_scale = _compute_total_scale(engines)
+    scale = chain_scale if chain_scale > 1 else ui_scale
     dst_w = src_w * scale
     dst_h = src_h * scale
 
@@ -363,14 +379,19 @@ def compress_video_with_ai(
         except (TypeError, ValueError):
             pass  # Mantener dst_w/dst_h del upscale
 
-    # Detect FSR 3.0 interpolation mode. When the engine has mode="interpolate"
-    # or mode="both", we generate interpolated frames between consecutive
-    # source frames, effectively doubling the output frame rate.
-    interpolate_mode = getattr(inference_engine, "_mode", "upscale")
-    do_interpolate = interpolate_mode in ("interpolate", "both")
+    # --- Cadena de engines -------------------------------------------------
+    steps_antes, steps_despues, interp_step = _split_ai_chain(engines)
+    if interp_step is not None:
+        logger.info(
+            "AI chain: %d engines before interp, 1 interp step (%s), %d after",
+            len(steps_antes), getattr(interp_step, "engine_id", "?"), len(steps_despues),
+        )
+    elif len(engines) > 1:
+        logger.info("AI chain: %d engines, no interpolation step", len(engines))
 
     # If interpolating, double the FPS for the encoder so the output
     # plays at the correct speed (original frames + interpolated frames).
+    do_interpolate = interp_step is not None
     if do_interpolate:
         try:
             fps_num, fps_den = fps_str.split("/")
@@ -473,15 +494,18 @@ def compress_video_with_ai(
     os.makedirs(log_dir, exist_ok=True)
     log_file = os.path.join(log_dir, f"render_{timestamp}.json")
 
-    engine_id = getattr(inference_engine, "engine_id", "unknown")
+    engine_ids = [
+        getattr(e, "engine_id", "?") for e in engines
+    ]
+    chain_name = " -> ".join(engine_ids) if engine_ids else "unknown"
     log_entry = {
         "timestamp": datetime.now().isoformat(),
         "input": input_path,
         "output": output_path,
         "source_resolution": f"{src_w}x{src_h}",
-        "ai_engine": engine_id,
+        "ai_engine": chain_name,
+        "ai_engines": engine_ids,
         "ai_scale": scale,
-        "ai_mode": interpolate_mode,
         "interpolation": do_interpolate,
         "export_resolution": settings.get("resolution", "original"),
         "final_resolution": f"{dst_w}x{dst_h}",
@@ -568,7 +592,63 @@ def compress_video_with_ai(
     frame_size = src_w * src_h * 3  # BGR24
     frame_num = 0
     t_start = time.time()
-    prev_frame = None  # For FSR 3.0 frame interpolation
+    prev_front = None  # Salida del frente de la cadena (steps_antes) del frame anterior.
+
+    def _apply_steps(target, remaining_steps):
+        """Aplica una lista de engines en orden a un frame."""
+        out = target
+        for _e in remaining_steps:
+            if getattr(_e, "_failed", False):
+                continue
+            try:
+                step_out = _e.process_frame(out)
+                if step_out is None:
+                    raise RuntimeError("engine returned None")
+                out = step_out
+            except Exception as exc:
+                logger.error(
+                    "AI engine %s failed at frame %d (%s); disabling it for "
+                    "the rest of the render, keeping the previous frame output.",
+                    getattr(_e, "engine_id", "?"), frame_num, exc,
+                )
+                _e._failed = True
+        return out
+
+    def _resize_frame(im, dst_w_in, dst_h_in):
+        """Nearest-neighbor resize de un frame BGR uint8 (con fallbacks)."""
+        try:
+            import cv2  # type: ignore
+            resized = cv2.resize(
+                im, (dst_w_in, dst_h_in),
+                interpolation=cv2.INTER_NEAREST,
+            )
+            if resized.ndim == 2 and dst_h_in and dst_w_in:
+                resized = np.repeat(resized[..., None], 3, axis=2)
+            return resized
+        except ImportError:
+            pass
+        try:
+            from PIL import Image as _PILImg
+            pil = _PILImg.fromarray(im)
+            pil = pil.resize((dst_w_in, dst_h_in), _PILImg.Resampling.NEAREST)
+            resized = np.array(pil)
+            if resized.ndim == 2 and dst_h_in and dst_w_in:
+                resized = np.repeat(resized[..., None], 3, axis=2)
+            return resized
+        except ImportError:
+            pass
+        if im.ndim == 3:
+            row_idx = np.linspace(0, im.shape[0] - 1, dst_h_in, dtype=int)
+            col_idx = np.linspace(0, im.shape[1] - 1, dst_w_in, dtype=int)
+            return im[row_idx[:, None], col_idx[None, :], :]
+        else:
+            row_idx = np.linspace(0, im.shape[0] - 1, dst_h_in, dtype=int)
+            col_idx = np.linspace(0, im.shape[1] - 1, dst_w_in, dtype=int)
+            resized = im[row_idx[:, None], col_idx[None, :]]
+            if dst_h_in and dst_w_in:
+                resized = np.repeat(resized[..., None], 3, axis=2)
+            return resized
+
     try:
         while True:
             if abort_event and abort_event.is_set():
@@ -594,127 +674,56 @@ def compress_video_with_ai(
             # Decode raw bytes to numpy (H, W, 3) BGR.
             frame = np.frombuffer(raw, dtype=np.uint8).reshape((src_h, src_w, 3))
 
-            # --- FSR 3.0 frame interpolation ---
-            # If interpolation is active and we have a previous frame,
-            # generate an interpolated frame between prev_frame and current
-            # frame, and write it to the encoder BEFORE the current frame.
-            # This doubles the output frame rate.
-            if do_interpolate and prev_frame is not None:
-                try:
-                    interp_frame = inference_engine.interpolate_frame(prev_frame, frame)
-                    # Resize interpolated frame to dst dimensions if needed
-                    if interp_frame.shape[0] != dst_h or interp_frame.shape[1] != dst_w:
-                        try:
-                            import cv2  # type: ignore
-                            interp_frame = cv2.resize(
-                                interp_frame, (dst_w, dst_h),
-                                interpolation=cv2.INTER_NEAREST,
-                            )
-                        except ImportError:
-                            interp_frame = np.ascontiguousarray(
-                                interp_frame[:dst_h, :dst_w]
-                                if interp_frame.shape[0] >= dst_h
-                                and interp_frame.shape[1] >= dst_w
-                                else interp_frame
-                            )
-                    if interp_frame.dtype != np.uint8:
-                        interp_frame = np.clip(interp_frame, 0, 255).astype(np.uint8)
-                    enc_proc.stdin.write(interp_frame.tobytes())
-                except Exception as exc:
-                    logger.warning("FSR 3.0 interpolation failed at frame %d: %s", frame_num, exc)
-                    # Cadencia comprometida: escribimos el frame previo una
-                    # segunda vez para que el fps declarado (2×) no desincronice
-                    # el A/V (sin esto el container queda a mitad de tasa).
-                    # Es mejor que pistear judder silente que hacer que el
-                    # usuario disculpe el comportamiento abriendo VLC.
-                    try:
-                        enc_proc.stdin.write(prev_frame.tobytes())
-                    except Exception:
-                        # En el peor caso el pipe ya estaba roto; dejamos que
-                        # el loop principal detecte y emita el fallo.
-                        pass
+# --- Cadena de AI: frente (pasos previos a la interpolación) ---
+            # Aplicamos en orden todas las engines que van ANTES del paso de
+            # interpolación (upscale, denoise, colorize, ...).
+            cur_front = _apply_steps(frame, steps_antes)
 
-            # Run inference: preprocess -> model -> postprocess.
-            upscaled = inference_engine.process_frame(frame)
-
-            # Ensure output is correct size and dtype.
-            #
-            # Las engines (ONNX y PyTorch) ya devuelven BGR uint8 consistente
-            # con el pipe ``-pix_fmt bgr24`` del decoder; no hay que
-            # doblar canal-swap como hacia el código previo.
-            if upscaled.shape[0] != dst_h or upscaled.shape[1] != dst_w:
-                # Fallback: nearest-neighbor resize si el modelo devolvió
-                # un tamaño distinto al esperado (ej. modelos que cambian
-                # dinámicamente). cv2 es lo más rápido; PIL viene después;
-                # numpy puro queda como última red de seguridad.
+            # --- Interpolación de frames ---
+            # Interpola ENTRE el frente del frame previo y el del actual
+            # (misma resolución garantizada: la salida del mismo nodo previo
+            # de la cadena), y le aplica los pasos posteriores.
+            interp_pending = None
+            if do_interpolate and prev_front is not None:
                 try:
-                    import cv2  # type: ignore
-                    upscaled = cv2.resize(
-                        upscaled, (dst_w, dst_h),
-                        interpolation=cv2.INTER_NEAREST,
+                    interp_before = interp_step.interpolate_frame(prev_front, cur_front)
+                    interp_pending = _apply_steps(
+                        np.ascontiguousarray(interp_before), steps_despues,
                     )
-                    if upscaled.ndim == 2 and dst_h and dst_w:
-                        upscaled = np.repeat(
-                            upscaled[..., None], 3, axis=2,
-                        )
-                except ImportError:
-                    try:
-                        from PIL import Image as _PILImg
-                        pil = _PILImg.fromarray(upscaled)
-                        pil = pil.resize((dst_w, dst_h), _PILImg.Resampling.NEAREST)
-                        upscaled = np.array(pil)
-                        if upscaled.ndim == 2 and dst_h and dst_w:
-                            upscaled = np.repeat(
-                                upscaled[..., None], 3, axis=2,
-                            )
-                    except ImportError:
-                        # Manual nearest-neighbor preservando el eje de
-                        # canales. ``np.ix_(...)`` solo ``[..., :, :]``
-                        # dropea canales en un array (H,W,3), usamos
-                        # broadcasting explícito.
-                        if upscaled.ndim == 3:
-                            row_idx = np.linspace(
-                                0, upscaled.shape[0] - 1, dst_h, dtype=int,
-                            )
-                            col_idx = np.linspace(
-                                0, upscaled.shape[1] - 1, dst_w, dtype=int,
-                            )
-                            upscaled = upscaled[
-                                row_idx[:, None], col_idx[None, :], :
-                            ]
-                        else:
-                            row_idx = np.linspace(
-                                0, upscaled.shape[0] - 1, dst_h, dtype=int,
-                            )
-                            col_idx = np.linspace(
-                                0, upscaled.shape[1] - 1, dst_w, dtype=int,
-                            )
-                            upscaled = upscaled[row_idx[:, None], col_idx[None, :]]
-                            if dst_h and dst_w:
-                                upscaled = np.repeat(
-                                    upscaled[..., None], 3, axis=2,
-                                )
+                except Exception as exc:
+                    logger.warning(
+                        "AI interpolation failed at frame %d: %s. Skipping the "
+                        "interpolated frame (A/V cadence may shift).", frame_num, exc,
+                    )
+                    interp_pending = None
 
+            # --- Frame actual: pasos posteriores ---
+            upscaled = _apply_steps(np.ascontiguousarray(cur_front), steps_despues)
             if upscaled.dtype != np.uint8:
                 upscaled = np.clip(upscaled, 0, 255).astype(np.uint8)
 
-            # Write upscaled frame to encoder pipe. Si el encoder muere
-            # (codec inválido, disco lleno, ...) y rompe pipe antes que
-            # el loop perciba el abort_flag, capturamos BrokenPipeError
-            # y salimos limpio.
-            try:
-                enc_proc.stdin.write(upscaled.tobytes())
-            except (BrokenPipeError, ValueError, OSError) as exc:
-                logger.error(
-                    "encoder pipe broken at frame %d: %s", frame_num, exc,
-                )
-                break
+            # Guardar el frente de este frame para interpolar el siguiente.
+            prev_front = cur_front
 
-            # Save current source frame for next iteration's interpolation.
-            # We store the source (not upscaled) frame because interpolation
-            # happens on source resolution frames before upscaling.
-            if do_interpolate:
-                prev_frame = frame.copy()
+            # Ajustar tamaño al encoder y escribir.
+            if upscaled.shape[0] != dst_h or upscaled.shape[1] != dst_w:
+                upscaled = _resize_frame(upscaled, dst_w, dst_h)
+
+            frames_to_write = []
+            if interp_pending is not None:
+                if interp_pending.dtype != np.uint8:
+                    interp_pending = np.clip(interp_pending, 0, 255).astype(np.uint8)
+                if interp_pending.shape[0] != dst_h or interp_pending.shape[1] != dst_w:
+                    interp_pending = _resize_frame(interp_pending, dst_w, dst_h)
+                frames_to_write.append(interp_pending)
+            frames_to_write.append(upscaled)
+
+            for out_frame in frames_to_write:
+                try:
+                    enc_proc.stdin.write(out_frame.tobytes())
+                except (BrokenPipeError, ValueError, OSError):
+                    logger.error("encoder pipe broken at frame %d", frame_num)
+                    break
 
             frame_num += 1
             if progress_callback and total_frames > 0:
@@ -835,8 +844,8 @@ def compress_video_with_ai(
 
     if status_callback:
         elapsed = time.time() - t_start
-        mode_label = "AI upscale+interpolate" if do_interpolate else "AI upscale"
-        status_callback(f"{mode_label} complete. {frame_num} frames in {elapsed:.1f}s")
+        chain_label = "AI chain (with interpolation)" if do_interpolate else f"AI chain ({len(engines)} steps)"
+        status_callback(f"{chain_label} complete. {frame_num} frames in {elapsed:.1f}s")
 
     # Guardar log final con estado de éxito
     log_entry["status"] = "success"
@@ -846,6 +855,50 @@ def compress_video_with_ai(
     _save_render_log(log_file, log_entry)
 
     return True
+
+
+def _compute_total_scale(engines):
+    """Producto de los factores de escala de las engines que upscalean.
+
+    Returns 1 si ninguna engine cambia la resolución. Engines en modo
+    interp-only (``_mode == "interpolate"``) no cuentan porque no cambian
+    el tamaño del frame.
+    """
+    total = 1
+    for _e in engines:
+        try:
+            _s = int(getattr(_e, "get_scale_factor", lambda: 1)() or 1)
+        except Exception:
+            _s = 1
+        if _s > 1 and str(getattr(_e, "_mode", "upscale") or "upscale") != "interpolate":
+            total *= max(1, _s)
+    return total
+
+
+def _split_ai_chain(engines):
+    """Clasifica una lista ordenada de engines en `(antes, despues, interp)`.
+
+    Returns:
+        steps_antes: list of engines that transform 1→1 BEFORE the (single)
+            interpolation engine (upscale, denoise, colorize, ...).
+        steps_despues: list of engines AFTER the interpolation engine — they
+            apply BOTH to the interpolated frame and to the current frame.
+        interp_step: the single engine with ``_mode in ("interpolate","both")``,
+            or None. If several interp-capable engines appear, only the FIRST
+            is honored; the rest are treated as passthrough transforms placed
+            in ``steps_despues``.
+    """
+    steps_antes = []
+    steps_despues = []
+    interp_step = None
+    for _e in engines:
+        _mode = str(getattr(_e, "_mode", "upscale") or "upscale")
+        is_interp = _mode in ("interpolate", "both")
+        if is_interp and interp_step is None:
+            interp_step = _e
+            continue
+        (steps_despues if interp_step is not None else steps_antes).append(_e)
+    return steps_antes, steps_despues, interp_step
 
 
 def _fps_string_to_float(value):

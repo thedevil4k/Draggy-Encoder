@@ -1915,6 +1915,177 @@ def test_detect_arch_and_scale_file_missing_and_unknown():
 
 
 # ==--------------------------------------------------------------------==
+# 7. AI chain: split, scale, end-to-end ordering
+# ==--------------------------------------------------------------------==
+
+
+class _FakeEngine:
+    """Minimal AIInferenceEngine stand-in for pure pipeline tests."""
+
+    def __init__(self, engine_id, scale=1, mode="upscale"):
+        self.engine_id = engine_id
+        self._scale = scale
+        self._mode = mode
+        self._failed = False
+        self.order_log = []
+
+    def get_scale_factor(self):
+        return self._scale
+
+    def process_frame(self, frame):
+        self.order_log.append(self.engine_id)
+        if self._failed:
+            raise RuntimeError(f"{self.engine_id} boom")
+        if self._scale > 1:
+            import numpy as _np
+            return _np.repeat(_np.repeat(frame, self._scale, axis=0), self._scale, axis=1)
+        return frame
+
+    def interpolate_frame(self, prev, cur):
+        self.order_log.append(f"{self.engine_id}:interp")
+        return cur
+
+
+def test_split_ai_chain_no_interp_preserves_order():
+    from src.processing.pipeline import _split_ai_chain
+
+    ups = _FakeEngine("upscale", 2)
+    den = _FakeEngine("denoise", 1)
+    col = _FakeEngine("colorize", 1)
+    antes, despues, interp = _split_ai_chain([ups, den, col])
+    assert interp is None
+    assert [e.engine_id for e in antes] == ["upscale", "denoise", "colorize"]
+    assert despues == []
+
+
+def test_split_ai_chain_interp_in_middle():
+    from src.processing.pipeline import _split_ai_chain
+
+    ups = _FakeEngine("upscale", 2)
+    interp = _FakeEngine("interp", 1, mode="interpolate")
+    den = _FakeEngine("denoise", 1)
+    antes, despues, interp_step = _split_ai_chain([ups, interp, den])
+    assert interp_step is interp
+    assert [e.engine_id for e in antes] == ["upscale"]
+    assert [e.engine_id for e in despues] == ["denoise"]
+
+
+def test_split_ai_chain_only_first_interp_honored():
+    from src.processing.pipeline import _split_ai_chain
+
+    i1 = _FakeEngine("interp1", 1, mode="interpolate")
+    i2 = _FakeEngine("interp2", 1, mode="interpolate")
+    antes, despues, interp_step = _split_ai_chain([i1, i2])
+    assert interp_step is i1
+    assert [e.engine_id for e in despues] == ["interp2"]
+
+
+def test_compute_total_scale_chain_product():
+    from src.processing.pipeline import _compute_total_scale
+
+    assert _compute_total_scale([_FakeEngine("a", 2), _FakeEngine("b", 4)]) == 8
+    assert _compute_total_scale([_FakeEngine("a", 2), _FakeEngine("b", 1)]) == 2
+    # Interp-only engines do not change resolution -> excluded.
+    assert _compute_total_scale([
+        _FakeEngine("a", 2),
+        _FakeEngine("i", 4, mode="interpolate"),
+    ]) == 2
+    assert _compute_total_scale([_FakeEngine("den", 1)]) == 1
+    assert _compute_total_scale([]) == 1
+
+
+def test_compress_video_with_ai_chain_order_and_scale(nvenc_clip):
+    """Chain of two engines must run in order and output the total scale."""
+    from src.processing.pipeline import compress_video_with_ai
+
+    ffmpeg, src, tmp = nvenc_clip
+    dst = os.path.join(tmp, "chain4.mp4")
+    engines = [_FakeEngine("first-2x", 2), _FakeEngine("second-2x", 2)]
+    ok = compress_video_with_ai(
+        ffmpeg,
+        src,
+        dst,
+        {
+            "audio": "noaudio",
+            "format": "mp4",
+            "codec": "h264_nvenc",
+            "preset": "p5",
+            "bitrate": "1500",
+            "pixel_format": "yuv420p",
+            "resolution": "original",
+        },
+        inference_engines=engines,
+    )
+    assert ok is True
+    assert os.path.exists(dst) and os.path.getsize(dst) > 0
+    # Both engines ran, in chain order, and the first frame went through
+    # the whole chain before the second one.
+    assert engines[0].order_log
+    assert engines[1].order_log
+    assert engines[0].order_log[0] == "first-2x"
+    assert engines[1].order_log[0] == "second-2x"
+    # Interleaved: first-2x, second-2x, first-2x, second-2x, ...
+    assert engines[0].order_log[:2] == ["first-2x", "first-2x"]
+    assert engines[1].order_log[:2] == ["second-2x", "second-2x"]
+
+
+def test_compress_video_with_ai_chain_engine_failure_degrades(nvenc_clip):
+    """A failing engine is disabled mid-render; the chain still completes."""
+    from src.processing.pipeline import compress_video_with_ai
+
+    ffmpeg, src, tmp = nvenc_clip
+    dst = os.path.join(tmp, "chain_fail.mp4")
+    bad = _FakeEngine("boom-engine", 1)
+    bad._failed = True  # fail on every frame from frame 0
+    ok = compress_video_with_ai(
+        ffmpeg,
+        src,
+        dst,
+        {
+            "audio": "noaudio",
+            "format": "mp4",
+            "codec": "h264_nvenc",
+            "preset": "p5",
+            "bitrate": "1500",
+            "pixel_format": "yuv420p",
+            "resolution": "original",
+        },
+        inference_engines=[_FakeEngine("ok-engine", 1), bad],
+    )
+    assert ok is True
+    assert os.path.exists(dst) and os.path.getsize(dst) > 0
+    assert bad._failed is True
+
+
+def test_compress_video_with_ai_interp_writes_double_frames(nvenc_clip):
+    """Interp step doubles the output frame count (interp + current)."""
+    from src.processing.pipeline import compress_video_with_ai
+
+    ffmpeg, src, tmp = nvenc_clip
+    dst = os.path.join(tmp, "chain_interp.mp4")
+    interp_engine = _FakeEngine("interp-step", 1, mode="interpolate")
+    ok = compress_video_with_ai(
+        ffmpeg,
+        src,
+        dst,
+        {
+            "audio": "noaudio",
+            "format": "mp4",
+            "codec": "h264_nvenc",
+            "preset": "p5",
+            "bitrate": "1500",
+            "pixel_format": "yuv420p",
+            "resolution": "original",
+        },
+        inference_engines=[interp_engine],
+    )
+    assert ok is True
+    assert os.path.exists(dst) and os.path.getsize(dst) > 0
+    # First frame has no interp; every subsequent one emits interp+current.
+    assert "interp-step:interp" in interp_engine.order_log
+
+
+# ==--------------------------------------------------------------------==
 # Standalone runner (works even without pytest installed)
 # ==--------------------------------------------------------------------==
 

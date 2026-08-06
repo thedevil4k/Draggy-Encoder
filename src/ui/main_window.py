@@ -191,259 +191,52 @@ class CompressionWorker(QThread):
     def run(self):
         try:
             status_cb = self._emit_status
-            # Determine if AI pipeline should be used (Upscale node active).
+            # Determine if the AI chain should be used: any active workflow
+            # node with an engine id (Upscale, Interp, Denoise, Colorize,
+            # FaceRestore — in the re-ordered chain position).
             use_ai = False
-            upscale_engine_id = None
-            upscale_model_path = None
-            upscale_scale = None
-            upscale_scale_info = {}  # Full info dict from workflow (includes mode for FSR 3.0)
-            if self.ai_engines and "Upscale" in self.ai_engines:
-                upscale_info = self.ai_engines["Upscale"]
-                if isinstance(upscale_info, dict):
-                    upscale_engine_id = upscale_info.get("engine_id", "")
-                    upscale_model_path = upscale_info.get("model_path")
-                    upscale_scale = upscale_info.get("scale")
-                    upscale_scale_info = upscale_info
+            for _cat, _info in (self.ai_engines or {}).items():
+                if isinstance(_info, dict):
+                    _eid = _info.get("engine_id", "")
                 else:
-                    upscale_engine_id = upscale_info
-                if upscale_engine_id:
+                    _eid = _info or ""
+                if _eid:
                     use_ai = True
-
-            # The Interp node may carry an FSR 3.1 engine (frame
-            # interpolation). FSR 3.1 decouples upscaling from frame
-            # generation: activating FSR in the Upscale node AND in the
-            # Interp node runs both features; activating only the Interp
-            # node runs interpolation alone.
-            interp_info_raw = (self.ai_engines or {}).get("Interpolate") or {}
-            interp_engine_id = interp_info_raw.get("engine_id", "") if isinstance(interp_info_raw, dict) else interp_info_raw
-            if interp_engine_id and "fsr31" in interp_engine_id:
-                use_ai = True
-
-            # Inyectar ai_scale en settings para que pipeline.py lo use
-            # al calcular la resolución del encoder.
-            if upscale_scale is not None:
-                self.settings["ai_scale"] = upscale_scale
-
-            # FSR 3.1 mode resolution across both workflow nodes (see
-            # ``resolve_fsr3_engine``): Upscale(FSR31) + Interp(FSR31)
-            # -> "both", Upscale(FSR31) alone -> "upscale",
-            # Interp(FSR31) alone -> "interpolate".
-            fsr3_engine_id, fsr3_model_path, fsr3_mode = resolve_fsr3_engine(
-                (self.ai_engines or {}).get("Upscale"),
-                interp_info_raw,
-            )
+                    break
 
             if self.mode == "compress" and use_ai:
-                # Build inference engine from the selected model.
-                # Strategy: prefer ONNX Runtime when it has an ACTIVE GPU
-                # provider (CUDA/TensorRT).  If ONNX only runs on CPU and
-                # torch with CUDA is available, prefer PyTorch (GPU) —
-                # otherwise the render would run on CPU silently.  If no
-                # .onnx exists and torch is available, convert .pth -> .onnx
-                # on the fly.  If nothing works, fail with a clear message.
+                # Build the AI CHAIN: each active workflow node (Upscale,
+                # Interp, Denoise, Colorize, FaceRestore) resolves to a
+                # loaded engine, in the re-ordered chain position. Engines
+                # that cannot be loaded fail fast with a clear message.
                 try:
-                    from src.ai.inference import (
-                        create_inference_engine,
-                        get_model_path,
-                        convert_pth_to_onnx,
-                        PyTorchInferenceEngine,
-                    )
-                    from src.ai.architectures import is_torch_available
-
-                    status_cb(f"Loading AI model: {fsr3_engine_id or upscale_engine_id}...")
-
-                    inference_engine = None
-                    errors = []
-
-                    # FSR engines don't need model files — pure algorithmic upscale
-                    if fsr3_engine_id and fsr3_engine_id.startswith("upscale-fsr"):
-                        if "fsr31" in fsr3_engine_id:
-                            # FSR 3.1 (FSR 2.0 upscaling + frame interpolation).
-                            # The mode (upscale/interpolate/both) is resolved
-                            # from both workflow nodes above (fsr3_mode).
-                            status_cb(f"FSR 3.1 engine (mode={fsr3_mode}, GPU via libplacebo)...")
-                            try:
-                                from src.ai.inference import FSR31Engine
-                                inference_engine = FSR31Engine(
-                                    fsr3_model_path or "",
-                                    fsr3_engine_id,
-                                    mode=fsr3_mode,
-                                )
-                                if inference_engine.load():
-                                    status_cb(f"AI model loaded — using GPU (FSR 3.1, mode={fsr3_mode})")
-                                else:
-                                    errors.append(
-                                        "FSR 3.1 requires FFmpeg full with libplacebo support"
-                                    )
-                            except Exception as exc:
-                                errors.append(f"FSR 3.1 engine failed: {exc}")
-                        elif upscale_engine_id.endswith("-v2"):
-                            # FSR 2.0 (GPU via libplacebo)
-                            status_cb(f"FSR 2.0 engine (GPU via libplacebo)...")
-                            try:
-                                inference_engine = create_inference_engine(upscale_engine_id, upscale_model_path or "")
-                                status_cb("AI model loaded — using GPU (FSR 2.0 via libplacebo)")
-                            except Exception as exc:
-                                errors.append(f"FSR 2.0 engine failed: {exc}")
-                        else:
-                            # FSR 1.0 (CPU)
-                            status_cb(f"FSR 1.0 engine (CPU, no model download needed)...")
-                            try:
-                                inference_engine = create_inference_engine(upscale_engine_id, upscale_model_path or "")
-                                status_cb("AI model loaded — using CPU (FSR 1.0)")
-                            except Exception as exc:
-                                errors.append(f"FSR engine failed: {exc}")
-
-                        if inference_engine is None or not getattr(inference_engine, "is_loaded", False):
-                            detail = " | ".join(errors) if errors else "FSR engine failed to load."
-                            raise RuntimeError(
-                                f"Could not load inference engine for {fsr3_engine_id}.\n"
-                                f"Details: {detail}\n\n"
-                                "FSR 1.0 needs no downloads; FSR 2.0/3.1 need "
-                                "FFmpeg full with libplacebo (Manage Dependencies → "
-                                "Runtimes & Binaries)."
-                            )
-                    else:
-                        pth_path = upscale_model_path  # Prefer the exact path from UI
-
-                        # If no model_path from UI, resolve from registry
-                        if not pth_path or not os.path.exists(pth_path):
-                            pth_path = get_model_path(upscale_engine_id, "torch")
-
-                        # 1) Try to find an existing .onnx file next to the .pth
-                        onnx_path = None
-                        if pth_path:
-                            candidate = os.path.splitext(pth_path)[0] + ".onnx"
-                            if os.path.exists(candidate):
-                                onnx_path = candidate
-                        if not onnx_path:
-                            onnx_path = get_model_path(upscale_engine_id, "onnxruntime")
-                        if onnx_path:
-                            status_cb(f"Found ONNX model, using ONNX Runtime (GPU if available)...")
-                            try:
-                                engine_candidate = create_inference_engine("onnxruntime", onnx_path)
-                            except Exception as exc:
-                                errors.append(f"ONNX Runtime failed: {exc}")
-                            else:
-                                active_providers = getattr(engine_candidate, "get_active_providers", None)
-                                active = (
-                                    active_providers()
-                                    if callable(active_providers)
-                                    else getattr(engine_candidate, "_providers", [])
-                                )
-                                # ONNX ativo solo en CPU: si torch puede usar
-                                # CUDA, preferimos PyTorch (GPU) antes que
-                                # procesar el video entero en CPU.
-                                if (
-                                    "CUDAExecutionProvider" not in active
-                                    and "TensorrtExecutionProvider" not in active
-                                    and pth_path
-                                    and is_torch_available()
-                                ):
-                                    status_cb("ONNX Runtime sin GPU — cambiando a PyTorch (CUDA)...")
-                                    try:
-                                        torch_engine = PyTorchInferenceEngine(pth_path, upscale_engine_id)
-                                        if torch_engine.load():
-                                            inference_engine = torch_engine
-                                        else:
-                                            errors.append("PyTorch load failed; keeping ONNX Runtime (CPU)")
-                                            inference_engine = engine_candidate
-                                    except Exception as exc:
-                                        errors.append(f"PyTorch (CUDA) failed: {exc}")
-                                        inference_engine = engine_candidate
-                                else:
-                                    inference_engine = engine_candidate
-
-                        # 2) If no ONNX yet, try converting .pth -> .onnx (needs torch).
-                        if inference_engine is None or not getattr(inference_engine, "is_loaded", False):
-                            if pth_path and is_torch_available():
-                                status_cb(f"Converting model to ONNX for GPU inference...")
-                                onnx_converted = convert_pth_to_onnx(pth_path)
-                                if onnx_converted:
-                                    try:
-                                        inference_engine = create_inference_engine("onnxruntime", onnx_converted)
-                                    except Exception as exc:
-                                        errors.append(f"ONNX converted but load failed: {exc}")
-                            elif pth_path:
-                                errors.append(
-                                    "PyTorch is not installed (required to convert .pth models to ONNX). "
-                                    "Install via Manage Dependencies → Runtimes & Binaries, "
-                                    "or use Python 3.11-3.14 for automatic download."
-                                )
-
-                        # 3) If ONNX didn't work, try PyTorch direct (needs torch).
-                        if inference_engine is None or not getattr(inference_engine, "is_loaded", False):
-                            if pth_path and is_torch_available():
-                                status_cb(f"Falling back to PyTorch engine (GPU if available)...")
-                                try:
-                                    inference_engine = create_inference_engine("torch", pth_path)
-                                except Exception as exc:
-                                    errors.append(f"PyTorch fallback failed: {exc}")
-
-                        if inference_engine is None or not getattr(inference_engine, "is_loaded", False):
-                            detail = " | ".join(errors) if errors else "No model weights found."
-                            hint = ""
-                            if not errors or "No model weights" in detail:
-                                hint = (
-                                    "\n\nThis engine has no weight files installed. Open "
-                                    "Manage Dependencies → Runtimes & Binaries and click "
-                                    "'Add Engine' on the model row to download them."
-                                )
-                            raise RuntimeError(
-                                f"Could not load inference engine for {upscale_engine_id}.\n"
-                                f"Details: {detail}\n\n"
-                                "Ensure ONNX Runtime or PyTorch is installed via "
-                                "Manage Dependencies → Runtimes & Binaries."
-                                + hint
-                            )
-
-                        # Show which provider is actually active.
-                        providers = getattr(inference_engine, "_providers", [])
-                        device = getattr(inference_engine, "_device", None)
-                        if "CUDAExecutionProvider" in providers or "TensorrtExecutionProvider" in providers:
-                            status_cb("AI model loaded — using GPU (CUDA)")
-                        elif device is not None and "cuda" in str(device).lower():
-                            status_cb("AI model loaded — using GPU (CUDA) via PyTorch")
-                        else:
-                            status_cb("AI model loaded — using CPU (no GPU)")
-
-                    # ETA pre-render con el benchmark cacheado del engine
-                    # (si existe; se mide tras cada instalación). Solo un
-                    # ffprobe barato: fps del source + duración del job.
-                    try:
-                        if inference_engine is not None:
-                            bench_eid = fsr3_engine_id or upscale_engine_id or ""
-                            if bench_eid:
-                                from src.ai.benchmark import estimate_status_line
-                                info = get_video_info(self.ffmpeg_path, self.input_path) or {}
-                                fps = None
-                                rfr = info.get("r_frame_rate", "")
-                                if "/" in rfr:
-                                    try:
-                                        num_s, den_s = rfr.split("/", 1)
-                                        num, den = float(num_s), float(den_s)
-                                        fps = num / den if den else None
-                                    except Exception:
-                                        fps = None
-                                if fps and fps > 0:
-                                    dur = self.settings.get("duration_seconds") or 0
-                                    line = estimate_status_line(bench_eid, int(dur * fps))
-                                    if line:
-                                        status_cb(line)
-                    except Exception:
-                        pass
+                    engines, chain_labels = self._build_ai_chain(status_cb)
                 except Exception as exc:
                     self.success = False
                     self.error_message = f"Failed to load AI model: {exc}"
                     return
+                if not engines:
+                    self.success = False
+                    self.error_message = (
+                        "No AI engines could be loaded for the selected chain."
+                    )
+                    return
 
-                status_cb("AI upscale: frame-by-frame processing...")
+                # Escala total de la cadena = producto de los factores de
+                # escala de las engines que realmente upscalean. Se inyecta
+                # en settings para que el encoder dimensione correctamente.
+                from src.processing.pipeline import _compute_total_scale
+                total_scale = _compute_total_scale(engines)
+                self.settings["ai_scale"] = total_scale
+
+                status_cb("AI chain: " + " -> ".join(chain_labels))
+                status_cb("AI chain: frame-by-frame processing...")
                 self.success = compress_video_with_ai(
                     self.ffmpeg_path,
                     self.input_path,
                     self.output_path,
                     self.settings,
-                    inference_engine,
+                    inference_engines=engines,
                     progress_callback=self._emit_progress,
                     status_callback=status_cb,
                     abort_event=self.abort_event,
@@ -485,6 +278,221 @@ class CompressionWorker(QThread):
 
     def _emit_status(self, message):
         self.status_message.emit(message)
+
+    def _build_ai_chain(self, status_cb):
+        """Build ONE loaded inference engine per active workflow node.
+
+        ``self.ai_engines`` is an ordered mapping ``{"Upscale": {...},
+        "Interpolate": {...}, "Denoise": {...}, "Colorize": {...},
+        "FaceRestore": {...}}`` in the chain order chosen by the user
+        (the WorkflowWidget reports it in ``middle_steps`` order).
+
+        Returns ``(engines, labels)`` where engines is the ordered list
+        of loaded ``AIInferenceEngine`` objects and labels is a parallel
+        list of human-readable names for status lines.
+
+        Raises RuntimeError if ANY selected engine cannot be loaded, so
+        the user gets a precise, actionable message (which node failed
+        instead of a silent partial chain).
+        """
+        from src.ai.inference import (
+            create_inference_engine,
+            get_model_path,
+            convert_pth_to_onnx,
+            PyTorchInferenceEngine,
+            FSR31Engine,
+        )
+        from src.ai.architectures import is_torch_available
+
+        engines = []        # loaded AIInferenceEngine, in chain order
+        labels = []         # ["Upscale (Real-ESRGAN x4)", ...]
+        errors = []         # human-readable per-node failures
+        fsr31_built = False
+
+        ai_map = self.ai_engines or {}
+
+        # FSR 3.1 mode resolution across both workflow nodes (see
+        # ``resolve_fsr3_engine``): Upscale(FSR31) + Interp(FSR31) -> "both",
+        # Upscale(FSR31) alone -> "upscale", Interp(FSR31) alone ->
+        # "interpolate".
+        fsr3_engine_id, fsr3_model_path, fsr3_mode = resolve_fsr3_engine(
+            ai_map.get("Upscale"),
+            ai_map.get("Interpolate"),
+        )
+
+        # --- Build the chain in workflow order -------------------------
+        for category, info in ai_map.items():
+            if isinstance(info, dict):
+                eid = info.get("engine_id", "") or ""
+                model_path = info.get("model_path")
+            else:
+                eid = info or ""
+                model_path = None
+            if not eid:
+                continue  # node active but "auto" — keep going
+
+            node_label = f"{category} ({eid})"
+
+            # --- FSR engines (pure algorithmic, no model downloads) ---
+            if eid.startswith("upscale-fsr"):
+                if "fsr31" in eid:
+                    # FSR 3.1 decouples upscale (in Upscale node) from
+                    # frame generation (in Interp node); build it ONCE, with
+                    # the combined mode resolved across both nodes. The
+                    # second FSR31 node in the chain adds nothing (it is
+                    # the same engine, merged mode).
+                    if fsr31_built:
+                        continue
+                    if fsr3_engine_id:
+                        try:
+                            eng = FSR31Engine(
+                                fsr3_model_path or "",
+                                fsr3_engine_id,
+                                mode=fsr3_mode,
+                            )
+                            if eng.load():
+                                engines.append(eng)
+                                fsr31_built = True
+                                labels.append(f"{category} (FSR 3.1, mode={fsr3_mode})")
+                                status_cb(f"FSR 3.1 loaded (mode={fsr3_mode}, libplacebo)")
+                            else:
+                                errors.append(
+                                    f"{node_label}: FSR 3.1 requires FFmpeg full "
+                                    "with libplacebo support"
+                                )
+                        except Exception as exc:
+                            errors.append(f"{node_label}: FSR 3.1 failed: {exc}")
+                    continue
+                try:
+                    eng = create_inference_engine(eid, model_path or "")
+                    if eng and getattr(eng, "is_loaded", False):
+                        engines.append(eng)
+                        labels.append(f"{category} (FSR {eid})")
+                        status_cb(f"{category}: {eid} loaded")
+                    else:
+                        errors.append(f"{node_label}: engine did not load")
+                except Exception as exc:
+                    errors.append(f"{node_label}: {exc}")
+                continue
+
+            # --- Library model engines (any category) -------------------
+            # Strategy: prefer ONNX Runtime when it has an ACTIVE GPU
+            # provider (CUDA/TensorRT).  If ONNX only runs on CPU and
+            # torch with CUDA is available, prefer PyTorch (GPU).  If no
+            # .onnx exists and torch is available, convert .pth -> .onnx.
+            # Used for EVERY model-based node so the chain works for any
+            # catalog engine (Real-ESRGAN, NAFNet, DDColor, GFPGAN, ...).
+            pth_path = model_path  # Prefer the exact path from UI
+            if not pth_path or not os.path.exists(pth_path):
+                pth_path = get_model_path(eid, "torch")
+
+            try:
+                inference_engine = None
+                node_errors = []
+
+                # 1) Existing .onnx next to .pth or from registry
+                onnx_path = None
+                if pth_path:
+                    candidate = os.path.splitext(pth_path)[0] + ".onnx"
+                    if os.path.exists(candidate):
+                        onnx_path = candidate
+                if not onnx_path:
+                    onnx_path = get_model_path(eid, "onnxruntime")
+                if onnx_path:
+                    try:
+                        engine_candidate = create_inference_engine("onnxruntime", onnx_path)
+                    except Exception as exc:
+                        node_errors.append(f"ONNX Runtime failed: {exc}")
+                    else:
+                        active_providers = getattr(engine_candidate, "get_active_providers", None)
+                        active = (
+                            active_providers()
+                            if callable(active_providers)
+                            else getattr(engine_candidate, "_providers", [])
+                        )
+                        if (
+                            "CUDAExecutionProvider" not in active
+                            and "TensorrtExecutionProvider" not in active
+                            and pth_path
+                            and is_torch_available()
+                        ):
+                            try:
+                                torch_engine = PyTorchInferenceEngine(pth_path, eid)
+                                if torch_engine.load():
+                                    inference_engine = torch_engine
+                                else:
+                                    node_errors.append(
+                                        "PyTorch load failed; keeping ONNX Runtime (CPU)"
+                                    )
+                                    inference_engine = engine_candidate
+                            except Exception as exc:
+                                node_errors.append(f"PyTorch (CUDA) failed: {exc}")
+                                inference_engine = engine_candidate
+                        else:
+                            inference_engine = engine_candidate
+
+                # 2) Convert .pth -> .onnx (needs torch)
+                if inference_engine is None or not getattr(inference_engine, "is_loaded", False):
+                    if pth_path and is_torch_available():
+                        onnx_converted = convert_pth_to_onnx(pth_path)
+                        if onnx_converted:
+                            try:
+                                inference_engine = create_inference_engine("onnxruntime", onnx_converted)
+                            except Exception as exc:
+                                node_errors.append(f"ONNX converted but load failed: {exc}")
+                    elif pth_path:
+                        node_errors.append(
+                            "PyTorch is not installed (required to convert .pth to ONNX)"
+                        )
+
+                # 3) PyTorch direct
+                if inference_engine is None or not getattr(inference_engine, "is_loaded", False):
+                    if pth_path and is_torch_available():
+                        try:
+                            inference_engine = create_inference_engine("torch", pth_path)
+                        except Exception as exc:
+                            node_errors.append(f"PyTorch fallback failed: {exc}")
+
+                if inference_engine is None or not getattr(inference_engine, "is_loaded", False):
+                    detail = " | ".join(node_errors) if node_errors else "No model weights found."
+                    hint = ""
+                    if not node_errors or "No model weights" in detail:
+                        hint = (
+                            "This engine has no weight files installed. Open "
+                            "Manage Dependencies → Runtimes & Binaries and click "
+                            "'Add Engine' on the model row to download them."
+                        )
+                    raise RuntimeError(
+                        f"{node_label} could not load.\nDetails: {detail}\n{hint}"
+                    )
+
+                engines.append(inference_engine)
+                provider = getattr(inference_engine, "_providers", [])
+                device = getattr(inference_engine, "_device", None)
+                if "CUDAExecutionProvider" in provider or "TensorrtExecutionProvider" in provider:
+                    status_cb(f"{category}: {eid} loaded (GPU, ONNX Runtime)")
+                elif device is not None and "cuda" in str(device).lower():
+                    status_cb(f"{category}: {eid} loaded (GPU, PyTorch)")
+                else:
+                    status_cb(f"{category}: {eid} loaded (CPU)")
+                labels.append(f"{category} ({eid})")
+            except RuntimeError as exc:
+                errors.append(str(exc))
+            except Exception as exc:
+                errors.append(f"{node_label}: {exc}")
+            continue
+
+        if not engines:
+            raise RuntimeError(
+                "No AI engine could be loaded for your chain.\n"
+                + ("\n".join(errors) if errors else "Check Manage Dependencies.")
+            )
+        if errors:
+            logger.warning(
+                "AI chain partially loaded; %d node(s) skipped: %s",
+                len(errors), " | ".join(errors),
+            )
+        return engines, labels
 
 
 class RedetectWorker(QThread):
