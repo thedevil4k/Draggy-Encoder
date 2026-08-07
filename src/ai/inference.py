@@ -1243,10 +1243,23 @@ def convert_pth_to_onnx(pth_path: str) -> Optional[str]:
     """Convert a .pth model to .onnx for GPU inference via ONNX Runtime.
 
     Saves the .onnx alongside the .pth file. Returns the .onnx path
-    or None on failure.
+    or None on failure. Use :func:`convert_pth_to_onnx_ex` when the UI
+    needs to know *why* a conversion failed.
+    """
+    path, _error = convert_pth_to_onnx_ex(pth_path)
+    return path
+
+
+def convert_pth_to_onnx_ex(pth_path: str) -> tuple[Optional[str], str]:
+    """Like :func:`convert_pth_to_onnx` but reports the failure reason.
+
+    Returns ``(onnx_path, "")`` on success or ``(None, reason)`` where
+    ``reason`` is a human-readable, user-facing explanation (missing
+    weights, unsupported architecture, non-3-channel input, export
+    failure, ...).
     """
     if not os.path.exists(pth_path):
-        return None
+        return None, f"Model weight file not found:\n{pth_path}"
 
     onnx_path = os.path.splitext(pth_path)[0] + ".onnx"
     if os.path.exists(onnx_path):
@@ -1255,15 +1268,15 @@ def convert_pth_to_onnx(pth_path: str) -> Optional[str]:
         # 12 canales de entrada) reventaría el render. Si no sirve, se
         # borra y se reconvierte.
         if _onnx_input_channels_ok(onnx_path):
-            return onnx_path
+            return onnx_path, ""
         try:
             os.remove(onnx_path)
-        except OSError:
-            return None
+        except OSError as exc:
+            return None, f"Could not replace the existing ONNX file: {exc}"
 
     try:
         import torch
-        from src.ai.architectures import build_model_from_state_dict
+        from src.ai.architectures import build_model_from_state_dict, detect_model_arch_and_scale
 
         # Redirect stdout/stderr to avoid cp1252 UnicodeEncodeError on Windows
         # during torch.onnx.export logging. We use devnull to suppress, then
@@ -1275,6 +1288,8 @@ def convert_pth_to_onnx(pth_path: str) -> Optional[str]:
         sys.stdout = _devnull
         sys.stderr = _devnull
 
+        error_msg = ""
+        model = None
         try:
             logger.info("Converting %s to ONNX...", pth_path)
             if pth_path.lower().endswith(".safetensors"):
@@ -1283,56 +1298,87 @@ def convert_pth_to_onnx(pth_path: str) -> Optional[str]:
             else:
                 state_dict = torch.load(pth_path, map_location="cpu", weights_only=False)
             if not isinstance(state_dict, dict):
-                return None
-
-            # Unwrap common checkpoint wrappers (params_ema, params, state_dict)
-            if isinstance(state_dict, dict) and "body.0.rdb1.conv1.weight" not in state_dict:
-                for wrapper_key in ("params_ema", "params", "state_dict"):
-                    if wrapper_key in state_dict and isinstance(state_dict[wrapper_key], dict):
-                        state_dict = state_dict[wrapper_key]
-                        break
-
-            model = build_model_from_state_dict(state_dict)
-            model.eval()
-
-            # Detect num_in_ch from the appropriate key for each architecture
-            if "conv_first.weight" in state_dict:
-                num_in_ch = state_dict["conv_first.weight"].shape[1]
-            elif "body.0.weight" in state_dict:
-                num_in_ch = state_dict["body.0.weight"].shape[1]
-            elif "input.weight" in state_dict:
-                num_in_ch = state_dict["input.weight"].shape[1]
+                error_msg = "The weight file does not contain a state dict."
             else:
-                num_in_ch = 3
+                # Unwrap common checkpoint wrappers (params_ema, params, state_dict)
+                if "body.0.rdb1.conv1.weight" not in state_dict:
+                    for wrapper_key in ("params_ema", "params", "state_dict"):
+                        if wrapper_key in state_dict and isinstance(state_dict[wrapper_key], dict):
+                            state_dict = state_dict[wrapper_key]
+                            break
 
-            # El pipeline alimenta frames BGR de 3 canales: un modelo con
-            # otra entrada fija (p.ej. RRDBNet de 12 canales) convertiría a
-            # un ONNX que revienta en el primer frame real ("Expected: 12").
-            if num_in_ch != 3:
-                logger.warning(
-                    "Skipping ONNX conversion for %s: model expects %d input "
-                    "channels (the frame pipeline always feeds 3-channel BGR).",
-                    os.path.basename(pth_path), num_in_ch,
-                )
-                return None
+                # Detect architecture first so we fail fast with a helpful
+                # message instead of a cryptic exporter error.
+                detected = detect_model_arch_and_scale(state_dict)
+                if not detected:
+                    error_msg = (
+                        "Unknown model architecture — only Real-ESRGAN "
+                        "(RRDB / SRVGG), Real-CUGAN and OmniSR weights can "
+                        "be converted to ONNX. The render will use PyTorch "
+                        "instead."
+                    )
+                else:
+                    try:
+                        model = build_model_from_state_dict(state_dict)
+                        model.eval()
+                        error_msg = ""
+                    except Exception as exc:
+                        error_msg = f"Could not build the model architecture: {exc}"
+            if error_msg:
+                pass
+            elif model is not None:
+                # Detect num_in_ch from the appropriate key for each architecture
+                if "conv_first.weight" in state_dict:
+                    num_in_ch = state_dict["conv_first.weight"].shape[1]
+                elif "body.0.weight" in state_dict:
+                    num_in_ch = state_dict["body.0.weight"].shape[1]
+                elif "input.weight" in state_dict:
+                    num_in_ch = state_dict["input.weight"].shape[1]
+                else:
+                    num_in_ch = 3
 
-            dummy = torch.randn(1, num_in_ch, 64, 64)
-            torch.onnx.export(
-                model, dummy, onnx_path,
-                opset_version=18,
-                input_names=["input"],
-                output_names=["output"],
-                dynamic_axes={"input": {0: "batch", 2: "height", 3: "width"},
-                              "output": {0: "batch", 2: "height", 3: "width"}},
-                dynamo=False,
-            )
+                # El pipeline alimenta frames BGR de 3 canales: un modelo con
+                # otra entrada fija (p.ej. RRDBNet de 12 canales) convertiría a
+                # un ONNX que revienta en el primer frame real ("Expected: 12").
+                if num_in_ch != 3:
+                    error_msg = (
+                        f"The model expects {num_in_ch} input channels, but "
+                        "the render pipeline always feeds 3-channel images. "
+                        "The render will use PyTorch instead."
+                    )
+                else:
+                    dummy = torch.randn(1, num_in_ch, 64, 64)
+                    try:
+                        torch.onnx.export(
+                            model, dummy, onnx_path,
+                            opset_version=18,
+                            input_names=["input"],
+                            output_names=["output"],
+                            dynamic_axes={"input": {0: "batch", 2: "height", 3: "width"},
+                                          "output": {0: "batch", 2: "height", 3: "width"}},
+                            dynamo=False,
+                        )
+                    except Exception as exc:
+                        error_msg = (
+                            f"torch.onnx.export failed for this model: {exc}. "
+                            "The render will use PyTorch instead."
+                        )
         finally:
             _devnull.close()
             sys.stdout = _orig_stdout
             sys.stderr = _orig_stderr
 
+        if error_msg:
+            logger.warning("ONNX conversion skipped for %s: %s", pth_path, error_msg)
+            try:
+                if os.path.exists(onnx_path):
+                    os.remove(onnx_path)
+            except Exception:
+                pass
+            return None, error_msg
+
         logger.info("ONNX conversion saved: %s", onnx_path)
-        return onnx_path
+        return onnx_path, ""
     except Exception as exc:
         logger.error("ONNX conversion failed for %s: %s", pth_path, exc)
         # Clean up partial file
@@ -1341,7 +1387,7 @@ def convert_pth_to_onnx(pth_path: str) -> Optional[str]:
                 os.remove(onnx_path)
         except Exception:
             pass
-        return None
+        return None, f"Unexpected error during conversion: {exc}"
 
 
 def get_model_path(engine_id_catalog: str, engine_id_inference: str = "onnxruntime") -> Optional[str]:

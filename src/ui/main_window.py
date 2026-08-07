@@ -312,7 +312,7 @@ class CompressionWorker(QThread):
             AIInferenceEngine,
             create_inference_engine,
             get_model_path,
-            convert_pth_to_onnx,
+            convert_pth_to_onnx_ex,
             PyTorchInferenceEngine,
             FSR31Engine,
         )
@@ -448,12 +448,16 @@ class CompressionWorker(QThread):
                 # 2) Convert .pth -> .onnx (needs torch)
                 if inference_engine is None or not getattr(inference_engine, "is_loaded", False):
                     if pth_path and is_torch_available():
-                        onnx_converted = convert_pth_to_onnx(pth_path)
+                        onnx_converted, conv_error = convert_pth_to_onnx_ex(pth_path)
                         if onnx_converted:
                             try:
                                 inference_engine = create_inference_engine("onnxruntime", onnx_converted)
                             except Exception as exc:
                                 node_errors.append(f"ONNX converted but load failed: {exc}")
+                        elif conv_error:
+                            node_errors.append(
+                                f"ONNX conversion skipped for {eid}: {conv_error}"
+                            )
                     elif pth_path:
                         node_errors.append(
                             "PyTorch is not installed (required to convert .pth to ONNX)"

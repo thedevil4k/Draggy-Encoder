@@ -547,7 +547,7 @@ class OnnxConvertWorker(QThread):
         try:
             # Import locally so the worker can fail with a clear message
             # instead of crashing the whole dialog if torch is missing.
-            from src.ai.inference import convert_pth_to_onnx
+            from src.ai.inference import convert_pth_to_onnx_ex
         except ImportError as exc:
             self.failed.emit(
                 f"Could not import the ONNX converter: {exc}\n\n"
@@ -560,11 +560,11 @@ class OnnxConvertWorker(QThread):
             self.failed.emit("cancelled by user")
             return
 
-        onnx_path = convert_pth_to_onnx(weight_path)
+        onnx_path, error_msg = convert_pth_to_onnx_ex(weight_path)
         if not onnx_path or not os.path.exists(onnx_path):
             self.failed.emit(
-                "ONNX conversion failed.\n"
-                "Check the application log for the underlying error.\n"
+                "ONNX conversion failed.\n\n"
+                f"{error_msg or 'Unknown error (check the application log).'}\n\n"
                 f"Weight file: {weight_path}"
             )
             return

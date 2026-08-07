@@ -209,6 +209,7 @@ def catalog_entries() -> list[dict]:
             "sentinel": rec.get("weight_file") or "",
             "lfs_warning": False,
             "is_user": True,
+            "arch": rec.get("arch") or "",
         })
     return out
 

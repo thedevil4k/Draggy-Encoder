@@ -870,6 +870,22 @@ def _build_cugan(sd: dict):
 # Public API
 # ---------------------------------------------------------------------------
 
+# Arquitecturas que ``build_model_from_state_dict`` puede construir y, por
+# tanto, las únicas que el conversor ONNX soporta. La UI la consulta para
+# deshabilitar "Convert to ONNX" en motores no convertibles.
+ONNX_CONVERTIBLE_ARCHS = frozenset({"omnisr", "rrdb", "srvgg", "cugan"})
+
+
+def onnx_convertible_archs() -> frozenset:
+    """Arquitecturas soportadas por el conversor ONNX (set inmutable)."""
+    return ONNX_CONVERTIBLE_ARCHS
+
+
+def arch_is_onnx_convertible(arch: str) -> bool:
+    """True si ``arch`` puede convertirse a ONNX con el conversor propio."""
+    return bool(arch) and arch in ONNX_CONVERTIBLE_ARCHS
+
+
 def detect_model_arch_and_scale(state_dict: dict):
     """Detecta ``(arch, scale)`` de un state_dict SIN construir el modelo.
 

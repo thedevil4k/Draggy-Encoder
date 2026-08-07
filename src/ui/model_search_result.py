@@ -28,6 +28,10 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from src.ai.architectures import (
+    ONNX_CONVERTIBLE_ARCHS as _ONNX_CONVERTIBLE_ARCHS,
+)
+
 
 class ModelSearchResult(QFrame):
     """Tarjeta de un modelo en los resultados de búsqueda.
@@ -279,6 +283,9 @@ class ModelSearchResult(QFrame):
         right.addWidget(self.btn_install)
 
         # Convert to ONNX button
+        arch = (eng.get("arch") or "").strip().lower()
+        arch_known = bool(arch)
+        arch_convertible = arch in _ONNX_CONVERTIBLE_ARCHS
         self.btn_convert = QPushButton("Convert to ONNX")
         if not eng.get("is_implemented", False):
             self.btn_convert.setEnabled(False)
@@ -292,6 +299,14 @@ class ModelSearchResult(QFrame):
             self.btn_convert.setToolTip("Install the engine first, then convert to ONNX.")
         elif onnx_converted:
             self.btn_convert.setText("Re-convert ONNX")
+        elif arch_known and not arch_convertible:
+            self.btn_convert.setEnabled(False)
+            self.btn_convert.setText("No ONNX")
+            self.btn_convert.setToolTip(
+                f"Architecture '{arch}' cannot be exported to ONNX: only "
+                "Real-ESRGAN (RRDB/SRVGG), Real-CUGAN and OmniSR weights "
+                "are supported. The render will use PyTorch instead."
+            )
         elif needs_conversion:
             self.btn_convert.setEnabled(True)
         else:

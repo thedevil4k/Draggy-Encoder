@@ -567,6 +567,11 @@ def search_hub_models(
 
             generated_id = user_engine_id(effective_category, repo_id)
             state = _get_engine_state(generated_id)
+            try:
+                from src.ai.user_models import get_model as _get_user_model
+                _arch = (_get_user_model(generated_id) or {}).get("arch") or ""
+            except Exception:
+                _arch = ""
 
             card = {
                 "engine_id": generated_id,
@@ -591,6 +596,7 @@ def search_hub_models(
                 "install_path": state.get("install_path"),
                 "compatibility": compatibility,
                 "is_user": True,
+                "arch": _arch,
                 "category_confidence": category_match,
                 "detected_category": detected,
             }

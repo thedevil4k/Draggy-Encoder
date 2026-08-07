@@ -542,10 +542,56 @@ CATALOG = [
 # Lookup helpers
 # ---------------------------------------------------------------------------
 
-
 # Built lazily on first access. Cheap, but worth being explicit.
 # Solo catálogo: los motores de usuario (Hub) se resuelven con ``get_entry``.
 CATALOG_BY_ID: dict[str, dict] = {e["engine_id"]: e for e in CATALOG}
+
+# Arquitectura conocida por motor de catálogo. Solo los motores con pesos
+# de red neuronal la declaran; los FSR (algorítmicos) no tienen ninguna.
+# La UI la usa para deshabilitar "Convert to ONNX" sin cargar pesos en el
+# hilo de la GUI (el conversor solo soporta las arquitecturas que
+# ``build_model_from_state_dict`` reconoce: rrdb / srvgg / cugan / omnisr).
+CATALOG_ARCH: dict[str, str] = {
+    "upscale-realesrgan-x4plus": "rrdb",
+    "upscale-realcugan-pro": "cugan",
+    "upscale-swinir-real": "swinir",
+    "upscale-realesr-animevideov3": "srvgg",
+    "upscale-realesr-general-x4v3": "srvgg",
+    "upscale-realesrgan-anime-6b": "rrdb",
+    "upscale-omnisr-x4": "omnisr",
+    "interpolate-rife-v4": "rife",
+    "interpolate-film": "film",
+    "colorize-ddcolor": "ddcolor",
+    "colorize-deoldify": "deoldify",
+    "denoise-nafnet": "nafnet",
+    "facerestore-gfpgan": "gfpgan",
+    "facerestore-codeformer": "codeformer",
+    "facerestore-gpen-512": "gpen",
+}
+
+
+def get_catalog_arch(engine_id: str) -> Optional[str]:
+    """Arquitectura conocida de un motor de catálogo, o None.
+
+    Los motores de usuario (Hub) guardan su ``arch`` detectada en
+    ``user_models.json``; el catálogo estático usa ``CATALOG_ARCH``.
+    Devuelve None cuando no se conoce (FSR algorítmicos, o pesos sin
+    detectar) — los llamadores deben tratar None como "desconocido",
+    no como "no convertible".
+    """
+    if not engine_id:
+        return None
+    arch = CATALOG_ARCH.get(engine_id)
+    if arch is not None:
+        return arch
+    if engine_id.startswith("user-"):
+        try:
+            from src.ai.user_models import get_model
+            rec = get_model(engine_id) or {}
+            return rec.get("arch") or None
+        except Exception:
+            return None
+    return None
 
 
 def _user_catalog_entries() -> list[dict]:
@@ -596,6 +642,13 @@ def _enrich(entry: dict, state: dict) -> dict:
     out = dict(entry)
     out["state"] = dict(state or {})
     out["install_dir"] = get_engine_dir(entry["engine_id"])
+    if "arch" not in out:
+        try:
+            arch = get_catalog_arch(entry["engine_id"])
+            if arch:
+                out["arch"] = arch
+        except Exception:
+            pass
     return out
 
 

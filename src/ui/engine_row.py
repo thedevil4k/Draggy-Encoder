@@ -42,6 +42,9 @@ from PySide6.QtWidgets import (
 
 from src.ai.fetcher import is_git_available as _is_git_available
 from src.ai.fetcher import is_hf_hub_available as _is_hf_hub_available
+from src.ai.architectures import (
+    ONNX_CONVERTIBLE_ARCHS as _ONNX_CONVERTIBLE_ARCHS,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -405,6 +408,9 @@ class EngineRow(QFrame):
         right.addWidget(self.btn_install)
 
         # Convert to ONNX button
+        arch = (eng.get("arch") or "").strip().lower()
+        arch_known = bool(arch)
+        arch_convertible = arch in _ONNX_CONVERTIBLE_ARCHS
         self.btn_convert = QPushButton("Convert to ONNX")
         if not implemented:
             self.btn_convert.setEnabled(False)
@@ -417,6 +423,18 @@ class EngineRow(QFrame):
             self.btn_convert.setEnabled(False)
             self.btn_convert.setText("N/A (built-in)")
             self.btn_convert.setToolTip("FSR is algorithmic — no ONNX conversion needed.")
+        elif converted:
+            self.btn_convert.setEnabled(True)
+            self.btn_convert.setText("Re-convert ONNX")
+            self.btn_convert.setToolTip("Weights already converted to ONNX. Click to refresh.")
+        elif arch_known and not arch_convertible:
+            self.btn_convert.setEnabled(False)
+            self.btn_convert.setText("No ONNX")
+            self.btn_convert.setToolTip(
+                f"Architecture '{arch}' cannot be exported to ONNX: only "
+                "Real-ESRGAN (RRDB/SRVGG), Real-CUGAN and OmniSR weights "
+                "are supported. The render will use PyTorch instead."
+            )
         self.btn_convert.clicked.connect(self._on_convert_clicked)
         right.addWidget(self.btn_convert)
 

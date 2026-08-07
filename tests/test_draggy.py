@@ -2419,6 +2419,121 @@ def test_onnx_engine_get_scale_factor_honors_target():
     assert eng.get_scale_factor() == 2
 
 
+# ---------------------------------------------------------------------------
+# 13. ONNX converter: descriptive failures + architecture support gating
+# ---------------------------------------------------------------------------
+
+def test_onnx_archs_support_set():
+    from src.ai.architectures import (
+        ONNX_CONVERTIBLE_ARCHS,
+        arch_is_onnx_convertible,
+        onnx_convertible_archs,
+    )
+
+    assert ONNX_CONVERTIBLE_ARCHS == frozenset({"omnisr", "rrdb", "srvgg", "cugan"})
+    assert onnx_convertible_archs() is ONNX_CONVERTIBLE_ARCHS
+    assert arch_is_onnx_convertible("rrdb") is True
+    assert arch_is_onnx_convertible("srvgg") is True
+    assert arch_is_onnx_convertible("cugan") is True
+    assert arch_is_onnx_convertible("omnisr") is True
+    assert arch_is_onnx_convertible("swinir") is False
+    assert arch_is_onnx_convertible("nafnet") is False
+    assert arch_is_onnx_convertible("") is False
+    assert arch_is_onnx_convertible(None) is False
+
+
+def test_catalog_arch_lookup_static_and_user(isolated_engines_state):
+    from src.ai.registry import CATALOG_ARCH, get_catalog_arch
+
+    assert CATALOG_ARCH["upscale-realesrgan-x4plus"] == "rrdb"
+    assert CATALOG_ARCH["upscale-realesr-animevideov3"] == "srvgg"
+    assert CATALOG_ARCH["upscale-omnisr-x4"] == "omnisr"
+    assert CATALOG_ARCH["facerestore-gfpgan"] == "gfpgan"  # no convertible
+    # FSR algorítmicos: sin arquitectura conocida -> None
+    assert get_catalog_arch("upscale-fsr-4x") is None
+    assert get_catalog_arch("") is None
+    assert get_catalog_arch("no-existe-123") is None
+
+    # Motores de usuario: arch detectada en user_models.json
+    from src.ai.user_models import register
+    register("user-upscale-foo", display_name="Foo", category="Upscale",
+             hf_repo_id="x/y", arch="srvgg", scale=4)
+    assert get_catalog_arch("user-upscale-foo") == "srvgg"
+
+    # Enriquecido por iter_catalog/list_installed para consumo de la UI
+    from src.ai.registry import iter_catalog, list_installed
+    from src.ai.engines_state import mark_installed
+    mark_installed("upscale-realesr-animevideov3")
+    entries = list(iter_catalog())
+    row = next(e for e in entries if e["engine_id"] == "upscale-realesr-animevideov3")
+    assert row.get("arch") == "srvgg"
+
+
+def test_convert_pth_to_onnx_ex_reports_missing_file():
+    from src.ai.inference import convert_pth_to_onnx_ex
+
+    path, err = convert_pth_to_onnx_ex("Z:/no/such/weights.pth")
+    assert path is None
+    assert "not found" in err
+
+
+def test_convert_pth_to_onnx_ex_reports_unknown_arch(tmp_path, local_store_runtime):
+    """Un state_dict de arquitectura desconocida falla con razón legible,
+    no con un error criptico del exporter."""
+    torch = pytest.importorskip("torch")
+    from src.ai.inference import convert_pth_to_onnx_ex
+
+    m = torch.nn.Conv2d(3, 3, 3)
+    pth = tmp_path / "unknown.pth"
+    torch.save(m.state_dict(), pth)
+
+    path, err = convert_pth_to_onnx_ex(str(pth))
+    assert path is None
+    assert "architecture" in err.lower()
+    assert not (tmp_path / "unknown.onnx").exists()
+
+
+def test_convert_pth_to_onnx_ex_reports_multichannel(tmp_path, local_store_runtime):
+    """Modelos de entrada != 3 canales: razón clara y sin archivo .onnx."""
+    torch = pytest.importorskip("torch")
+    from src.ai.architectures import SRVGGNetCompact
+    from src.ai.inference import convert_pth_to_onnx_ex
+
+    m = SRVGGNetCompact(num_in_ch=12, num_out_ch=12, num_feat=4, num_conv=2, upscale=4)
+    pth = tmp_path / "bad12ch.pth"
+    torch.save(m.state_dict(), pth)
+
+    path, err = convert_pth_to_onnx_ex(str(pth))
+    assert path is None
+    assert "12" in err
+    assert not (tmp_path / "bad12ch.onnx").exists()
+
+
+def test_convert_pth_to_onnx_ex_reuses_existing_good_onnx(tmp_path, local_store_runtime):
+    """Si ya existe un .onnx de 3 canales, se reutiliza sin reconvertir."""
+    torch = pytest.importorskip("torch")
+    from src.ai.architectures import SRVGGNetCompact
+    from src.ai.inference import convert_pth_to_onnx_ex
+
+    m = SRVGGNetCompact(num_in_ch=3, num_out_ch=3, num_feat=4, num_conv=2, upscale=4)
+    m.eval()
+    pth = tmp_path / "model.pth"
+    torch.save(m.state_dict(), pth)
+    onnx_path = tmp_path / "model.onnx"
+    torch.onnx.export(
+        m, torch.randn(1, 3, 64, 64), str(onnx_path), opset_version=18,
+        input_names=["input"], output_names=["output"],
+        dynamic_axes={
+            "input": {0: "batch", 2: "height", 3: "width"},
+            "output": {0: "batch", 2: "height", 3: "width"},
+        },
+    )
+
+    path, err = convert_pth_to_onnx_ex(str(pth))
+    assert path == str(onnx_path)
+    assert err == ""
+
+
 # ==--------------------------------------------------------------------==
 # Standalone runner (works even without pytest installed)
 # ==--------------------------------------------------------------------==
