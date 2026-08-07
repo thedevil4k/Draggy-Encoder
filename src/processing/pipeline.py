@@ -26,6 +26,27 @@ from src.ffmpeg.runner import (
 logger = logging.getLogger(__name__)
 
 
+def _emit_phase(phase_cb, ev, phase_id, label="", pct=0, msg=""):
+    """Emit a structured phase event to the (optional) phase callback.
+
+    ``ev`` ∈ {"start", "progress", "end", "failed"}. The GUI translates
+    these into per-phase rows (tasks panel). Never raises: a broken
+    watcher must not break the render.
+    """
+    if not phase_cb:
+        return
+    try:
+        phase_cb({
+            "ev": ev,
+            "id": phase_id,
+            "label": label,
+            "pct": int(pct),
+            "msg": msg,
+        })
+    except Exception as exc:
+        logger.warning("phase_cb error: %s", exc)
+
+
 def _get_duration_seconds(ffmpeg_path, video_path):
     info = get_video_info(ffmpeg_path, video_path)
     try:
@@ -71,7 +92,7 @@ def _measure_if_needed(ffmpeg_path, input_path, settings, status_callback=None,
 
 def compress_video(ffmpeg_path, input_path, output_path, settings,
                    progress_callback=None, status_callback=None, abort_event=None,
-                   ai_engines=None, on_process=None):
+                   ai_engines=None, on_process=None, phase_cb=None):
     """Comprime un vídeo completo. Audio boost usa two-pass loudnorm.
 
     ``ai_engines`` is an optional mapping ``{"Upscale": "engine_id",
@@ -115,24 +136,34 @@ def compress_video(ffmpeg_path, input_path, output_path, settings,
         except Exception as exc:
             logger.warning("ai_engines plumbing failed: %s", exc)
 
+    _emit_phase(phase_cb, "start", "compress", label="Compress / Encode", pct=0)
     loudnorm_meas = _measure_if_needed(
         ffmpeg_path, input_path, settings, status_callback=status_callback,
         start_time=settings.get("start_time"),
         end_time=settings.get("end_time"),
     )
+    if loudnorm_meas:
+        _emit_phase(phase_cb, "start", "audio", label="Audio boost", pct=100)
+        _emit_phase(phase_cb, "end", "audio")
     args = build_args(input_path, output_path, settings, loudnorm_meas=loudnorm_meas)
-    return run_ffmpeg(
+    result = run_ffmpeg(
         ffmpeg_path,
         args,
         progress_callback=progress_callback,
         abort_event=abort_event,
         on_process=on_process,
     )
+    if result:
+        _emit_phase(phase_cb, "progress", "compress", pct=100)
+        _emit_phase(phase_cb, "end", "compress")
+    else:
+        _emit_phase(phase_cb, "failed", "compress")
+    return result
 
 
 def generate_preview(ffmpeg_path, input_path, settings, progress_callback=None,
                      status_callback=None, abort_event=None, ai_engines=None,
-                     on_process=None):
+                     on_process=None, phase_cb=None):
     """Genera un preview: codifica un clip corto y extrae un frame aleatorio.
 
     Devuelve una tupla ``(original_bytes, compressed_bytes)`` con los bytes de
@@ -147,6 +178,7 @@ def generate_preview(ffmpeg_path, input_path, settings, progress_callback=None,
     settings = dict(settings)
     duration = _get_duration_seconds(ffmpeg_path, input_path)
     settings["duration_seconds"] = duration
+    _emit_phase(phase_cb, "start", "preview", label="Preview clip", pct=0)
 
     if ai_engines:
         try:
@@ -252,6 +284,8 @@ def generate_preview(ffmpeg_path, input_path, settings, progress_callback=None,
         if not compressed_data.startswith(b"\xff\xd8") or not original_data.startswith(b"\xff\xd8"):
             raise RuntimeError("Generated frame files are not valid JPEG images.")
 
+        _emit_phase(phase_cb, "progress", "preview", pct=100)
+        _emit_phase(phase_cb, "end", "preview")
         return original_data, compressed_data
 
 
@@ -271,6 +305,7 @@ def compress_video_with_ai(
     abort_event=None,
     on_process=None,
     inference_engines=None,
+    phase_cb=None,
 ):
     """Decode -> AI chain -> encode in a single pass (frame-by-frame).
 
@@ -347,6 +382,7 @@ def compress_video_with_ai(
 
     if status_callback:
         status_callback("AI pipeline: probing video info...")
+    _emit_phase(phase_cb, "progress", "probe", label="Analyzing video", pct=50)
 
     # Target scale: la cadena puede tener VARIOS upscalers (p.ej. 2x→4x).
     # La escala total es el producto de los factores de cada engine que
@@ -421,6 +457,52 @@ def compress_video_with_ai(
     preset = settings.get("preset", "medium")
     pixel_fmt = settings.get("pixel_format", "yuv420p")
     extra_flags = settings.get("extra_video_flags", "")
+
+    # --- Fases (tasks panel) ---
+    phase_labels = []
+    phase_labels.append(("probe", "Analyzing video"))
+    for i, _e in enumerate(engines, 1):
+        _eid = getattr(_e, "engine_id", "?") or "?"
+        try:
+            _meta = get_engine_meta(_eid) or {}
+            _label = _meta.get("display_name", _eid)
+        except Exception:
+            _label = _eid
+        phase_labels.append((f"engine-{i}", _label))
+    _audio_codec = settings.get("audio", "copy")
+    _audio_boost = bool(settings.get("audio_boost", False))
+    _has_audio_phase = (
+        _audio_codec != "noaudio" and (_audio_boost or _audio_codec != "copy")
+    )
+    if _has_audio_phase:
+        phase_labels.append(
+            ("audio", "Audio (parallel)" if _audio_boost else "Audio encode")
+        )
+    phase_labels.append(("mux", "Finalizing / Mux"))
+    for ph_id, ph_label in phase_labels:
+        _emit_phase(phase_cb, "start", ph_id, label=ph_label, pct=0)
+
+    # --- Audio en paralelo -------------------------------------------------
+    # Para no penalizar el throughput de la GPU con la codificación de
+    # audio, en un hilo daemon medimos la loudness (si boost) y codificamos
+    # la pista completa a un archivo temporal con el mismo codec/filtro que
+    # usaría el mux. Cuando el render termina, el mux solo hace copy del
+    # archivo pre-codificado -> el vídeo NO espera a la medición.
+    audio_tmp = [None]
+    audio_error = [None]
+    audio_thread = None
+    if _has_audio_phase:
+        def _audio_job():
+            try:
+                audio_tmp[0] = _encode_audio_parallel(
+                    ffmpeg_path, input_path, settings,
+                    status_callback=status_callback, abort_event=abort_event,
+                )
+            except Exception as exc:
+                audio_error[0] = exc
+                audio_tmp[0] = None
+        audio_thread = threading.Thread(target=_audio_job, daemon=True)
+        audio_thread.start()
 
     # --- FFmpeg decoder: rawvideo BGR24 pipe ---
     dec_cmd = [
@@ -737,6 +819,14 @@ def compress_video_with_ai(
             if progress_callback and total_frames > 0:
                 pct = min(100, int(frame_num * 100 / total_frames))
                 progress_callback(pct)
+                # Each engine phase advances with the same frame pct; the
+                # interpolation phase finishes earlier (only interp frames).
+                base_pct = min(100, pct)
+                for ph_id, _ph_lbl in phase_labels:
+                    if ph_id == "probe":
+                        _emit_phase(phase_cb, "progress", ph_id, pct=100)
+                    elif ph_id.startswith("engine-"):
+                        _emit_phase(phase_cb, "progress", ph_id, pct=base_pct)
             elif progress_callback and duration > 0:
                 elapsed = time.time() - t_start
                 pct = min(95, int((elapsed / duration) * 50))  # rough estimate
@@ -831,14 +921,23 @@ def compress_video_with_ai(
     if audio_codec != "noaudio":
         if status_callback:
             status_callback("Muxing audio...")
-        loudnorm_meas = _measure_if_needed(
-            ffmpeg_path, input_path, settings, status_callback=status_callback,
-        )
+        _emit_phase(phase_cb, "progress", "mux", label="Finalizing / Mux", pct=10)
+        # Espera al hilo de audio paralelo (normalmente ya acabado: el
+        # audio se codifica mucho más rápido que el render de GPU).
+        if audio_thread is not None:
+            audio_thread.join(timeout=10)
+        if _has_audio_phase:
+            if audio_tmp[0]:
+                _emit_phase(phase_cb, "progress", "audio", pct=100)
+                _emit_phase(phase_cb, "end", "audio")
+            else:
+                _emit_phase(phase_cb, "failed", "audio")
         mux_ok = _mux_audio(
             ffmpeg_path, input_path, output_path, audio_codec,
-            loudnorm_meas=loudnorm_meas,
+            loudnorm_meas=None,
             audio_boost=bool(settings.get("audio_boost", False)),
             container_format=settings.get("format", "mp4"),
+            audio_file=audio_tmp[0],
             abort_event=abort_event,
         )
         # Si el mux falló sin que el usuario abortase, lo surfaceamos
@@ -856,10 +955,26 @@ def compress_video_with_ai(
                 output_path,
             )
 
+    # Limpieza del audio temporal pre-codificado en paralelo.
+    if audio_tmp[0] and os.path.exists(audio_tmp[0]):
+        try:
+            os.remove(audio_tmp[0])
+        except Exception:
+            pass
+
     if status_callback:
         elapsed = time.time() - t_start
         chain_label = "AI chain (with interpolation)" if do_interpolate else f"AI chain ({len(engines)} steps)"
         status_callback(f"{chain_label} complete. {frame_num} frames in {elapsed:.1f}s")
+
+    for ph_id, _ph_lbl in phase_labels:
+        if ph_id == "probe":
+            _emit_phase(phase_cb, "end", ph_id)
+        elif ph_id.startswith("engine-"):
+            _emit_phase(phase_cb, "end", ph_id)
+        elif ph_id == "mux":
+            _emit_phase(phase_cb, "progress", ph_id, pct=100)
+            _emit_phase(phase_cb, "end", ph_id)
 
     # Guardar log final con estado de éxito
     log_entry["status"] = "success"
@@ -982,9 +1097,106 @@ def _audio_mux_args(audio_codec, loudnorm_meas, audio_boost, container_format="m
     return args
 
 
+def _encode_audio_parallel(ffmpeg_path, input_path, settings,
+                           status_callback=None, abort_event=None):
+    """Codifica la pista de audio COMPLETA a un archivo temporal.
+
+    Corre en un hilo daemon mientras el vídeo se renderiza con la GPU.
+    Devuelve la ruta del archivo temporal (con codec y loudnorm ya
+    aplicados) o ``None`` si no procede / falla. El caller limpia el
+    archivo con ``os.remove``.
+
+    El extension se elige según el codec final para que el mux del
+    contenedor destino pueda copiar la pista sin re-encodear.
+    """
+    audio_codec = str(settings.get("audio", "copy") or "copy")
+    audio_boost = bool(settings.get("audio_boost", False))
+    container_format = settings.get("format", "mp4")
+    if audio_codec == "noaudio":
+        return None
+
+    loudnorm_meas = None
+    if audio_boost:
+        loudnorm_meas = _measure_if_needed(
+            ffmpeg_path, input_path, settings, status_callback=status_callback,
+        )
+
+    mux_args = _audio_mux_args(
+        audio_codec, loudnorm_meas, audio_boost, container_format,
+    )
+    enc_a = mux_args[1]
+    if enc_a == "libmp3lame":
+        ext = ".mp3"
+    elif enc_a == "libopus":
+        ext = ".opus"
+    else:
+        ext = ".m4a"
+
+    tmp_fd, tmp_path = tempfile.mkstemp(prefix=".drag-audio-", suffix=ext)
+    try:
+        os.close(tmp_fd)
+    except Exception:
+        pass
+
+    cmd = [
+        ffmpeg_path,
+        "-hide_banner", "-loglevel", "warning",
+        "-y",
+        "-i", input_path,
+        "-map", "0:a:0?",
+        "-c:a", enc_a,
+        "-b:a", "192k",
+    ]
+    if audio_boost and len(mux_args) >= 4:
+        af = mux_args[mux_args.index("-af") + 1]
+        cmd.extend(["-af", af])
+    if enc_a == "libopus":
+        cmd.append("-strict")
+        cmd.append("-2")
+    cmd.append(tmp_path)
+
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        encoding="utf-8",
+        errors="replace",
+    )
+    try:
+        while proc.poll() is None:
+            if abort_event and abort_event.is_set():
+                try:
+                    proc.terminate()
+                    proc.wait(timeout=5)
+                except Exception:
+                    pass
+                return None
+            time.sleep(0.1)
+        if proc.returncode == 0 and os.path.exists(tmp_path) and os.path.getsize(tmp_path) > 0:
+            return tmp_path
+        try:
+            stderr_tail = (proc.stderr.read() or "")[-512:]
+        except Exception:
+            stderr_tail = ""
+        logger.warning(
+            "Parallel audio encode failed (rc=%s): %s", proc.returncode, stderr_tail,
+        )
+        return None
+    finally:
+        try:
+            proc.stderr.close()
+        except Exception:
+            pass
+        if (proc.returncode is None or proc.returncode != 0) and os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except Exception:
+                pass
+
+
 def _mux_audio(ffmpeg_path, input_path, output_path, audio_codec="copy",
                loudnorm_meas=None, audio_boost=False, container_format="mp4",
-               abort_event=None):
+               audio_file=None, abort_event=None):
     """Mux audio from the original input into the upscaled output.
 
     Uses ``ffmpeg -i upscaled.{ext} -i original.mp4 -map 0:v -map 1:a
@@ -993,6 +1205,11 @@ def _mux_audio(ffmpeg_path, input_path, output_path, audio_codec="copy",
     the destination container: previously the code hardcoded ``.mp4``
     even when the user selected ``.mkv`` / ``.avi`` / ``.webm``,
     which caused muxer-internal ``Invalid argument`` errors.
+
+    ``audio_file`` (optional) is a pre-encoded audio track (produced in
+    parallel by ``_encode_audio_parallel``); when given it is used as
+    the audio source instead of ``input_path`` and copied verbatim
+    (boost/filter already baked in).
 
     Polls ``abort_event`` every 100 ms while ffmpeg runs so the worker
     can be aborted cleanly from the GUI instead of blocking here for
@@ -1023,16 +1240,20 @@ def _mux_audio(ffmpeg_path, input_path, output_path, audio_codec="copy",
         ffmpeg_path,
         "-hide_banner", "-loglevel", "warning",
         "-i", output_path,
-        "-i", input_path,
+        "-i", (audio_file or input_path),
         "-map", "0:v:0",
         "-map", "1:a?",
         "-c:v", "copy",
         ]
-        cmd.extend(
-            _audio_mux_args(
-                audio_codec, loudnorm_meas, audio_boost, container_format,
+        if audio_file:
+            # Audio pre-codificado en paralelo: solo copiamos la pista.
+            cmd.extend(["-c:a", "copy"])
+        else:
+            cmd.extend(
+                _audio_mux_args(
+                    audio_codec, loudnorm_meas, audio_boost, container_format,
+                )
             )
-        )
         cmd.extend(["-shortest", "-y", tmp_out])
         proc = subprocess.Popen(
             cmd,

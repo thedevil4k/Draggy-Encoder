@@ -2174,6 +2174,175 @@ def test_compress_video_with_ai_audio_boost_keeps_audio(nvenc_clip):
     ).stdout
     # Boost re-encodes to AAC, not a raw copy of the source track.
     assert "aac" in out, f"expected re-encoded AAC audio, got: {out!r}"
+    # No leftover parallel-audio temp files must survive the mux cleanup.
+    leftovers = [f for f in os.listdir(tmp) if f.startswith(".drag-audio-")]
+    assert leftovers == [], leftovers
+
+
+def test_ai_chain_emits_phase_order(nvenc_clip):
+    """compress_video_with_ai must emit probe -> engine -> audio -> mux."""
+    from src.processing.pipeline import compress_video_with_ai
+
+    ffmpeg, src, tmp = nvenc_clip
+    dst = os.path.join(tmp, "chain_phases.mp4")
+    events = []
+
+    def cb(ev):
+        events.append(ev)
+
+    ok = compress_video_with_ai(
+        ffmpeg,
+        src,
+        dst,
+        {
+            "audio": "copy",
+            "audio_boost": True,
+            "format": "mp4",
+            "codec": "h264_nvenc",
+            "preset": "p5",
+            "bitrate": "1500",
+            "pixel_format": "yuv420p",
+            "resolution": "original",
+        },
+        inference_engines=[_FakeEngine("upscale-2x", 2)],
+        phase_cb=cb,
+    )
+    assert ok is True
+    starts = [e for e in events if e["ev"] == "start"]
+    ids = [e["id"] for e in starts]
+    assert ids[0] == "probe", ids
+    assert any(i.startswith("engine-") for i in ids), ids
+    assert "audio" in ids, ids
+    assert "mux" in ids, ids
+    assert ids.index("probe") < ids.index("audio") < ids.index("mux")
+    # Every phase that started also ended (or failed).
+    for ph in ids:
+        ended = [e["id"] for e in events if e["ev"] in ("end", "failed")]
+        assert ph in ended, (ph, events)
+
+
+def test_ai_chain_mux_phase_completes_when_no_audio(nvenc_clip):
+    """Chain without audio still emits mux completion (no crash)."""
+    from src.processing.pipeline import compress_video_with_ai
+
+    ffmpeg, src, tmp = nvenc_clip
+    dst = os.path.join(tmp, "chain_noaudio.mp4")
+    events = []
+    ok = compress_video_with_ai(
+        ffmpeg,
+        src,
+        dst,
+        {
+            "audio": "noaudio",
+            "format": "mp4",
+            "codec": "h264_nvenc",
+            "preset": "p5",
+            "bitrate": "1500",
+            "pixel_format": "yuv420p",
+            "resolution": "original",
+        },
+        inference_engines=[_FakeEngine("upscale-2x", 2)],
+        phase_cb=events.append,
+    )
+    assert ok is True
+    ended_ids = [e["id"] for e in events if e["ev"] in ("end", "failed")]
+    # Finalization phase always runs (encoder finalize); audio phase does not.
+    assert "mux" in ended_ids
+    assert "audio" not in ended_ids
+    assert any(i.startswith("engine-") for i in ended_ids)
+    assert "probe" in ended_ids
+    assert not [f for f in os.listdir(tmp) if f.startswith(".drag-audio-")]
+
+
+def test_parallel_audio_no_boost_skips_thread(nvenc_clip):
+    """copy + no boost keeps the fast passthrough (no parallel encode)."""
+    from src.processing.pipeline import compress_video_with_ai
+
+    ffmpeg, src, tmp = nvenc_clip
+    dst = os.path.join(tmp, "chain_copy.mp4")
+    events = []
+    ok = compress_video_with_ai(
+        ffmpeg,
+        src,
+        dst,
+        {
+            "audio": "copy",
+            "audio_boost": False,
+            "format": "mp4",
+            "codec": "h264_nvenc",
+            "preset": "p5",
+            "bitrate": "1500",
+            "pixel_format": "yuv420p",
+            "resolution": "original",
+        },
+        inference_engines=[_FakeEngine("upscale-2x", 2)],
+        phase_cb=events.append,
+    )
+    assert ok is True
+    assert any(e["id"] == "mux" and e["ev"] == "end" for e in events)
+    leftovers = [f for f in os.listdir(tmp) if f.startswith(".drag-audio-")]
+    assert leftovers == []
+
+
+def test_task_history_roundtrip_and_failsafe(tmp_path, monkeypatch):
+    """start/update/finish/list round-trip; corrupted file degrades to []."""
+    import src.task_history as th
+
+    monkeypatch.setenv("DEBUG_TASK_HISTORY_DIR", str(tmp_path))
+    # Point the module at the tmp session dir.
+    monkeypatch.setattr(th, "_path", lambda: str(tmp_path / "tasks.json"))
+    assert th.start_task("t1", "video.mp4", input_path="C:\\in.mp4")
+    assert th.update_phase("t1", "engine-1", "Upscale A", "running", 40)
+    assert th.update_phase("t1", "mux", "Mux", "running", 10)
+    assert th.finish_task("t1", "success")
+
+    tasks = th.list_tasks()
+    assert len(tasks) == 1
+    t1 = tasks[0]
+    assert t1["status"] == "success"
+    phase_ids = {p["phase_id"] for p in t1["phases"]}
+    assert phase_ids == {"engine-1", "mux"}
+    assert th.get_task("t1")["name"] == "video.mp4"
+
+    # Corrupt the file: listing must not raise.
+    (tmp_path / "tasks.json").write_text("{not json", encoding="utf-8")
+    assert th.list_tasks() == []
+    assert th.get_task("nope") is None
+
+
+def test_task_history_clear(tmp_path, monkeypatch):
+    import src.task_history as th
+
+    monkeypatch.setattr(th, "_path", lambda: str(tmp_path / "tasks.json"))
+    th.start_task("x", "a.mp4")
+    assert th.clear() is True
+    assert th.list_tasks() == []
+
+
+def test_tasks_panel_widget_smoke(qapp):
+    """TasksPanel renders tasks/phases and toggles without crashing."""
+    from src.ui.tasks_panel import TasksPanel
+
+    panel = TasksPanel()
+    panel.get_or_create("job-1", "movie.mp4")
+    card = panel._cards["job-1"]
+    card.set_running()
+    card.update_phase_evt({"id": "engine-1", "label": "Upscale", "ev": "start", "pct": 0})
+    card.update_phase_evt({"id": "engine-1", "ev": "progress", "pct": 50})
+    card.update_phase_evt({"id": "mux", "label": "Mux", "ev": "start", "pct": 0})
+    card.update_phase_evt({"id": "mux", "ev": "end", "pct": 100})
+    panel.mark_finished("job-1", "success")
+    assert card._status == "completed"
+    assert "engine-1" in card._phases and "mux" in card._phases
+
+    # History rebuild path must not crash either.
+    panel.rebuild([
+        {"task_id": "old-1", "name": "old.mp4", "status": "success",
+         "phases": [{"phase_id": "engine-1", "label": "Upscale",
+                     "status": "done", "pct": 100}]}
+    ])
+    assert "old-1" in panel._cards
+    assert panel._cards["old-1"]._status == "completed"
 
 
 # ==--------------------------------------------------------------------==

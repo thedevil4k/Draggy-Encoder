@@ -15,6 +15,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QProgressBar,
     QPushButton,
+    QSplitter,
     QStyle,
     QSystemTrayIcon,
     QVBoxLayout,
@@ -33,6 +34,7 @@ from src.ui.hardware_dialog import HardwareDialog
 from src.ui.preferences_dialog import PreferencesDialog
 from src.ui.preview_dialog import PreviewDialog
 from src.ui.settings_panel import SettingsPanel
+from src.ui.tasks_panel import TasksPanel
 from src.ui.update_banner import UpdateBanner
 from src.ui.update_chain import _UpdateChainController, notify_log
 from src.runtimes.manager import (
@@ -156,6 +158,7 @@ class CompressionWorker(QThread):
 
     progress = Signal(int)
     status_message = Signal(str)
+    phase_ev = Signal(dict)
 
     def __init__(self, ffmpeg_path, input_path, output_path, settings, mode="compress",
                  ai_engines=None, abort_event=None):
@@ -191,6 +194,7 @@ class CompressionWorker(QThread):
     def run(self):
         try:
             status_cb = self._emit_status
+            phase_cb = self._emit_phase
             # Determine if the AI chain should be used: any active workflow
             # node with an engine id (Upscale, Interp, Denoise, Colorize,
             # FaceRestore — in the re-ordered chain position).
@@ -241,6 +245,7 @@ class CompressionWorker(QThread):
                     status_callback=status_cb,
                     abort_event=self.abort_event,
                     on_process=lambda p: setattr(self, "_proc", p),
+                    phase_cb=phase_cb,
                 )
             elif self.mode == "compress":
                 self.success = compress_video(
@@ -253,6 +258,7 @@ class CompressionWorker(QThread):
                     ai_engines=self.ai_engines,
                     abort_event=self.abort_event,
                     on_process=lambda p: setattr(self, "_proc", p),
+                    phase_cb=phase_cb,
                 )
             elif self.mode == "preview":
                 self.preview_original, self.preview_compressed = generate_preview(
@@ -264,6 +270,7 @@ class CompressionWorker(QThread):
                     ai_engines=self.ai_engines,
                     abort_event=self.abort_event,
                     on_process=lambda p: setattr(self, "_proc", p),
+                    phase_cb=phase_cb,
                 )
                 self.success = bool(self.preview_original and self.preview_compressed)
                 if not self.success and not self.error_message:
@@ -275,6 +282,12 @@ class CompressionWorker(QThread):
 
     def _emit_progress(self, value):
         self.progress.emit(value)
+
+    def _emit_phase(self, ev):
+        try:
+            self.phase_ev.emit(dict(ev or {}))
+        except Exception:
+            pass
 
     def _emit_status(self, message):
         self.status_message.emit(message)
@@ -609,7 +622,13 @@ class MainWindow(QMainWindow):
 
         central = QWidget()
         self.setCentralWidget(central)
-        layout = QVBoxLayout(central)
+        root_layout = QHBoxLayout(central)
+        root_layout.setContentsMargins(0, 0, 0, 0)
+        root_layout.setSpacing(0)
+
+        # Main column (everything the app had before the tasks panel).
+        main_col = QWidget()
+        layout = QVBoxLayout(main_col)
         layout.setSpacing(12)
         layout.setContentsMargins(16, 16, 16, 16)
 
@@ -719,6 +738,22 @@ class MainWindow(QMainWindow):
         self.progress.setRange(0, 100)
         self.progress.setValue(0)
         layout.addWidget(self.progress)
+
+        # --- Tasks panel (right side, collapsible) ---
+        self.tasks_panel = TasksPanel()
+        self.tasks_panel.btn_clear.clicked.connect(self._on_clear_task_history)
+
+        self.splitter = QSplitter(Qt.Orientation.Horizontal)
+        self.splitter.setChildrenCollapsible(True)
+        self.splitter.addWidget(main_col)
+        self.splitter.addWidget(self.tasks_panel)
+        self.splitter.setStretchFactor(0, 4)
+        self.splitter.setStretchFactor(1, 1)
+        self.splitter.setSizes([980, 320])
+        root_layout.addWidget(self.splitter)
+
+        # Cargar el histórico persistente de tareas al arrancar.
+        self._load_task_history()
 
         # Estado interno del banner: cuadricula de timers que mantiene la
         # propuesta al dia durante la sesion.
@@ -1827,12 +1862,30 @@ class MainWindow(QMainWindow):
         # update chain was running).
         src = input_path if input_path is not None else self.input_path
 
+        # Register the task in the side panel + persisted history.
+        import uuid
+        self._current_task_id = str(uuid.uuid4())
+        task_name = os.path.basename(src)
+        if mode == "preview":
+            task_name += " (preview)"
+        self.tasks_panel.get_or_create(self._current_task_id, task_name)
+        self.tasks_panel._cards[self._current_task_id].set_running()
+        try:
+            import src.task_history as task_history
+            task_history.start_task(
+                self._current_task_id, task_name, input_path=src,
+            )
+        except Exception:
+            pass
+
         self.worker = CompressionWorker(
             self.ffmpeg_path, src, output_path, settings,
             mode=mode, ai_engines=ai_engines,
         )
+        self.worker.task_id = self._current_task_id
         self.worker.progress.connect(self._on_worker_progress)
         self.worker.status_message.connect(self.status_label.setText)
+        self.worker.phase_ev.connect(self._on_phase_event)
         # Direct slot + QueuedConnection: el callback SIEMPRE corre en el
         # hilo de la GUI. Lambda en hilo secundario fallaria silenciosamente.
         self.worker.finished.connect(self._on_worker_finished, Qt.ConnectionType.QueuedConnection)
@@ -1856,6 +1909,57 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
 
+    def _on_phase_event(self, ev):
+        """Traduce un evento de fase del worker al panel + historial."""
+        task_id = getattr(self, "_current_task_id", None)
+        if not task_id:
+            return
+        self.tasks_panel.update_phase_event(task_id, ev)
+        try:
+            import src.task_history as task_history
+            phase_status = {
+                "start": "pending",
+                "progress": "running",
+                "end": "done",
+                "failed": "failed",
+            }.get(ev.get("ev"), "pending")
+            task_history.update_phase(
+                task_id,
+                ev.get("id", ""),
+                label=ev.get("label", ""),
+                status=phase_status,
+                pct=int(ev.get("pct", 0) or 0),
+            )
+        except Exception:
+            pass
+
+    def _mark_task_finished(self, status):
+        task_id = getattr(self, "_current_task_id", None)
+        if task_id:
+            self.tasks_panel.mark_finished(task_id, status)
+            try:
+                import src.task_history as task_history
+                task_history.finish_task(task_id, status)
+            except Exception:
+                pass
+        self._current_task_id = None
+
+    def _load_task_history(self):
+        """Carga el histórico persistente de tareas en el panel."""
+        try:
+            import src.task_history as task_history
+            self.tasks_panel.rebuild(task_history.list_tasks(limit=50))
+        except Exception:
+            pass
+
+    def _on_clear_task_history(self):
+        try:
+            import src.task_history as task_history
+            task_history.clear()
+        except Exception:
+            pass
+        self.tasks_panel.rebuild([])
+
     def _on_worker_finished(self):
         self.btn_compress.setEnabled(True)
         self.btn_preview.setEnabled(True)
@@ -1877,6 +1981,7 @@ class MainWindow(QMainWindow):
             getattr(worker, "abort_event", None) is not None
             and worker.abort_event.is_set()
         ):
+            self._mark_task_finished("aborted")
             self._cleanup_after_abort()
             return
 
@@ -1961,6 +2066,7 @@ class MainWindow(QMainWindow):
         # ---------------- Standard worker-finished -----------------
         self.progress.setValue(100 if worker.success else 0)
         mode = getattr(worker, "mode", "compress")
+        self._mark_task_finished("success" if worker.success else "failed")
 
         if not worker.success:
             # Un fallo de encode deja el output parcial (truncado/incompleto)
