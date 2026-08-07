@@ -936,10 +936,9 @@ def compress_video_with_ai(
             audio_thread.join(timeout=10)
         if _has_audio_phase:
             if audio_tmp[0]:
-                _emit_phase(phase_cb, "progress", "audio", pct=100)
-                _emit_phase(phase_cb, "end", "audio")
+                _emit_phase(phase_cb, "end", "audio", label="Audio (parallel)")
             else:
-                _emit_phase(phase_cb, "failed", "audio")
+                _emit_phase(phase_cb, "failed", "audio", label="Audio (parallel)")
         mux_ok = _mux_audio(
             ffmpeg_path, input_path, output_path, audio_codec,
             loudnorm_meas=None,
@@ -1204,13 +1203,14 @@ def _encode_audio_parallel(ffmpeg_path, input_path, settings,
                     if line and "=" in line:
                         key, _, value = line.partition("=")
                         value = value.strip()
-                        if key == "out_time_ms":
+                        if key == "out_time_us" or key == "out_time_ms":
+                            # Legacy: out_time_ms en ffmpeg son MICROsegundos.
                             try:
-                                out_ms = float(value)
+                                out_us = float(value)
                             except (TypeError, ValueError):
-                                out_ms = 0.0
+                                out_us = 0.0
                             if duration_s and duration_s > 0:
-                                pct = int(min(out_ms / (duration_s * 1000.0) * 100, 100))
+                                pct = int(min(out_us / (duration_s * 1000000.0) * 100, 100))
                             else:
                                 pct = -1
                             if pct != last_pct and pct >= 0:

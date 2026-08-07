@@ -513,8 +513,7 @@ def search_hub_models(
     try:
         models = api.list_models(
             search=query or None,
-            sort="downloads",
-            direction=-1,
+            sort="-downloads",
             offset=page * limit,
             limit=limit,
             expand=["siblings", "cardData"],
