@@ -171,6 +171,12 @@ class HFDownloadWorker(QThread):
             self.failed.emit("cancelled before start")
             return
 
+        # In PyInstaller GUI builds (console=False), sys.stderr is None.
+        # HuggingFace's tqdm progress bars crash trying to write to it.
+        # Disable them — the worker already manages its own progress via
+        # Qt signals.
+        os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
+
         try:
             from huggingface_hub import HfApi, hf_hub_download
         except ImportError:
