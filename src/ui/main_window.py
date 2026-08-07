@@ -309,6 +309,7 @@ class CompressionWorker(QThread):
         instead of a silent partial chain).
         """
         from src.ai.inference import (
+            AIInferenceEngine,
             create_inference_engine,
             get_model_path,
             convert_pth_to_onnx,
@@ -478,6 +479,19 @@ class CompressionWorker(QThread):
                     raise RuntimeError(
                         f"{node_label} could not load.\nDetails: {detail}\n{hint}"
                     )
+
+                # Escala objetivo: la que el usuario eligió en el dropdown
+                # del nodo Upscale (p.ej. x2 con un peso nativo x4). Si es
+                # válida y menor que la nativa, se la comunicamos a la
+                # engine para que reporte esa escala (el frame sigue
+                # upscaleando a la nativa y el encoder re-encaja el tamaño).
+                try:
+                    _us = info.get("scale") if isinstance(info, dict) else None
+                    _us_int = int(_us) if _us else 0
+                except (TypeError, ValueError):
+                    _us_int = 0
+                if _us_int > 1 and isinstance(inference_engine, AIInferenceEngine):
+                    inference_engine._target_scale = _us_int
 
                 engines.append(inference_engine)
                 provider = getattr(inference_engine, "_providers", [])

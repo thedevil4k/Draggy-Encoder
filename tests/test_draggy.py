@@ -2345,6 +2345,80 @@ def test_tasks_panel_widget_smoke(qapp):
     assert panel._cards["old-1"]._status == "completed"
 
 
+# ---------------------------------------------------------------------------
+# 12. Model scale: filename parsing + target scale honored by engines
+# ---------------------------------------------------------------------------
+
+
+def test_parse_model_scale_from_name_real_world_names():
+    """Escalas extraídas de nombres reales de pesos del ecosistema."""
+    from src.ui.workflow_widget import _parse_model_scale_from_name as _ps
+
+    assert _ps("RealESRGAN_x4plus.pth") == 4
+    assert _ps("realesr-animevideov3-x4.pth") == 4
+    assert _ps("realesr-animevideov3-x2.pth") == 2
+    assert _ps("realesr-animevideov3-x3.pth") == 3
+    assert _ps("realesr-general-x4v3.pth") == 4
+    assert _ps("4x-UltraSharp.pth") == 4
+    assert _ps("Real_CUGAN_x2.pth") == 2
+    assert _ps("realesrgan-x4plus-anime-6b.pth") == 4
+    assert _ps("RealESRGAN_x4plus_anime_6B.pth") == 4
+    assert _ps("Real-CUGAN_x3_no_denoise.pth") == 3
+    assert _ps("realesr_animevideov3_x4_plus.pth") == 4
+
+
+def test_parse_model_scale_from_name_unknown_returns_one():
+    from src.ui.workflow_widget import _parse_model_scale_from_name as _ps
+
+    assert _ps("model.safetensors") == 1
+    assert _ps("SwinIR_003_realSR_BSRGAN_DFOWMFC_s64w8_SwinIR-L.pth") == 1
+    assert _ps("") == 1
+
+
+def test_pytorch_engine_get_scale_factor_honors_target(tmp_path, monkeypatch):
+    """Con _target_scale menor que la nativa, get_scale_factor reporta la
+    escala elegida por el usuario (x2 sobre un peso nativo x4)."""
+    import src.ai.inference as inf
+    from src.ai.inference import PyTorchInferenceEngine
+
+    pth = tmp_path / "model.pth"
+    pth.write_bytes(b"fake")
+
+    # No necesitamos torch real: solo comprobamos el getter.
+    class _Noop(PyTorchInferenceEngine):
+        def load(self):
+            self._scale = 4
+            self._loaded = True
+            return True
+
+    monkeypatch.setattr(inf, "PyTorchInferenceEngine", _Noop)
+    eng = inf.PyTorchInferenceEngine(str(pth), "upscale-realesr-animevideov3")
+    assert eng.load() is True
+    assert eng.get_scale_factor() == 4  # nativa sin target
+
+    eng._target_scale = 2
+    assert eng.get_scale_factor() == 2  # el usuario pidió x2
+
+    eng._target_scale = 8  # target > nativa: no es válido, se queda nativa
+    assert eng.get_scale_factor() == 4
+
+    eng._target_scale = 2
+    eng._scale = 2  # peso real x2 y pedido x2: sin cambio
+    assert eng.get_scale_factor() == 2
+
+
+def test_onnx_engine_get_scale_factor_honors_target():
+    from src.ai.inference import ONNXRUNTIMEInferenceEngine
+
+    eng = ONNXRUNTIMEInferenceEngine("", "onnxruntime")
+    eng._input_shape = (1, 3, 64, 64)
+    eng._output_shape = (1, 3, 256, 256)
+    assert eng.get_scale_factor() == 4
+
+    eng._target_scale = 2
+    assert eng.get_scale_factor() == 2
+
+
 # ==--------------------------------------------------------------------==
 # Standalone runner (works even without pytest installed)
 # ==--------------------------------------------------------------------==

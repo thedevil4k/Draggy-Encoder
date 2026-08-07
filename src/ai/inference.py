@@ -122,6 +122,10 @@ class AIInferenceEngine:
         self._output_name = ""
         self._input_shape = None
         self._output_shape = None
+        # Escala objetivo solicitada por la UI (el usuario puede querer
+        # x2 aunque el peso sea x4). None → usar la escala nativa del
+        # modelo detectada en load().
+        self._target_scale = None
 
     @property
     def is_loaded(self) -> bool:
@@ -439,15 +443,19 @@ class ONNXRUNTIMEInferenceEngine(AIInferenceEngine):
 
     def get_scale_factor(self) -> int:
         """Intenta determinar el factor de escala del modelo."""
+        native = 2
         if self._input_shape and self._output_shape:
             try:
                 in_h = self._input_shape[2] if len(self._input_shape) > 2 else 1
                 out_h = self._output_shape[2] if len(self._output_shape) > 2 else 1
                 if in_h > 0 and out_h > 0:
-                    return max(1, out_h // in_h)
+                    native = max(1, out_h // in_h)
             except (TypeError, IndexError):
                 pass
-        return 2
+        # La escala solicitada por la UI manda si es menor que la nativa.
+        if self._target_scale and 1 < self._target_scale < native:
+            return int(self._target_scale)
+        return native
 
     def unload(self) -> None:
         self._session = None
@@ -585,6 +593,11 @@ class PyTorchInferenceEngine(AIInferenceEngine):
         return output
 
     def get_scale_factor(self) -> int:
+        # Si el usuario pidió una escala menor que la nativa del peso
+        # (p.ej. x2 con un modelo x4), reportar la solicitada: la
+        # pipeline dimensiona el encoder con este valor.
+        if self._target_scale and 1 < self._target_scale < self._scale:
+            return int(self._target_scale)
         return self._scale
 
     def unload(self) -> None:

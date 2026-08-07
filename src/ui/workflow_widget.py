@@ -33,6 +33,42 @@ NODE_CATEGORY = {
 
 
 # -----------------------------------------------------------------------
+# Scale parsing from model filenames.
+# -----------------------------------------------------------------------
+
+
+def _parse_model_scale_from_name(fname: str) -> int:
+    """Extract an upscale factor (2, 3, 4, 8...) from a weight filename.
+
+    Handles the naming conventions found in the Real-ESRGAN / Real-CUGAN /
+    OmniSR ecosystem, both orders ("x4plus", "x4v3", "4x-UltraSharp") and
+    with or without separators. Returns 1 when no scale can be parsed.
+    """
+    import re
+
+    # ``(\d+)x`` or ``x(\d+)`` where the following character is a word
+    # boundary or separator, so "x4plus"/"x4v3" and "4x-UltraSharp" match
+    # but "anime6B" (no x) and "somethingdx" (x only) do not.
+    patterns = [
+        # x2, x4, x8... possibly followed by plus/vN or ending the name
+        re.compile(r"[xX](\d+)(?=(?:plus|v\d+)?(?:$|[\s_.-]))", re.IGNORECASE),
+        # 2x, 4x ... prefixed to the name
+        re.compile(r"(?:^|[\s_.-])(\d+)[xX](?=(?:plus|v\d+)?(?:$|[\s_.-]))", re.IGNORECASE),
+    ]
+    best = 1
+    for _rx in patterns:
+        for _m in _rx.finditer(fname):
+            try:
+                _v = int(_m.group(1))
+            except (TypeError, ValueError):
+                continue
+            # Ignore absurd numbers that look like model versions/resolutions.
+            if 1 < _v <= 64:
+                best = max(best, _v)
+    return best
+
+
+# -----------------------------------------------------------------------
 # Base step
 # -----------------------------------------------------------------------
 
@@ -577,16 +613,22 @@ class AIWorkflowStep(QFrame):
 
             for mp in sorted(model_paths):
                 fname = os.path.basename(mp)
-                # Extract scale from filename: x2, x4, x8, 4x, etc.
-                scale = 1
-                sm = re.search(r"[_-]?(\d+)[xX](?:[_\-.]|$)", fname)
-                if not sm:
-                    sm = re.search(r"[_-]?[xX](\d+)(?:[_\-.]|$)", fname)
-                if sm:
+                # Extract scale from filename: x2, x3, x4, x8, 4x, 2x, etc.
+                # Cubre nombres reales del ecosistema: "x4plus", "x4v3",
+                # "realesr-animevideov3-x4", "4x-UltraSharp", "Real_CUGAN_x2".
+                scale = _parse_model_scale_from_name(fname)
+                if scale < 2:
+                    # Ninguna pista en el nombre (p.ej. "model.safetensors"):
+                    # cae a la escala declarada en el catálogo si es una
+                    # engine upscale conocida y tiene escala > 1.
                     try:
-                        scale = int(sm.group(1))
-                    except ValueError:
-                        scale = 1
+                        from src.ai.registry import get_entry, get_scale_factor as _cat_scale
+                        _entry = get_entry(eid) or {}
+                        if _entry.get("category") == "Upscale":
+                            _cs = int(_cat_scale(eid) or 1)
+                            scale = _cs if _cs > 1 else 1
+                    except Exception:
+                        pass
 
                 # Build a human label.
                 short_name = os.path.splitext(fname)[0]

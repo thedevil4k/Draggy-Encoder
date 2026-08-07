@@ -705,13 +705,20 @@ def compress_video_with_ai(
         return out
 
     def _resize_frame(im, dst_w_in, dst_h_in):
-        """Nearest-neighbor resize de un frame BGR uint8 (con fallbacks)."""
+        """Resize de un frame BGR uint8 a (dst_w_in, dst_h_in).
+
+        Usa AREA para reducción (mejor calidad al bajar de escala, p.ej.
+        cuando la engine es nativa x4 y el usuario pidió x2) y LINEAR para
+        agrandar. Con fallbacks PIL/numpy si opencv no está disponible.
+        """
         try:
             import cv2  # type: ignore
-            resized = cv2.resize(
-                im, (dst_w_in, dst_h_in),
-                interpolation=cv2.INTER_NEAREST,
+            _interp = (
+                cv2.INTER_AREA
+                if (dst_h_in < im.shape[0] or dst_w_in < im.shape[1])
+                else cv2.INTER_LINEAR
             )
+            resized = cv2.resize(im, (dst_w_in, dst_h_in), interpolation=_interp)
             if resized.ndim == 2 and dst_h_in and dst_w_in:
                 resized = np.repeat(resized[..., None], 3, axis=2)
             return resized
@@ -720,7 +727,7 @@ def compress_video_with_ai(
         try:
             from PIL import Image as _PILImg
             pil = _PILImg.fromarray(im)
-            pil = pil.resize((dst_w_in, dst_h_in), _PILImg.Resampling.NEAREST)
+            pil = pil.resize((dst_w_in, dst_h_in), _PILImg.Resampling.BILINEAR)
             resized = np.array(pil)
             if resized.ndim == 2 and dst_h_in and dst_w_in:
                 resized = np.repeat(resized[..., None], 3, axis=2)
