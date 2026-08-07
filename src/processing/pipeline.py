@@ -496,7 +496,8 @@ def compress_video_with_ai(
             try:
                 audio_tmp[0] = _encode_audio_parallel(
                     ffmpeg_path, input_path, settings,
-                    status_callback=status_callback, abort_event=abort_event,
+                    status_callback=status_callback, phase_cb=phase_cb,
+                    abort_event=abort_event,
                 )
             except Exception as exc:
                 audio_error[0] = exc
@@ -1105,7 +1106,7 @@ def _audio_mux_args(audio_codec, loudnorm_meas, audio_boost, container_format="m
 
 
 def _encode_audio_parallel(ffmpeg_path, input_path, settings,
-                           status_callback=None, abort_event=None):
+                           status_callback=None, phase_cb=None, abort_event=None):
     """Codifica la pista de audio COMPLETA a un archivo temporal.
 
     Corre en un hilo daemon mientras el vídeo se renderiza con la GPU.
@@ -1115,6 +1116,10 @@ def _encode_audio_parallel(ffmpeg_path, input_path, settings,
 
     El extension se elige según el codec final para que el mux del
     contenedor destino pueda copiar la pista sin re-encodear.
+
+    ``phase_cb`` (opcional) recibe eventos de fase ``audio`` con progreso
+    real del encode leyendo ``-progress pipe:1`` de ffmpeg, para que la
+    fase "Audio (parallel)" avance en el panel de tareas.
     """
     audio_codec = str(settings.get("audio", "copy") or "copy")
     audio_boost = bool(settings.get("audio_boost", False))
@@ -1151,6 +1156,7 @@ def _encode_audio_parallel(ffmpeg_path, input_path, settings,
         "-y",
         "-i", input_path,
         "-map", "0:a:0?",
+        "-vn",
         "-c:a", enc_a,
         "-b:a", "192k",
     ]
@@ -1162,14 +1168,24 @@ def _encode_audio_parallel(ffmpeg_path, input_path, settings,
         cmd.append("-2")
     cmd.append(tmp_path)
 
+    if phase_cb is not None:
+        # -progress pipe:1 emite out_time_ms=... en stdout; lo convertimos a
+        # un % de la duración del input para que la fase Audio avance.
+        cmd.insert(1, "-progress")
+        cmd.insert(2, "pipe:1")
+
+    duration_s = _get_duration_seconds(ffmpeg_path, input_path) or 0
+
     proc = subprocess.Popen(
         cmd,
-        stdout=subprocess.DEVNULL,
+        stdout=subprocess.PIPE if phase_cb is not None else subprocess.DEVNULL,
         stderr=subprocess.PIPE,
         encoding="utf-8",
         errors="replace",
     )
     try:
+        # Track del último out_time_ms para emitir sólo cambios de %.
+        last_pct = -1
         while proc.poll() is None:
             if abort_event and abort_event.is_set():
                 try:
@@ -1178,8 +1194,35 @@ def _encode_audio_parallel(ffmpeg_path, input_path, settings,
                 except Exception:
                     pass
                 return None
+            if phase_cb is not None:
+                try:
+                    line = proc.stdout.readline()
+                except Exception:
+                    line = ""
+                if line:
+                    line = line.strip()
+                    if line and "=" in line:
+                        key, _, value = line.partition("=")
+                        value = value.strip()
+                        if key == "out_time_ms":
+                            try:
+                                out_ms = float(value)
+                            except (TypeError, ValueError):
+                                out_ms = 0.0
+                            if duration_s and duration_s > 0:
+                                pct = int(min(out_ms / (duration_s * 1000.0) * 100, 100))
+                            else:
+                                pct = -1
+                            if pct != last_pct and pct >= 0:
+                                last_pct = pct
+                                _emit_phase(phase_cb, "progress", "audio",
+                                            label="Audio (parallel)", pct=pct)
+                continue
             time.sleep(0.1)
         if proc.returncode == 0 and os.path.exists(tmp_path) and os.path.getsize(tmp_path) > 0:
+            if phase_cb is not None:
+                _emit_phase(phase_cb, "progress", "audio",
+                            label="Audio (parallel)", pct=100)
             return tmp_path
         try:
             stderr_tail = (proc.stderr.read() or "")[-512:]

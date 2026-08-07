@@ -84,6 +84,8 @@ def measure_loudness(ffmpeg_path, input_path, timeout_seconds=600,
     elif end_sec is not None:
         cmd.extend(["-to", str(end_sec)])
     cmd.extend([
+        "-map", "0:a:0?",   # solo la primera pista de audio
+        "-vn",              # sin vídeo: no decodificar la pista más pesada
         "-af", "loudnorm=I=-16:TP=-1.5:LRA=11:print_format=json",
         "-f", "null",
         "-",
