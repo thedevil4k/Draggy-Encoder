@@ -2344,6 +2344,45 @@ def test_tasks_panel_widget_smoke(qapp):
     assert "old-1" in panel._cards
     assert panel._cards["old-1"]._status == "completed"
 
+    # Log tab: append + clear without crashing.
+    panel.append_log("first line")
+    panel.append_log("second line")
+    assert panel.log_view.toPlainText().count("\n") >= 1
+    panel._on_clear_log()
+    assert panel.log_view.toPlainText() == ""
+
+
+def test_tasks_panel_clear_all_removes_every_card(qapp):
+    """clear_all() must wipe every visible card (fixes Clear history)."""
+    from src.ui.tasks_panel import TasksPanel
+
+    panel = TasksPanel()
+    for i in range(3):
+        panel.get_or_create(f"job-{i}", f"file-{i}.mp4")
+    assert len(panel._cards) == 3
+    assert len(panel._order) == 3
+
+    panel.clear_all()
+    assert panel._cards == {}
+    assert panel._order == []
+    assert panel._list_layout.count() == 1  # solo queda el stretch
+
+
+def test_tasks_panel_rebuild_replaces_not_duplicates(qapp):
+    """rebuild() substituye la lista: no duplica tarjetas antiguas."""
+    from src.ui.tasks_panel import TasksPanel
+
+    panel = TasksPanel()
+    panel.rebuild([
+        {"task_id": "a", "name": "a.mp4", "status": "success", "phases": []}
+    ])
+    assert "a" in panel._cards
+    panel.rebuild([
+        {"task_id": "b", "name": "b.mp4", "status": "running", "phases": []}
+    ])
+    assert "a" not in panel._cards
+    assert "b" in panel._cards
+
 
 # ---------------------------------------------------------------------------
 # 12. Model scale: filename parsing + target scale honored by engines

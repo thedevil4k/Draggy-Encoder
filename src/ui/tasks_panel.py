@@ -1,9 +1,12 @@
-"""Panel lateral de tareas: muestra el progreso por fase de cada job.
+"""Panel lateral de tareas + log: muestra el progreso por fase de cada job.
 
-Derecha de la interfaz, colapsable con un toggle. Cada ``TaskCard``
-representa un job (bien corriente, bien histórico persistido en
-``src.task_history``) y dentro lista una fila por fase (``PhaseRow``)
-con su propia mini-barra: engine de IA, audio, mux.
+Derecha de la interfaz, colapsable con un toggle. Dos pestañas:
+
+- **Tasks**: una ``TaskCard`` por render pedido por el usuario (bien
+  corriente, bien histórico persistido en ``src.task_history``) con una
+  fila por fase (``PhaseRow``) y su mini-barra: engine de IA, audio, mux.
+- **Log**: historial plano de mensajes de estado ("lo que está sucediendo
+  y ha sucedido"), timestampados y con autoscroll.
 
 Los eventos vienen del worker vía un dict plano:
 ``{"ev": start|progress|end|failed, "id": str, "label": str, "pct": int,
@@ -13,15 +16,19 @@ acoplamientos de ida.
 
 from __future__ import annotations
 
+from datetime import datetime
+
 from PySide6.QtCore import QSize, Qt
-from PySide6.QtGui import QColor, QPainter
+from PySide6.QtGui import QColor, QPainter, QTextCursor
 from PySide6.QtWidgets import (
     QFrame,
     QHBoxLayout,
     QLabel,
+    QPlainTextEdit,
     QPushButton,
     QScrollArea,
     QSizePolicy,
+    QTabWidget,
     QVBoxLayout,
     QWidget,
 )
@@ -229,7 +236,7 @@ class TaskCard(QFrame):
 
 
 class TasksPanel(QWidget):
-    """Panel lateral colapsable de tareas y sus fases."""
+    """Panel lateral colapsable: pestaña Tasks (renders del usuario) + Log."""
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -248,6 +255,18 @@ class TasksPanel(QWidget):
         header.addWidget(self._count_label, 1, Qt.AlignmentFlag.AlignRight)
         root.addLayout(header)
 
+        self.tabs = QTabWidget()
+        self.tabs.setStyleSheet(
+            "QTabWidget::pane { border: none; background: transparent; }"
+            "QTabBar::tab { background: #1f2c4c; color: #a0a0b0; padding: 4px 12px;"
+            " border-radius: 5px 5px 0 0; margin-right: 2px; }"
+            "QTabBar::tab:selected { background: #243049; color: #e8e8f0; }"
+        )
+
+        # --- Pestaña Tasks: tarjetas de render del usuario ---
+        self._tasks_host = QWidget()
+        tasks_lay = QVBoxLayout(self._tasks_host)
+        tasks_lay.setContentsMargins(0, 0, 0, 0)
         self.scroll = QScrollArea()
         self.scroll.setWidgetResizable(True)
         self.scroll.setStyleSheet(
@@ -260,23 +279,64 @@ class TasksPanel(QWidget):
         self._list_layout.setSpacing(8)
         self._list_layout.addStretch(1)
         self.scroll.setWidget(self._list)
-        root.addWidget(self.scroll, 1)
+        tasks_lay.addWidget(self.scroll, 1)
 
         self.btn_clear = QPushButton("Clear history")
         self.btn_clear.setStyleSheet(
             "background-color: #1f2c4c; color: #a0a0b0; border: 1px solid #2c3e50; "
             "border-radius: 6px; padding: 4px 10px; font-size: 11px;"
         )
-        root.addWidget(self.btn_clear)
+        tasks_lay.addWidget(self.btn_clear)
+        self.tabs.addTab(self._tasks_host, "Tasks")
+
+        # --- Pestaña Log: todo lo que sucede y ha sucedido ---
+        self._log_host = QWidget()
+        log_lay = QVBoxLayout(self._log_host)
+        log_lay.setContentsMargins(0, 0, 0, 0)
+        self.log_view = QPlainTextEdit()
+        self.log_view.setReadOnly(True)
+        self.log_view.setMaximumBlockCount(5000)
+        self.log_view.setStyleSheet(
+            "QPlainTextEdit { background: #0f1424; color: #c8c8d4; border: 1px solid #243049; "
+            "border-radius: 6px; font-family: Consolas, monospace; font-size: 11px; }"
+        )
+        log_lay.addWidget(self.log_view, 1)
+
+        self.btn_clear_log = QPushButton("Clear log")
+        self.btn_clear_log.setStyleSheet(
+            "background-color: #1f2c4c; color: #a0a0b0; border: 1px solid #2c3e50; "
+            "border-radius: 6px; padding: 4px 10px; font-size: 11px;"
+        )
+        self.btn_clear_log.clicked.connect(self._on_clear_log)
+        log_lay.addWidget(self.btn_clear_log)
+
+        self.tabs.addTab(self._log_host, "Log")
+        root.addWidget(self.tabs, 1)
 
         self._order: list[str] = []   # task ids (newest first)
         self._cards: dict[str, TaskCard] = {}
+
+    # --- API del Log -------------------------------------------------
+
+    def append_log(self, message: str):
+        """Añade una línea timestampada al log (autoscroll al final)."""
+        if not message:
+            return
+        ts = datetime.now().strftime("%H:%M:%S")
+        self.log_view.appendPlainText(f"[{ts}] {message}")
+        cursor = self.log_view.textCursor()
+        cursor.movePosition(QTextCursor.MoveOperation.End)
+        self.log_view.setTextCursor(cursor)
+
+    def _on_clear_log(self):
+        self.log_view.clear()
 
     def _sync_count(self):
         self._count_label.setText(str(len(self._cards)))
 
     def rebuild(self, tasks: list = None):
-        """(Re)construye la lista desde ``src.task_history.list_tasks()``."""
+        """``(Re)construye la lista desde ``list_tasks()`` reemplazando todo."""
+        self.clear_all()
         for task in (tasks or []):
             task_id = task.get("task_id", "")
             if not task_id:
@@ -311,6 +371,16 @@ class TasksPanel(QWidget):
             card.deleteLater()
             if task_id in self._order:
                 self._order.remove(task_id)
+        self._sync_count()
+
+    def clear_all(self):
+        """Elimina TODAS las tarjetas del UI (historial visible)."""
+        for task_id in list(self._order):
+            card = self._cards.pop(task_id, None)
+            if card is not None:
+                self._list_layout.removeWidget(card)
+                card.deleteLater()
+        self._order.clear()
         self._sync_count()
 
     def update_phase_event(self, task_id: str, ev: dict):

@@ -1412,7 +1412,7 @@ class MainWindow(QMainWindow):
         self._close_chain.chain_started.connect(self._on_chain_started)
         self._close_chain.step_started.connect(self._on_chain_step_started)
         self._close_chain.step_progress.connect(self.progress.setValue)
-        self._close_chain.step_status.connect(self.status_label.setText)
+        self._close_chain.step_status.connect(self._on_status_message)
         self._close_chain.step_finished.connect(self._on_chain_step_finished)
         self._close_chain.chain_finished.connect(self._on_chain_finished)
         self._close_chain.start()
@@ -1733,7 +1733,7 @@ class MainWindow(QMainWindow):
 
         self._banner_update_worker = _FFmpegUpdateWorker(parent=self)
         self._banner_update_worker.progress.connect(self.progress.setValue)
-        self._banner_update_worker.status.connect(self.status_label.setText)
+        self._banner_update_worker.status.connect(self._on_status_message)
         self._banner_update_worker.finished_ok.connect(self._on_banner_update_finished)
         self._banner_update_worker.failed.connect(self._on_banner_update_failed)
         self._banner_update_worker.finished.connect(self._on_banner_update_thread_finished)
@@ -1902,7 +1902,7 @@ class MainWindow(QMainWindow):
         )
         self.worker.task_id = self._current_task_id
         self.worker.progress.connect(self._on_worker_progress)
-        self.worker.status_message.connect(self.status_label.setText)
+        self.worker.status_message.connect(self._on_status_message)
         self.worker.phase_ev.connect(self._on_phase_event)
         # Direct slot + QueuedConnection: el callback SIEMPRE corre en el
         # hilo de la GUI. Lambda en hilo secundario fallaria silenciosamente.
@@ -1926,6 +1926,11 @@ class MainWindow(QMainWindow):
                 self.progress.setFormat("%p%")
         except Exception:
             pass
+
+    def _on_status_message(self, message):
+        """Estado del worker: label + log del panel lateral."""
+        self.status_label.setText(message)
+        self.tasks_panel.append_log(message)
 
     def _on_phase_event(self, ev):
         """Traduce un evento de fase del worker al panel + historial."""
@@ -1976,7 +1981,7 @@ class MainWindow(QMainWindow):
             task_history.clear()
         except Exception:
             pass
-        self.tasks_panel.rebuild([])
+        self.tasks_panel.clear_all()
 
     def _on_worker_finished(self):
         self.btn_compress.setEnabled(True)
@@ -2271,7 +2276,7 @@ class MainWindow(QMainWindow):
 
         self.redetect_worker = RedetectWorker(self.ffmpeg_path)
         self.redetect_worker.progress.connect(
-            lambda v, msg: (self.progress.setValue(v), self.status_label.setText(msg))
+            lambda v, msg: (self.progress.setValue(v), self._on_status_message(msg))
         )
         self.redetect_worker.done.connect(self._on_redetect_done)
         self.redetect_worker.error.connect(self._on_redetect_error)
