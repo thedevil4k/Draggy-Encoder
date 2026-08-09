@@ -24,11 +24,11 @@ logger = logging.getLogger(__name__)
 # Mapping of workflow node name -> engine category.
 # -----------------------------------------------------------------------
 NODE_CATEGORY = {
-    "Upscale": ("Upscale", "Upscale engines (Real-ESRGAN, Real-CUGAN, ...)"),
-    "Interp":  ("Interpolate", "Frame interpolation engines (RIFE, FILM, ...)"),
-    "Denoise": ("Denoise", "Denoising engines (NAFNet, ...)"),
-    "Colorize": ("Colorize",   "Colorization engines (DDColor, DeOldify, ...)"),
-    "FaceRestore": ("FaceRestore", "Face restoration engines (GFPGAN, CodeFormer, ...)"),
+    "Upscale": ("Upscale", "Upscale engines (Real-ESRGAN, CUGAN, ...)"),
+    "Interp":  ("Interpolate", "Frame interpolation (RIFE, FILM, ...)"),
+    "Denoise": ("Denoise", "Denoising (NAFNet, ...)"),
+    "Colorize": ("Colorize",   "Colorization (DDColor, DeOldify, ...)"),
+    "FaceRestore": ("FaceRestore", "Face restoration (GFPGAN, ...)"),
 }
 
 
@@ -80,7 +80,7 @@ class WorkflowStep(QWidget):
         super().__init__(parent)
         self.name = name
         self.active = active
-        self.setFixedSize(fixed_width, 90)
+        self.setFixedSize(fixed_width, 150)
         self._setup_ui(icon_path)
 
     def _setup_ui(self, icon_path):
@@ -89,7 +89,7 @@ class WorkflowStep(QWidget):
         layout.setSpacing(2)
 
         self.icon_label = QLabel()
-        self.icon_label.setFixedSize(64, 64)
+        self.icon_label.setFixedSize(72, 72)
         self.icon_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.icon_label.setScaledContents(True)
         self._load_icon(icon_path)
@@ -148,7 +148,7 @@ class ImportStep(WorkflowStep):
         layout.setSpacing(2)
 
         self.icon_label = QLabel()
-        self.icon_label.setFixedSize(64, 64)
+        self.icon_label.setFixedSize(72, 72)
         self.icon_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.icon_label.setScaledContents(True)
         self._load_icon(icon_path)
@@ -250,7 +250,7 @@ class AIWorkflowStep(QFrame):
     search_requested = Signal(str)  # arg = categoría del nodo
 
     def __init__(self, name, icon_path, parent=None,
-                 fixed_width=200, fixed_height=130):
+                 fixed_width=200, fixed_height=150):
         super().__init__(parent)
         self.name = name
         if name in NODE_CATEGORY:
@@ -351,10 +351,10 @@ class AIWorkflowStep(QFrame):
         layout.setSpacing(3)
 
         header = QHBoxLayout()
-        header.setSpacing(6)
+        header.setSpacing(5)
 
         self.icon_label = QLabel()
-        self.icon_label.setFixedSize(40, 40)
+        self.icon_label.setFixedSize(36, 36)
         self.icon_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.icon_label.setScaledContents(True)
         self._load_icon(icon_path)
@@ -479,15 +479,42 @@ class AIWorkflowStep(QFrame):
             if s not in seen_scales:
                 seen_scales[s] = m
 
-        if len(seen_scales) > 1:
-            for s in sorted(seen_scales.keys()):
-                self.combo_scale.addItem(f"{s}x", seen_scales[s])
+        # Scales que declara el catálogo (p.ej. AnimeVideo v3 soporta
+        # 2x/3x/4x como en video2x). Si el nombre del archivo no las
+        # revela todas, completamos el dropdown con ellas: la escala se
+        # comunica luego a la engine vía _target_scale y el encoder
+        # re-encaja el frame al factor elegido.
+        try:
+            from src.ai.registry import get_supported_scales
+            catalog_scales = get_supported_scales(engine_id) or []
+        except Exception:
+            catalog_scales = []
+
+        def _data_for_scale(s):
+            # Prefiere el modelo real con esa escala; si no existe
+            # (archivo sin sufijo de escala), usa cualquier modelo de
+            # la engine — la engine upscala a su nativa y el encoder
+            # dimensiona al factor elegido.
+            m = seen_scales.get(s)
+            if m is not None:
+                return dict(m)
+            return {
+                "engine_id": engine_id,
+                "model_path": None,
+                "scale": s,
+            }
+
+        scales = sorted({s for s in seen_scales if s > 1} | set(catalog_scales))
+
+        if len(scales) > 1:
+            for s in scales:
+                self.combo_scale.addItem(f"{s}x", _data_for_scale(s))
             self.combo_scale.setCurrentIndex(0)
             self.combo_scale.setEnabled(True)
             self.combo_scale.setVisible(True)
-        elif len(seen_scales) == 1:
-            s = list(seen_scales.keys())[0]
-            self.combo_scale.addItem(f"{s}x", seen_scales[s])
+        elif len(scales) == 1:
+            s = scales[0]
+            self.combo_scale.addItem(f"{s}x", _data_for_scale(s))
             self.combo_scale.setCurrentIndex(0)
             self.combo_scale.setEnabled(False)
             self.combo_scale.setVisible(True)
@@ -864,20 +891,20 @@ class WorkflowWidget(QWidget):
 
     def _make_arrow(self):
         arrow = QLabel("→")
-        arrow.setStyleSheet("color: #00d2d3; font-size: 24px;")
+        arrow.setStyleSheet("color: #00d2d3; font-size: 20px;")
         arrow.setAlignment(Qt.AlignmentFlag.AlignCenter)
         return arrow
 
     def _make_reorder_controls(self, index):
         """Crea botones ▶ ◀ para mover un paso intermedio."""
         widget = QWidget()
-        widget.setFixedWidth(48)
+        widget.setFixedWidth(40)
         layout = QHBoxLayout(widget)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(2)
 
         btn_left = QPushButton("◀")
-        btn_left.setFixedSize(20, 20)
+        btn_left.setFixedSize(18, 18)
         btn_left.setStyleSheet(
             "QPushButton { background-color: #16213e; color: #00d2d3; border: 1px solid #2c3e50; "
             "border-radius: 4px; font-size: 8px; padding: 0px; }"
@@ -886,7 +913,7 @@ class WorkflowWidget(QWidget):
         btn_left.clicked.connect(lambda _checked, idx=index: self._move_step(idx, -1))
 
         btn_right = QPushButton("▶")
-        btn_right.setFixedSize(20, 20)
+        btn_right.setFixedSize(18, 18)
         btn_right.setStyleSheet(
             "QPushButton { background-color: #16213e; color: #00d2d3; border: 1px solid #2c3e50; "
             "border-radius: 4px; font-size: 8px; padding: 0px; }"

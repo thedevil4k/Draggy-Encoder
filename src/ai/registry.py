@@ -138,7 +138,7 @@ CATALOG = [
     # --- Upscaling (fast / lightweight) -----------------------------------
     {
         "engine_id": "upscale-realesr-animevideov3",
-        "display_name": "RealESR AnimeVideo v3 (fast, x4)",
+        "display_name": "RealESR AnimeVideo v3 (fast, x2/x3/x4)",
         "category": "Upscale",
         "hf_repo_id": "leonelhs/realesrgan",
         "hf_url": "https://huggingface.co/leonelhs/realesrgan",
@@ -151,6 +151,9 @@ CATALOG = [
         "sentinel": "README.md",
         "lfs_warning": False,
         "similar_models_url": "https://openmodeldb.info/models/4x-realesr-animevideo-v3",
+        # Como en video2x: el modelo admite 2x, 3x y 4x (la escala elegida
+        # se comunica a la engine vía _target_scale y el encoder re-encaja).
+        "supported_scales": [2, 3, 4],
     },
     {
         "engine_id": "upscale-realesr-general-x4v3",
@@ -723,6 +726,29 @@ def get_scale_factor(engine_id: str) -> int:
     if m:
         return int(m.group(1))
     return 1
+
+
+def get_supported_scales(engine_id: str) -> list:
+    """Factores de upscale que el catálogo declara para una engine.
+
+    Cuando el entry tiene ``supported_scales`` (p.ej. AnimeVideo v3 con
+    ``[2, 3, 4]`` como en video2x) se devuelve esa lista; si no, una lista
+    con un único factor derivado de ``sample_shape`` (o vacía si no se
+    puede determinar).
+    """
+    entry = get_entry(engine_id)
+    if not entry:
+        return []
+    supported = entry.get("supported_scales")
+    if isinstance(supported, list):
+        try:
+            scales = sorted({int(s) for s in supported if int(s) > 1})
+        except (TypeError, ValueError):
+            scales = []
+        if scales:
+            return scales
+    native = get_scale_factor(engine_id)
+    return [native] if native > 1 else []
 
 
 # ---------------------------------------------------------------------------

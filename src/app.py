@@ -12,9 +12,10 @@ except Exception:
     pass
 
 from PySide6.QtCore import Qt, QThread, Signal
+from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import QApplication
 
-from src.config import APP_NAME
+from src.config import APP_NAME, get_asset_path
 from src.ffmpeg.codec_tester import test_all_codecs
 from src.ffmpeg.manager import ensure_ffmpeg
 from src.hardware.detector import get_hardware_summary
@@ -74,6 +75,11 @@ class DraggyEncoderApp:
         self.app = QApplication(sys.argv)
         self.app.setApplicationName(APP_NAME)
         self.app.setStyle("Fusion")
+        # El logo del programa es el mismo icono que el botón Import de
+        # la cadena: un único asset en toda la app.
+        logo_path = get_asset_path("Import.png")
+        if logo_path and os.path.exists(logo_path):
+            self.app.setWindowIcon(QIcon(logo_path))
 
     def run(self):
         self.loading = LoadingDialog("Starting DRAGGY ENCODER", "Initializing...")
