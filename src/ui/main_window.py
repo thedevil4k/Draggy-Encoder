@@ -738,12 +738,19 @@ class MainWindow(QMainWindow):
         self.btn_compress.clicked.connect(self._compress)
         self.btn_preview = QPushButton("Preview")
         self.btn_preview.clicked.connect(self._preview)
+        self.btn_add_queue = QPushButton("Add to queue")
+        self.btn_add_queue.setToolTip(
+            "Queue this render (video + AI chain + settings).\n"
+            "It will run later when you press Start queue."
+        )
+        self.btn_add_queue.clicked.connect(self._add_to_queue)
         self.btn_abort = QPushButton("Abort")
         self.btn_abort.setEnabled(False)
         self.btn_abort.clicked.connect(self._abort)
 
         bottom_layout.addWidget(self.btn_compress)
         bottom_layout.addWidget(self.btn_preview)
+        bottom_layout.addWidget(self.btn_add_queue)
         bottom_layout.addWidget(self.btn_abort)
         layout.addLayout(bottom_layout)
 
@@ -760,6 +767,8 @@ class MainWindow(QMainWindow):
         # --- Tasks panel (right side, collapsible) ---
         self.tasks_panel = TasksPanel()
         self.tasks_panel.btn_clear.clicked.connect(self._on_clear_task_history)
+        self.tasks_panel.btn_start_queue.clicked.connect(self._start_queue)
+        self.tasks_panel.btn_clear_queue.clicked.connect(self._on_clear_queue)
 
         self.splitter = QSplitter(Qt.Orientation.Horizontal)
         self.splitter.setChildrenCollapsible(True)
@@ -772,6 +781,7 @@ class MainWindow(QMainWindow):
 
         # Cargar el histórico persistente de tareas al arrancar.
         self._load_task_history()
+        self._load_task_queue()
 
         # Estado interno del banner: cuadricula de timers que mantiene la
         # propuesta al dia durante la sesion.
@@ -1867,7 +1877,8 @@ class MainWindow(QMainWindow):
         )
         self._run_worker(None, settings, mode="preview", ai_engines=ai_engines)
 
-    def _run_worker(self, output_path, settings, mode, ai_engines=None, input_path=None):
+    def _run_worker(self, output_path, settings, mode, ai_engines=None, input_path=None,
+                    queue_id=None):
         self.btn_compress.setEnabled(False)
         self.btn_preview.setEnabled(False)
         self.btn_abort.setEnabled(True)
@@ -1880,9 +1891,14 @@ class MainWindow(QMainWindow):
         # update chain was running).
         src = input_path if input_path is not None else self.input_path
 
-        # Register the task in the side panel + persisted history.
+# Register the task in the side panel + persisted history.
         import uuid
-        self._current_task_id = str(uuid.uuid4())
+        if queue_id:
+            # Queue: el id del item se reusa como task_id del panel para
+            # que fases y progreso queden asociados a la fila correcta.
+            self._current_task_id = queue_id
+        else:
+            self._current_task_id = str(uuid.uuid4())
         task_name = os.path.basename(src)
         if mode == "preview":
             task_name += " (preview)"
@@ -1983,6 +1999,154 @@ class MainWindow(QMainWindow):
             pass
         self.tasks_panel.clear_all()
 
+    # --- Cola de renders --------------------------------------------------
+
+    def _load_task_queue(self):
+        """Carga la cola persistente en la pestaña Queue (arranque)."""
+        try:
+            import src.task_queue as task_queue
+            self.tasks_panel.rebuild_queue(task_queue.list_items())
+        except Exception:
+            self.tasks_panel.rebuild_queue([])
+
+    def _add_to_queue(self):
+        """Snapshot del video + cadena IA + ajustes -> item de la cola."""
+        if getattr(self, "worker", None) is not None and self.worker.isRunning():
+            self._on_status_message("Finish the current render before queuing.")
+            return
+        if not self.input_path:
+            QMessageBox.warning(self, "No video", "Please select a video first.")
+            return
+        if not self._maybe_ffmpeg_health_check():
+            return
+
+        output_path = self._get_output_path()
+        settings = self.settings_panel.get_settings()
+        settings["pipeline_order"] = self.workflow.get_pipeline()
+        self._remember_runtime_prefs(settings)
+        ai_engines = self.workflow.get_selected_engines()
+
+        try:
+            import src.task_queue as task_queue
+            queue_id = task_queue.enqueue(
+                name=os.path.basename(self.input_path),
+                input_path=self.input_path,
+                output_path=output_path,
+                settings=settings,
+                ai_engines=ai_engines,
+                pipeline_order=settings.get("pipeline_order", []),
+            )
+        except Exception:
+            queue_id = ""
+        if not queue_id:
+            self._on_status_message("Could not add the job to the queue.")
+            return
+        self.tasks_panel.rebuild_queue(task_queue.list_items())
+        self._on_status_message(
+            f"Queued: {os.path.basename(self.input_path)} -> "
+            f"{os.path.basename(output_path)}"
+        )
+
+    def _on_clear_queue(self):
+        ret = QMessageBox.question(
+            self,
+            "Clear queue",
+            "Remove all queued jobs?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if ret != QMessageBox.Yes:
+            return
+        try:
+            import src.task_queue as task_queue
+            task_queue.clear()
+        except Exception:
+            pass
+        self.tasks_panel.clear_queue_rows()
+        self._on_status_message("Queue cleared.")
+
+    def _start_queue(self):
+        """Arranca la cola: ejecuta los items "queued" en secuencia."""
+        if getattr(self, "_queue_active", False):
+            return
+        try:
+            import src.task_queue as task_queue
+            if task_queue.first_pending() is None:
+                self._on_status_message("Queue is already empty.")
+                return
+        except Exception:
+            self._on_status_message("Could not read the queue.")
+            return
+        self._queue_active = True
+        self.tasks_panel.set_queue_running(True)
+        self._start_next_queue_item()
+
+    def _start_next_queue_item(self):
+        """Ejecuta el siguiente item "queued"; al agotarse resume la UI."""
+        if not getattr(self, "_queue_active", False):
+            return
+        try:
+            import src.task_queue as task_queue
+            item = task_queue.first_pending()
+        except Exception:
+            item = None
+        if item is None:
+            self._queue_active = False
+            self.tasks_panel.set_queue_running(False)
+            self._on_status_message("Queue finished.")
+            self.tasks_panel.append_log("Queue finished: all jobs processed.")
+            return
+
+        queue_id = item.get("queue_id", "")
+        task_queue.set_status(queue_id, "running")
+        self.tasks_panel.set_queue_status(queue_id, "running")
+
+        input_path = item.get("input_path", "")
+        if not input_path or not os.path.exists(input_path):
+            task_queue.set_status(
+                queue_id, "failed", error="Input file is missing: " + input_path
+            )
+            self.tasks_panel.set_queue_status(queue_id, "failed")
+            self.tasks_panel.append_log(
+                f"Queue item failed (missing input): {item.get('name')}"
+            )
+            self._start_next_queue_item()
+            return
+
+        settings = dict(item.get("settings") or {})
+        settings["pipeline_order"] = list(item.get("pipeline_order") or [])
+        ai_engines = dict(item.get("ai_engines") or {})
+        output_path = item.get("output_path") or ""
+        self._run_worker(
+            output_path,
+            settings,
+            mode="compress",
+            ai_engines=ai_engines,
+            input_path=input_path,
+            queue_id=queue_id,
+        )
+
+    def _advance_queue_after_worker(self, status: str, error: str = ""):
+        """Marca el item que acaba de terminar y arranca el siguiente."""
+        queue_id = getattr(self, "_current_task_id", None)
+        if not queue_id:
+            worker = getattr(self, "worker", None)
+            queue_id = getattr(worker, "task_id", None)
+        if queue_id:
+            try:
+                import src.task_queue as task_queue
+                task_queue.set_status(queue_id, status, error=error or "")
+                item = task_queue.get_item(queue_id)
+                name = (item or {}).get("name", queue_id)
+            except Exception:
+                name = queue_id
+            self.tasks_panel.set_queue_status(queue_id, status)
+            self.tasks_panel.append_log(
+                f"Queue item {status}: {name}"
+                + (f" ({error})" if error else "")
+            )
+        self._start_next_queue_item()
+
     def _on_worker_finished(self):
         self.btn_compress.setEnabled(True)
         self.btn_preview.setEnabled(True)
@@ -2006,6 +2170,8 @@ class MainWindow(QMainWindow):
         ):
             self._mark_task_finished("aborted")
             self._cleanup_after_abort()
+            if getattr(self, "_queue_active", False):
+                self._advance_queue_after_worker("aborted", "Aborted by user")
             return
 
         # ---------------- Followup branch -----------------
@@ -2090,6 +2256,15 @@ class MainWindow(QMainWindow):
         self.progress.setValue(100 if worker.success else 0)
         mode = getattr(worker, "mode", "compress")
         self._mark_task_finished("success" if worker.success else "failed")
+
+        if getattr(self, "_queue_active", False):
+            # Modo cola: sin diálogos modales por item; marcamos y
+            # seguimos con el siguiente render programado.
+            self._advance_queue_after_worker(
+                "done" if worker.success else "failed",
+                "" if worker.success else (worker.error_message or "Operation failed"),
+            )
+            return
 
         if not worker.success:
             # Un fallo de encode deja el output parcial (truncado/incompleto)

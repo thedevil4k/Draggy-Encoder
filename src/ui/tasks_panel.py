@@ -311,10 +311,63 @@ class TasksPanel(QWidget):
         log_lay.addWidget(self.btn_clear_log)
 
         self.tabs.addTab(self._log_host, "Log")
+
+        # --- Pestaña Queue: renders programados por el usuario ---
+        self._queue_host = QWidget()
+        queue_lay = QVBoxLayout(self._queue_host)
+        queue_lay.setContentsMargins(0, 0, 0, 0)
+
+        self.queue_scroll = QScrollArea()
+        self.queue_scroll.setWidgetResizable(True)
+        self.queue_scroll.setStyleSheet(
+            "QScrollArea { border: none; background: transparent; }"
+        )
+        self._queue_list = QWidget()
+        self._queue_list.setStyleSheet("background: transparent;")
+        self._queue_layout = QVBoxLayout(self._queue_list)
+        self._queue_layout.setContentsMargins(0, 0, 0, 0)
+        self._queue_layout.setSpacing(6)
+        self._queue_layout.addStretch(1)
+        self.queue_scroll.setWidget(self._queue_list)
+        queue_lay.addWidget(self.queue_scroll, 1)
+
+        self._queue_empty = QLabel(
+            "No queued jobs.\n\nSelect a video, configure the AI chain\n"
+            "and compression settings, then press\n"
+            "\"Add to queue\" below."
+        )
+        self._queue_empty.setStyleSheet(
+            "color: #7f8fa6; font-size: 11px; padding: 8px;"
+        )
+        self._queue_empty.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._queue_empty.setWordWrap(True)
+        self._queue_empty.hide()
+        queue_lay.addWidget(self._queue_empty)
+
+        btn_row = QHBoxLayout()
+        btn_row.setSpacing(6)
+        self.btn_start_queue = QPushButton("Start queue")
+        self.btn_start_queue.setStyleSheet(
+            "background-color: #27ae60; color: #ffffff; border: none; "
+            "border-radius: 6px; padding: 5px 10px; font-size: 11px; font-weight: bold;"
+        )
+        self.btn_start_queue.setEnabled(False)
+        btn_row.addWidget(self.btn_start_queue, 1)
+        self.btn_clear_queue = QPushButton("Clear queue")
+        self.btn_clear_queue.setStyleSheet(
+            "background-color: #1f2c4c; color: #a0a0b0; border: 1px solid #2c3e50; "
+            "border-radius: 6px; padding: 4px 10px; font-size: 11px;"
+        )
+        btn_row.addWidget(self.btn_clear_queue)
+        queue_lay.addLayout(btn_row)
+
+        self.tabs.addTab(self._queue_host, "Queue")
         root.addWidget(self.tabs, 1)
 
         self._order: list[str] = []   # task ids (newest first)
         self._cards: dict[str, TaskCard] = {}
+        self._queue_rows: dict[str, QueueRow] = {}
+        self._queue_running = False
 
     # --- API del Log -------------------------------------------------
 
@@ -393,3 +446,131 @@ class TasksPanel(QWidget):
         if card is None:
             return
         card.finish(status)
+
+    # --- API de la Queue ----------------------------------------------
+
+    def rebuild_queue(self, items: list = None):
+        """Reconstruye la pestaña Queue desde ``src.task_queue.list_items()``."""
+        for queue_id in list(self._queue_rows):
+            self._remove_queue_row(queue_id)
+        has_any = False
+        for item in (items or []):
+            queue_id = item.get("queue_id", "")
+            if not queue_id:
+                continue
+            self._queue_row(queue_id, item.get("name", queue_id))
+            self.set_queue_status(queue_id, item.get("status", "queued"))
+            has_any = True
+        self._queue_empty.setVisible(not has_any)
+
+    def _queue_row(self, queue_id: str, name: str) -> QueueRow:
+        row = self._queue_rows.get(queue_id)
+        if row is not None:
+            if name:
+                row.name_label.setText(name)
+            return row
+        row = QueueRow(queue_id, name)
+        row.btn_remove.clicked.connect(
+            lambda _checked=False, qid=queue_id: self.remove_queue_item(qid)
+        )
+        self._queue_rows[queue_id] = row
+        self._queue_layout.insertWidget(self._queue_layout.count() - 1, row)
+        self._queue_empty.hide()
+        return row
+
+    def set_queue_status(self, queue_id: str, status: str):
+        row = self._queue_rows.get(queue_id)
+        if row is not None:
+            row.set_status(status)
+
+    def _remove_queue_row(self, queue_id: str):
+        row = self._queue_rows.pop(queue_id, None)
+        if row is not None:
+            self._queue_layout.removeWidget(row)
+            row.deleteLater()
+
+    def remove_queue_item(self, queue_id: str):
+        """Quita un item de la cola (UI + persistencia)."""
+        try:
+            import src.task_queue as task_queue
+            task_queue.remove(queue_id)
+        except Exception:
+            pass
+        self._remove_queue_row(queue_id)
+        if not self._queue_rows:
+            self._queue_empty.show()
+            self.btn_start_queue.setEnabled(False)
+
+    def clear_queue_rows(self):
+        """Limpia SOLO la pestaña UI; no toca el archivo persistente."""
+        for queue_id in list(self._queue_rows):
+            self._remove_queue_row(queue_id)
+        self._queue_empty.show()
+        self.btn_start_queue.setEnabled(False)
+
+    def set_queue_running(self, running: bool):
+        """Habilita/deshabilita Start queue según si la cola está en marcha."""
+        self._queue_running = running
+        self.btn_start_queue.setEnabled(
+            not running and bool(self._queue_rows)
+        )
+
+
+# ---------------------------------------------------------------------------
+# Queue: renders programados por el usuario (cola de trabajo)
+# ---------------------------------------------------------------------------
+
+_QUEUE_STATUS_META = {
+    "queued":  ("QUEUED", "#7f8fa6"),
+    "running": ("RUNNING", "#00d2c3"),
+    "done":    ("DONE ✓", "#27ae60"),
+    "failed":  ("FAILED", "#e74c3c"),
+    "aborted": ("ABORTED", "#e67e22"),
+}
+
+
+class QueueRow(QFrame):
+    """Fila de la pestaña Queue: nombre + estado + quitar item."""
+
+    def __init__(self, queue_id, name, parent=None):
+        super().__init__(parent)
+        self.queue_id = queue_id
+        self.setObjectName("QueueRow")
+        self.setStyleSheet(
+            "#QueueRow { background-color: #141a30; border: 1px solid #243049; "
+            "border-radius: 6px; }"
+        )
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(6, 4, 6, 4)
+        lay.setSpacing(6)
+
+        self.name_label = QLabel(name or queue_id)
+        self.name_label.setStyleSheet("color: #e8e8f0; font-size: 11px;")
+        self.name_label.setWordWrap(True)
+        lay.addWidget(self.name_label, 1)
+
+        self.pill = QLabel("QUEUED")
+        self._paint("queued")
+        lay.addWidget(self.pill)
+
+        self.btn_remove = QPushButton("✕")
+        self.btn_remove.setFixedWidth(24)
+        self.btn_remove.setToolTip("Remove from queue")
+        self.btn_remove.setStyleSheet(
+            "background: transparent; color: #a0a0b0; border: none; font-size: 12px;"
+        )
+        lay.addWidget(self.btn_remove)
+
+    def _paint(self, status: str):
+        text, color = _QUEUE_STATUS_META.get(
+            status, ("QUEUED", "#9f8fa6")
+        )
+        self.pill.setText(text)
+        self.pill.setStyleSheet(
+            f"color: {color}; background: #1f2c4c; padding: 1px 6px; "
+            "border-radius: 4px; font-size: 9px; font-weight: bold;"
+        )
+
+    def set_status(self, status: str):
+        if status in _QUEUE_STATUS_META:
+            self._paint(status)

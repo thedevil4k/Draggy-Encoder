@@ -2385,6 +2385,112 @@ def test_tasks_panel_rebuild_replaces_not_duplicates(qapp):
 
 
 # ---------------------------------------------------------------------------
+# 13. Task queue: persistent render queue (video2x-style batching)
+# ---------------------------------------------------------------------------
+
+
+def test_task_queue_roundtrip_and_failsafe(tmp_path, monkeypatch):
+    """enqueue/list/set_status/first_pending round-trip; corrupt file -> []."""
+    import src.task_queue as tq
+
+    monkeypatch.setattr(tq, "_path", lambda: str(tmp_path / "queue.json"))
+    qid1 = tq.enqueue(
+        name="a.mp4", input_path="C:\\in\\a.mp4",
+        output_path="C:\\out\\a_comp.mp4",
+        settings={"codec": "h264_nvenc", "bitrate": "1500"},
+        ai_engines={"Upscale": "realesrgan-x4"},
+        pipeline_order=["Upscale"],
+    )
+    assert qid1
+    qid2 = tq.enqueue(
+        name="b.mp4", input_path="C:\\in\\b.mp4",
+        output_path="C:\\out\\b_comp.mp4",
+        settings={"codec": "libx264"},
+    )
+    assert qid2 != qid1
+
+    items = tq.list_items()
+    assert [i["queue_id"] for i in items] == [qid1, qid2]  # orden de encolado
+    assert tq.first_pending()["queue_id"] == qid1
+
+    assert tq.set_status(qid1, "running")
+    assert tq.first_pending()["queue_id"] == qid2
+    assert tq.set_status(qid1, "done")
+    assert tq.first_pending()["queue_id"] == qid2
+
+    got = tq.get_item(qid1)
+    assert got["status"] == "done"
+    assert got["settings"]["codec"] == "h264_nvenc"
+    assert got["ai_engines"] == {"Upscale": "realesrgan-x4"}
+    assert got["pipeline_order"] == ["Upscale"]
+
+    assert tq.remove(qid2)
+    assert tq.get_item(qid2) is None
+    assert tq.count() == 1
+
+    # Failsafe: archivo corrupto -> listas vacías sin excepción.
+    (tmp_path / "queue.json").write_text("{not json", encoding="utf-8")
+    assert tq.list_items() == []
+    assert tq.first_pending() is None
+    assert tq.count() == 0
+
+
+def test_task_queue_items_are_independent_snapshots(tmp_path, monkeypatch):
+    """Cada item conserva SU config, aunque se encole otro después."""
+    import src.task_queue as tq
+
+    monkeypatch.setattr(tq, "_path", lambda: str(tmp_path / "queue.json"))
+    qid1 = tq.enqueue(
+        name="a.mp4", input_path="C:\\in\\a.mp4",
+        output_path="C:\\out\\a.mp4",
+        settings={"codec": "h264_nvenc", "audio_boost": True},
+        ai_engines={"Upscale": "eng-x2"},
+    )
+    qid2 = tq.enqueue(
+        name="b.mp4", input_path="C:\\in\\b.mp4",
+        output_path="C:\\out\\b.mp4",
+        settings={"codec": "libx264", "audio_boost": False},
+        ai_engines={"Upscale": "eng-x4"},
+    )
+    assert tq.get_item(qid1)["settings"]["codec"] == "h264_nvenc"
+    assert tq.get_item(qid2)["settings"]["codec"] == "libx264"
+    assert tq.get_item(qid1)["ai_engines"] == {"Upscale": "eng-x2"}
+    assert tq.get_item(qid2)["ai_engines"] == {"Upscale": "eng-x4"}
+    # Duplicados permitidos (mismo input/output) -> ids distintos.
+    qid3 = tq.enqueue(
+        name="a.mp4", input_path="C:\\in\\a.mp4",
+        output_path="C:\\out\\a.mp4", settings={},
+    )
+    assert qid3 != qid1
+    assert tq.count() == 3
+
+
+def test_tasks_panel_queue_tab_smoke(qapp):
+    """Pestaña Queue: rebuild, estados, quitar y limpiar sin crashear."""
+    from src.ui.tasks_panel import TasksPanel
+
+    panel = TasksPanel()
+    panel.rebuild_queue([
+        {"queue_id": "q1", "name": "movie1.mp4", "status": "queued"},
+        {"queue_id": "q2", "name": "movie2.mp4", "status": "queued"},
+    ])
+    assert "q1" in panel._queue_rows and "q2" in panel._queue_rows
+    panel.set_queue_status("q1", "running")
+    assert panel._queue_rows["q1"].pill.text() == "RUNNING"
+    panel.set_queue_status("q1", "done")
+    assert panel._queue_rows["q1"].pill.text() == "DONE ✓"
+
+    # Quitar un item vía la API pública (UI + persistencia no-crash).
+    panel.remove_queue_item("q2")
+    assert "q2" not in panel._queue_rows
+    assert "q1" in panel._queue_rows
+
+    panel.clear_queue_rows()
+    assert panel._queue_rows == {}
+    assert panel.btn_start_queue.isEnabled() is False
+
+
+# ---------------------------------------------------------------------------
 # 12. Model scale: filename parsing + target scale honored by engines
 # ---------------------------------------------------------------------------
 
