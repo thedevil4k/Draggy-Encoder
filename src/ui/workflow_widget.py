@@ -507,6 +507,17 @@ class AIWorkflowStep(QFrame):
         scales = sorted({s for s in seen_scales if s > 1} | set(catalog_scales))
 
         if len(scales) > 1:
+            # "Model native": la resolución de salida es EXACTAMENTE la que
+            # produce el modelo (su escala nativa), sin re-encaje del
+            # encoder a un factor elegido. Lleva ``scale`` = nativa del
+            # catálogo (para que la UI muestre la resolución real) y el
+            # flag ``native`` que el pipeline usa para medir el frame real.
+            native_scale = max(scales)
+            native_data = _data_for_scale(native_scale)
+            native_data["native"] = True
+
+            self.combo_scale.clear()
+            self.combo_scale.addItem("Model native", native_data)
             for s in scales:
                 self.combo_scale.addItem(f"{s}x", _data_for_scale(s))
             self.combo_scale.setCurrentIndex(0)
@@ -729,7 +740,7 @@ class AIWorkflowStep(QFrame):
         engine_id = self.combo.currentData() or ""
         if isinstance(engine_id, dict):
             engine_id = engine_id.get("engine_id", "")
-        if self.combo_scale.isVisible() and self.combo_scale.count() > 0:
+        if not self.combo_scale.isHidden() and self.combo_scale.count() > 0:
             scale_data = self.combo_scale.currentData()
             if scale_data and isinstance(scale_data, dict):
                 return {
@@ -737,6 +748,7 @@ class AIWorkflowStep(QFrame):
                     "model_path": scale_data.get("model_path"),
                     "scale": scale_data.get("scale", 1),
                     "mode": scale_data.get("mode", "upscale"),
+                    "native": bool(scale_data.get("native", False)),
                 }
         for m in getattr(self, "_all_model_files", []):
             if m.get("engine_id") == engine_id:

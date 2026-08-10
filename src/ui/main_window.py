@@ -232,6 +232,13 @@ class CompressionWorker(QThread):
                 from src.processing.pipeline import _compute_total_scale
                 total_scale = _compute_total_scale(engines)
                 self.settings["ai_scale"] = total_scale
+                # "Model native": el nodo pide la resolución tal cual el
+                # modelo la produce. La pipeline medirá el frame real de la
+                # cadena para dimensionar el encoder (sin re-encaje).
+                self.settings["ai_native"] = any(
+                    isinstance(v, dict) and bool(v.get("native"))
+                    for v in (self.ai_engines or {}).values()
+                )
 
                 status_cb("AI chain: " + " -> ".join(chain_labels))
                 status_cb("AI chain: frame-by-frame processing...")
@@ -489,13 +496,28 @@ class CompressionWorker(QThread):
                 # válida y menor que la nativa, se la comunicamos a la
                 # engine para que reporte esa escala (el frame sigue
                 # upscaleando a la nativa y el encoder re-encaja el tamaño).
+                # En modo "Model native" (info.native) NO forzamos nada:
+                # la engine reporta su escala real y el pipeline mide el
+                # frame de la cadena para la resolución de salida.
                 try:
                     _us = info.get("scale") if isinstance(info, dict) else None
                     _us_int = int(_us) if _us else 0
                 except (TypeError, ValueError):
                     _us_int = 0
-                if _us_int > 1 and isinstance(inference_engine, AIInferenceEngine):
+                _is_native = bool(
+                    isinstance(info, dict) and info.get("native")
+                )
+                if (
+                    _us_int > 1
+                    and not _is_native
+                    and isinstance(inference_engine, AIInferenceEngine)
+                ):
                     inference_engine._target_scale = _us_int
+                elif _is_native and isinstance(inference_engine, AIInferenceEngine):
+                    # Garantizar que la engine reporte su escala NATIVA real
+                    # (algunas engines ONNX solo la detectan fiablemente por
+                    # shapes; si no coincide, el pipeline mide el frame real).
+                    inference_engine._target_scale = None
 
                 engines.append(inference_engine)
                 provider = getattr(inference_engine, "_providers", [])
@@ -565,6 +587,7 @@ class MainWindow(QMainWindow):
         self.hardware_info = hardware_info
         self.compatible_codecs = compatible_codecs
         self.input_path = None
+        self.input_paths = []  # multi-selección (uno o más videos)
         # Carpeta de output inicial: prefiere ``last_output_dir`` si la
         # preferencia ``auto_open_last_output`` está activa y la carpeta
         # sigue existiendo; cae al Desktop si falta o falla.
@@ -909,14 +932,26 @@ class MainWindow(QMainWindow):
         """
 
     def _select_video(self):
-        path, _ = QFileDialog.getOpenFileName(
-            self, "Select Video", "",
+        """Selecciona UNO O VARIOS videos y los deja listos para la cola.
+
+        La config (codec, resolución, cadena IA, ...) que el usuario ajuste
+        después se aplica a TODOS los seleccionados en ``_add_to_queue``.
+        """
+        paths, _ = QFileDialog.getOpenFileNames(
+            self, "Select Videos", "",
             "Video Files (*.mp4 *.mkv *.avi *.wmv *.mov *.webm *.m4v);;All Files (*)",
         )
-        if path:
-            self.input_path = path
-            self.status_label.setText(f"Selected: {os.path.basename(path)}")
-            self._update_original_bitrate(path)
+        if not paths:
+            return
+        self.input_paths = list(paths)
+        # Backward compat: el primer video sigue siendo ``input_path`` para
+        # los flujos single (preview / compress directo / last_job).
+        self.input_path = paths[0]
+        if len(paths) == 1:
+            self.status_label.setText(f"Selected: {os.path.basename(paths[0])}")
+        else:
+            self.status_label.setText(f"Selected: {len(paths)} videos")
+        self._update_original_bitrate(paths[0])
 
     def _update_original_bitrate(self, path):
         info = get_video_info(self.ffmpeg_path, path)
@@ -1803,10 +1838,19 @@ class MainWindow(QMainWindow):
     def _on_banner_update_thread_finished(self):
         self._banner_update_worker = None
 
-    def _get_output_path(self):
+    def _get_output_path(self, input_path=None):
         settings = self.settings_panel.get_settings()
-        base, ext = os.path.splitext(os.path.basename(self.input_path))
+        src = input_path or self.input_path
+        base, ext = os.path.splitext(os.path.basename(src))
         output_name = settings.get("output_name") or f"{base}_compressed"
+        # Con varios videos en cola, un output_name fijo chocaría entre
+        # ellos; lo prefijamos con el nombre base de cada archivo.
+        if (
+            output_name
+            and output_name != f"{base}_compressed"
+            and len(getattr(self, "input_paths", None) or []) > 1
+        ):
+            output_name = f"{output_name}_{base}"
         fmt = settings.get("format", "mp4")
         return os.path.join(self.output_dir, f"{output_name}.{fmt}")
 
@@ -2010,42 +2054,59 @@ class MainWindow(QMainWindow):
             self.tasks_panel.rebuild_queue([])
 
     def _add_to_queue(self):
-        """Snapshot del video + cadena IA + ajustes -> item de la cola."""
+        """Snapshot del/los video(s) + cadena IA + ajustes -> items de cola.
+
+        Con varios videos seleccionados, TODOS entran a la cola con la
+        MISMA config actual del usuario (codec, resolución, cadena IA...).
+        """
         if getattr(self, "worker", None) is not None and self.worker.isRunning():
             self._on_status_message("Finish the current render before queuing.")
             return
-        if not self.input_path:
+        paths = list(getattr(self, "input_paths", None) or [])
+        if not paths and self.input_path:
+            paths = [self.input_path]
+        if not paths:
             QMessageBox.warning(self, "No video", "Please select a video first.")
             return
         if not self._maybe_ffmpeg_health_check():
             return
 
-        output_path = self._get_output_path()
         settings = self.settings_panel.get_settings()
         settings["pipeline_order"] = self.workflow.get_pipeline()
         self._remember_runtime_prefs(settings)
         ai_engines = self.workflow.get_selected_engines()
 
-        try:
-            import src.task_queue as task_queue
-            queue_id = task_queue.enqueue(
-                name=os.path.basename(self.input_path),
-                input_path=self.input_path,
-                output_path=output_path,
-                settings=settings,
-                ai_engines=ai_engines,
-                pipeline_order=settings.get("pipeline_order", []),
-            )
-        except Exception:
-            queue_id = ""
-        if not queue_id:
-            self._on_status_message("Could not add the job to the queue.")
-            return
-        self.tasks_panel.rebuild_queue(task_queue.list_items())
-        self._on_status_message(
-            f"Queued: {os.path.basename(self.input_path)} -> "
-            f"{os.path.basename(output_path)}"
-        )
+        queued = 0
+        for path in paths:
+            if not path or not os.path.exists(path):
+                self._on_status_message(f"Skipped missing file: {path}")
+                continue
+            output_path = self._get_output_path(path)
+            try:
+                import src.task_queue as task_queue
+                queue_id = task_queue.enqueue(
+                    name=os.path.basename(path),
+                    input_path=path,
+                    output_path=output_path,
+                    settings=settings,
+                    ai_engines=ai_engines,
+                    pipeline_order=settings.get("pipeline_order", []),
+                )
+            except Exception:
+                queue_id = ""
+            if queue_id:
+                queued += 1
+            else:
+                self._on_status_message(f"Could not add to the queue: {path}")
+        if queued:
+            self.tasks_panel.rebuild_queue(task_queue.list_items())
+            if queued == 1:
+                self._on_status_message(
+                    f"Queued: {os.path.basename(paths[0])} -> "
+                    f"{os.path.basename(self._get_output_path(paths[0]))}"
+                )
+            else:
+                self._on_status_message(f"Queued {queued} videos with the current settings.")
 
     def _on_clear_queue(self):
         ret = QMessageBox.question(

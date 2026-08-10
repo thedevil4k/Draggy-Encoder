@@ -431,6 +431,46 @@ def compress_video_with_ai(
     elif len(engines) > 1:
         logger.info("AI chain: %d engines, no interpolation step", len(engines))
 
+    # --- "Model native": medir la resolución REAL de la cadena -------------
+    # Con la opción "Model native" activa, el usuario quiere la resolución
+    # de salida EXACTAMENTE como la produce el modelo de upscaling (sin el
+    # re-encaje del encoder a un factor elegido). Ejecutamos un frame de
+    # prueba (negro, tamaño del source) por los pasos de la cadena y usamos
+    # el tamaño resultante para ``-s`` del encoder. La paridad se fuerza
+    # hacia abajo (la mayoría de codecs requiere dimensiones pares). Si la
+    # medición falla por cualquier motivo, caemos al cálculo escalado.
+    if settings.get("ai_native") and settings.get("resolution", "original") == "original":
+        try:
+            probe = np.zeros((src_h, src_w, 3), dtype=np.uint8)
+            for _e in list(steps_antes) + list(steps_despues):
+                if getattr(_e, "_failed", False):
+                    continue
+                try:
+                    probe = _e.process_frame(probe)
+                except Exception as exc:
+                    logger.warning(
+                        "native-probe: engine %s failed on the probe frame "
+                        "(%s); using scaled resolution instead",
+                        getattr(_e, "engine_id", "?"), exc,
+                    )
+                    raise
+            if probe.ndim == 3 and probe.shape[0] > 0 and probe.shape[1] > 0:
+                probe_h, probe_w = probe.shape[0], probe.shape[1]
+                probe_w -= probe_w % 2
+                probe_h -= probe_h % 2
+                if probe_w > 0 and probe_h > 0:
+                    dst_w, dst_h = probe_w, probe_h
+                    logger.info(
+                        "Model native: encoder sized to the model output "
+                        "(%dx%d) instead of the computed scale",
+                        dst_w, dst_h,
+                    )
+        except Exception as exc:
+            logger.warning(
+                "Model native probe failed (%s); falling back to the "
+                "computed scaled resolution %dx%d", exc, dst_w, dst_h,
+            )
+
     # If interpolating, double the FPS for the encoder so the output
     # plays at the correct speed (original frames + interpolated frames).
     do_interpolate = interp_step is not None

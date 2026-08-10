@@ -1453,6 +1453,49 @@ def test_workflow_maps_face_restore_node(qapp):
         widget.deleteLater()
 
 
+def test_workflow_scale_dropdown_offers_model_native(qapp, isolated_engines_state):
+    """The Upscale node's scale dropdown offers 'Model native' first and
+    carries the native flag + real model path so the pipeline can size the
+    encoder to the model's own output."""
+    import src.ai.engines_state as es
+    from src.ai.registry import get_engine_dir
+    from src.ui.workflow_widget import WorkflowWidget
+
+    eid = "upscale-realesr-animevideov3"  # catalog declares 2x/3x/4x
+    target = get_engine_dir(eid)
+    os.makedirs(target, exist_ok=True)
+    # Real weight file with an unambiguous x4 scale in the name.
+    open(os.path.join(target, "realesr-animevideov3-x4.pth"), "w").close()
+    es.mark_installed(eid, install_path=target)
+
+    widget = WorkflowWidget()
+    try:
+        ups = next(s for s in widget.middle_steps if s.name == "Upscale")
+        ups.set_active(True)
+        ups.combo.setCurrentIndex(0)  # select the installed engine
+
+        assert not ups.combo_scale.isHidden()
+        assert ups.combo_scale.count() >= 4  # Model native + x2/x3/x4
+        texts = [ups.combo_scale.itemText(i) for i in range(ups.combo_scale.count())]
+        assert texts[0] == "Model native", texts
+        # Default selection IS Model native -> output = exactly the model's.
+        assert ups.combo_scale.currentIndex() == 0
+
+        info = ups.get_selected_model_info()
+        assert info["native"] is True
+        assert info["scale"] == 4  # native scale from the catalog
+        assert info["model_path"] is not None
+        # Switching to an explicit scale clears the native flag.
+        for i in range(ups.combo_scale.count()):
+            if ups.combo_scale.itemText(i) == "2x":
+                ups.combo_scale.setCurrentIndex(i)
+        info2 = ups.get_selected_model_info()
+        assert info2["native"] is False
+        assert info2["scale"] == 2
+    finally:
+        widget.deleteLater()
+
+
 def test_list_all_has_face_restore_slot(isolated_engines_state):
     """The Dependencies REGISTRY exposes a FaceRestore model slot that
     reports honestly against the empty models dir."""
@@ -2085,6 +2128,95 @@ def test_compress_video_with_ai_interp_writes_double_frames(nvenc_clip):
     assert "interp-step:interp" in interp_engine.order_log
 
 
+def test_compress_video_with_ai_native_uses_model_size(nvenc_clip):
+    """'Model native' (settings ai_native) must size the encoder to the
+    REAL output of the chain — a 2x-scaling fake chain fed a 640x360 clip
+    therefore encodes at 1280x720, NOT at the computed scale reduction."""
+    from src.processing.pipeline import compress_video_with_ai
+
+    ffmpeg, src, tmp = nvenc_clip
+    dst = os.path.join(tmp, "chain_native.mp4")
+    model = _FakeEngine("native-model", 2)
+    ok = compress_video_with_ai(
+        ffmpeg,
+        src,
+        dst,
+        {
+            "audio": "noaudio",
+            "format": "mp4",
+            "codec": "h264_nvenc",
+            "preset": "p5",
+            "bitrate": "1500",
+            "pixel_format": "yuv420p",
+            "resolution": "original",
+            # The ui picked 'Model native': the encoder must use the model's
+            # own output resolution instead of ai_scale/chain product.
+            "ai_native": True,
+            "ai_scale": 1,
+        },
+        inference_engines=[model],
+    )
+    assert ok is True
+    assert os.path.exists(dst) and os.path.getsize(dst) > 0
+
+    ffprobe = os.path.join(os.path.dirname(ffmpeg), "ffprobe.exe")
+    assert os.path.exists(ffprobe)
+    out = subprocess.run(
+        [ffprobe, "-v", "error", "-select_streams", "v:0",
+         "-show_entries", "stream=width,height",
+         "-of", "default=noprint_wrappers=1", dst],
+        capture_output=True, text=True, timeout=30,
+    ).stdout
+    fields = {}
+    for line in out.splitlines():
+        if "=" in line:
+            k, v = line.split("=", 1)
+            fields[k.strip()] = v.strip()
+    # 640x360 -> _FakeEngine(scale=2) -> 1280x720 (the model's real output).
+    assert fields.get("width") == "1280", fields
+    assert fields.get("height") == "720", fields
+
+
+def test_compress_video_with_ai_native_probe_fallback(nvenc_clip):
+    """If the native probe fails (engine error on the probe frame), the
+    render falls back to the computed scaled resolution instead of dying."""
+    from src.processing.pipeline import compress_video_with_ai
+
+    ffmpeg, src, tmp = nvenc_clip
+    dst = os.path.join(tmp, "chain_native_fallback.mp4")
+
+    class _ExplodingProbe(_FakeEngine):
+        def process_frame(self, frame):
+            # First call is the probe; subsequent calls are real frames.
+            if not getattr(self, "_probe_done", False):
+                self._probe_done = True
+                raise RuntimeError("probe boom")
+            return super().process_frame(frame)
+
+    engine = _ExplodingProbe("native-fallback", 2)
+    ok = compress_video_with_ai(
+        ffmpeg,
+        src,
+        dst,
+        {
+            "audio": "noaudio",
+            "format": "mp4",
+            "codec": "h264_nvenc",
+            "preset": "p5",
+            "bitrate": "1500",
+            "pixel_format": "yuv420p",
+            "resolution": "original",
+            "ai_native": True,
+            "ai_scale": 2,
+        },
+        inference_engines=[engine],
+    )
+    assert ok is True
+    assert os.path.exists(dst) and os.path.getsize(dst) > 0
+    # Fallback path still wrote frames (chain completed).
+    assert engine.order_log
+
+
 def test_audio_mux_args_copy_passthrough_without_boost():
     """-c:a copy when boost is off (no re-encode, fastest path)."""
     from src.processing.pipeline import _audio_mux_args
@@ -2463,6 +2595,107 @@ def test_task_queue_items_are_independent_snapshots(tmp_path, monkeypatch):
     )
     assert qid3 != qid1
     assert tq.count() == 3
+
+
+def test_add_to_queue_batches_multiple_videos_same_config(tmp_path, monkeypatch):
+    """_add_to_queue con varios videos seleccionados encola TODOS con la
+    misma config (snapshot único de settings + cadena IA + pipeline)."""
+    import src.task_queue as tq
+    from src.ui.main_window import MainWindow
+
+    monkeypatch.setattr(tq, "_path", lambda: str(tmp_path / "queue.json"))
+
+    v1 = tmp_path / "a.mp4"
+    v2 = tmp_path / "b.mkv"
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    v1.write_bytes(b"x")
+    v2.write_bytes(b"x")
+
+    mw = MainWindow.__new__(MainWindow)
+    mw.input_paths = [str(v1), str(v2)]
+    mw.input_path = str(v1)
+    mw.output_dir = str(out_dir)
+    mw.worker = None
+    mw._maybe_ffmpeg_health_check = lambda: True
+    mw._remember_runtime_prefs = lambda s: None
+    messages = []
+    mw._on_status_message = messages.append
+
+    class _Panel:
+        def rebuild_queue(self, items):
+            self.items = items
+
+    mw.tasks_panel = _Panel()
+
+    class _SettingsPanel:
+        def get_settings(self):
+            return {
+                "format": "mp4",
+                "output_name": "",
+                "codec": "h264_nvenc",
+                "resolution": "original",
+            }
+
+    mw.settings_panel = _SettingsPanel()
+
+    class _Workflow:
+        def get_pipeline(self):
+            return ["Import", "Upscale", "Compress"]
+
+        def get_selected_engines(self):
+            return {"Upscale": {"engine_id": "upscale-realesrgan-x4plus",
+                                "model_path": None, "scale": 4}}
+
+    mw.workflow = _Workflow()
+
+    mw._add_to_queue()
+
+    items = tq.list_items()
+    assert len(items) == 2
+    # Orden de selección preservado.
+    assert items[0]["input_path"] == str(v1)
+    assert items[1]["input_path"] == str(v2)
+    # Misma config (mismo snapshot) en ambos.
+    assert items[0]["settings"]["codec"] == "h264_nvenc"
+    assert items[1]["settings"]["codec"] == "h264_nvenc"
+    assert items[0]["ai_engines"] == items[1]["ai_engines"]
+    assert items[0]["pipeline_order"] == items[1]["pipeline_order"] == \
+        ["Import", "Upscale", "Compress"]
+    # Outputs distintos por archivo.
+    assert items[0]["output_path"] == str(out_dir / "a_compressed.mp4")
+    assert items[1]["output_path"] == str(out_dir / "b_compressed.mp4")
+    assert "Queued 2 videos" in messages[-1]
+
+
+def test_output_path_batch_with_fixed_name_avoids_collision(tmp_path, monkeypatch):
+    """Un output_name fijo + varios videos -> nombres por archivo."""
+    from src.ui.main_window import MainWindow
+
+    v1 = tmp_path / "one.mp4"
+    v2 = tmp_path / "two.mp4"
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    v1.write_bytes(b"x")
+    v2.write_bytes(b"x")
+
+    mw = MainWindow.__new__(MainWindow)
+    mw.input_paths = [str(v1), str(v2)]
+    mw.input_path = str(v1)
+    mw.output_dir = str(out_dir)
+
+    class _SettingsPanel:
+        def get_settings(self):
+            return {"format": "mkv", "output_name": "final"}
+
+    mw.settings_panel = _SettingsPanel()
+
+    assert mw._get_output_path(str(v1)) == str(out_dir / "final_one.mkv")
+    assert mw._get_output_path(str(v2)) == str(out_dir / "final_two.mkv")
+    # Sin nombre fijo: default <base>_compressed
+    mw.settings_panel = _SettingsPanel()
+    mw.settings_panel.get_settings = lambda: {"format": "mp4", "output_name": ""}
+    assert mw._get_output_path(str(v1)) == str(out_dir / "one_compressed.mp4")
 
 
 def test_tasks_panel_queue_tab_smoke(qapp):
