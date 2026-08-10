@@ -1496,6 +1496,97 @@ def test_workflow_scale_dropdown_offers_model_native(qapp, isolated_engines_stat
         widget.deleteLater()
 
 
+def test_import_step_video_paths_from_mime(tmp_path):
+    """video_paths_from_mime extrae solo URLs locales con extensión de
+    video y que existen en disco, en orden de arrastre."""
+    from PySide6.QtCore import QMimeData, QUrl
+    from src.ui.workflow_widget import video_paths_from_mime
+
+    vid = tmp_path / "clip.mp4"
+    vid.write_bytes(b"x")
+    text = tmp_path / "notes.txt"
+    text.write_bytes(b"x")
+    missing_mkv = tmp_path / "missing.mkv"
+
+    mime = QMimeData()
+    mime.setUrls([
+        QUrl.fromLocalFile(str(vid)),
+        QUrl.fromLocalFile(str(text)),
+        QUrl("https://huggingface.co/owner/4x-UltraSharp"),
+        QUrl.fromLocalFile(str(missing_mkv)),
+    ])
+    # QUrl.fromLocalFile normaliza a "/"; comparamos con normpath.
+    out = [os.path.normpath(p) for p in video_paths_from_mime(mime)]
+    assert out == [str(vid)]
+    assert video_paths_from_mime(QMimeData()) == []
+
+
+def test_import_step_drop_event_emits_video_dropped(qapp, tmp_path):
+    """Un drop real de videos sobre la casilla Import emite
+    ``video_dropped`` con las rutas válidas y rechaza archivos no-video."""
+    from PySide6.QtCore import QMimeData, QPointF, Qt, QUrl
+    from PySide6.QtGui import QDropEvent
+    from src.ui.workflow_widget import WorkflowWidget
+
+    vid = tmp_path / "movie.mkv"
+    vid.write_bytes(b"x")
+
+    widget = WorkflowWidget()
+    try:
+        got = []
+        widget.video_dropped.connect(got.append)
+
+        mime = QMimeData()
+        mime.setUrls([QUrl.fromLocalFile(str(vid))])
+        event = QDropEvent(
+            QPointF(10, 10),
+            Qt.DropAction.CopyAction,
+            mime,
+            Qt.MouseButton.LeftButton,
+            Qt.KeyboardModifier.NoModifier,
+        )
+        widget.step_import.dropEvent(event)
+        assert [os.path.normpath(p) for p in got[0]] == [str(vid)]
+
+        # Un drop sin videos no emite nada.
+        bad = QMimeData()
+        bad.setUrls([QUrl.fromLocalFile(str(tmp_path / "x.txt"))])
+        event_bad = QDropEvent(
+            QPointF(10, 10),
+            Qt.DropAction.CopyAction,
+            bad,
+            Qt.MouseButton.LeftButton,
+            Qt.KeyboardModifier.NoModifier,
+        )
+        widget.step_import.dropEvent(event_bad)
+        assert len(got) == 1  # el drop sin videos no emite nada
+    finally:
+        widget.deleteLater()
+
+
+def test_main_window_accepts_dropped_video_paths(tmp_path, monkeypatch):
+    """El handler de drag & drop de MainWindow fija la selección igual que
+    el diálogo: filtra inexistentes y actualiza input_paths/input_path."""
+    from src.ui.main_window import MainWindow
+
+    vid = tmp_path / "a.mp4"
+    vid.write_bytes(b"x")
+
+    mw = MainWindow.__new__(MainWindow)
+    mw.input_path = None
+    mw.input_paths = []
+    statuses = []
+    mw.status_label = type("L", (), {"setText": lambda self, t: statuses.append(t)})()
+    updates = []
+    mw._update_original_bitrate = lambda p: updates.append(p)
+
+    mw._on_video_dropped([str(vid), str(tmp_path / "nope.mkv")])
+    assert mw.input_paths == [str(vid)]
+    assert mw.input_path == str(vid)
+    assert statuses == ["Selected: a.mp4"]
+    assert updates == [str(vid)]
+
+
 def test_list_all_has_face_restore_slot(isolated_engines_state):
     """The Dependencies REGISTRY exposes a FaceRestore model slot that
     reports honestly against the empty models dir."""
@@ -1735,7 +1826,9 @@ class _FakeModelInfo:
 
 
 class _FakeHfApi:
-    """Sustituye ``HfApi`` y registra las llamadas para assert de cache/offset."""
+    """Sustituye ``HfApi`` y registra las llamadas (kwargs) para asserts
+    de cache y paginación cliente (``list_models`` 1.x ya no acepta
+    ``offset``: la paginación se hace con islice sobre el iterable)."""
 
     calls: list[dict] = []
 
@@ -1744,45 +1837,43 @@ class _FakeHfApi:
 
     def list_models(self, **kwargs):
         _FakeHfApi.calls.append(dict(kwargs))
-        offset = kwargs.get("offset", 0)
-        if offset == 0:
-            return [
-                _FakeModelInfo(
-                    "owner/4x-UltraSharp",
-                    files=["model.pth", "README.md"],
-                    tags=["image-to-image", "super-resolution"],
-                    pipeline_tag="image-to-image",
-                    downloads=42_000,
-                    license="mit",
-                ),
-                _FakeModelInfo(
-                    "owner/rife-v4.6",
-                    files=["flownet.pkl", "README.md"],
-                    pipeline_tag=None,
-                    downloads=8_000,
-                ),
-                _FakeModelInfo(
-                    "owner/film-vfi",
-                    files=["flownet.pth", "README.md"],
-                    pipeline_tag=None,
-                    downloads=15_000,
-                ),
-                _FakeModelInfo(
-                    "bigcorp/llm-7b",
-                    files=["pytorch_model.bin", "config.json"],
-                    tags=["text-generation"],
-                    pipeline_tag="text-generation",
-                    downloads=999_999,
-                ),
-                _FakeModelInfo(
-                    "mystery/random-weights",
-                    files=["model.safetensors", "README.md"],
-                    tags=["image-to-image"],
-                    pipeline_tag="image-to-image",
-                    downloads=500,
-                ),
-            ]
-        return [_FakeModelInfo("owner/more-models", files=["a.pth"])]
+        # ``islice`` pagina sobre este iterable: no hay offset server-side.
+        return [
+            _FakeModelInfo(
+                "owner/4x-UltraSharp",
+                files=["model.pth", "README.md"],
+                tags=["image-to-image", "super-resolution"],
+                pipeline_tag="image-to-image",
+                downloads=42_000,
+                license="mit",
+            ),
+            _FakeModelInfo(
+                "owner/rife-v4.6",
+                files=["flownet.pkl", "README.md"],
+                pipeline_tag=None,
+                downloads=8_000,
+            ),
+            _FakeModelInfo(
+                "owner/film-vfi",
+                files=["flownet.pth", "README.md"],
+                pipeline_tag=None,
+                downloads=15_000,
+            ),
+            _FakeModelInfo(
+                "bigcorp/llm-7b",
+                files=["pytorch_model.bin", "config.json"],
+                tags=["text-generation"],
+                pipeline_tag="text-generation",
+                downloads=999_999,
+            ),
+            _FakeModelInfo(
+                "mystery/random-weights",
+                files=["model.safetensors", "README.md"],
+                tags=["image-to-image"],
+                pipeline_tag="image-to-image",
+                downloads=500,
+            ),
+        ]
 
 
 def test_user_engine_id_is_slug_safe_and_deterministic():
@@ -1856,7 +1947,10 @@ def test_search_hub_models_engine_compat_filter(monkeypatch):
     assert "mystery/random-weights" in ids  # .safetensors -> torch OK
 
 
-def test_search_hub_models_cache_and_offset(monkeypatch):
+def test_search_hub_models_cache_no_offset_kwargs(monkeypatch):
+    """La API nueva de huggingface_hub (1.x) no acepta ``offset``: la
+    llamada a ``list_models`` no debe llevar ni ``offset`` ni ``limit``
+    server-side (la paginación se hace en cliente con islice)."""
     monkeypatch.setattr("huggingface_hub.HfApi", _FakeHfApi)
     _FakeHfApi.calls.clear()
     from src.ai.hf_search import search_hub_models, clear_cache
@@ -1866,12 +1960,55 @@ def test_search_hub_models_cache_and_offset(monkeypatch):
     assert len(_FakeHfApi.calls) == 1  # segunda llamada servida del cache
 
     search_hub_models(category="Upscale", page=1, limit=30, use_cache=True)
-    assert _FakeHfApi.calls[-1]["offset"] == 30
-    assert _FakeHfApi.calls[-1]["limit"] == 30
+    call = _FakeHfApi.calls[-1]
+    assert call.get("sort") == "downloads"
+    assert "-downloads" not in call.get("sort", "")
+    assert "offset" not in call
+    assert "limit" not in call
 
     clear_cache()
     search_hub_models(category="Upscale", use_cache=True)
     assert len(_FakeHfApi.calls) == 3  # tras clear_cache vuelve a llamar
+
+
+def test_search_hub_models_paginates_client_side(monkeypatch):
+    """Página 0/1/2 (limit=2) devuelven slices disjuntos del iterable de
+    ``list_models``: la paginación funciona sin el parámetro ``offset``."""
+    class _PagedApi:
+        calls: list[dict] = []
+
+        def __init__(self, token=None):
+            pass
+
+        def list_models(self, **kwargs):
+            _PagedApi.calls.append(dict(kwargs))
+            return [
+                _FakeModelInfo("owner/4x-UltraSharp", files=["model.pth"],
+                               tags=["image-to-image"], pipeline_tag="image-to-image"),
+                _FakeModelInfo("owner/rife-v4.6", files=["flownet.pkl", "model.pth"]),
+                _FakeModelInfo("owner/film-vfi", files=["flownet.pth"]),
+                _FakeModelInfo("bigcorp/llm-7b", files=["pytorch_model.bin"],
+                               tags=["text-generation"], pipeline_tag="text-generation"),
+                _FakeModelInfo("mystery/random-weights", files=["model.safetensors"],
+                               tags=["image-to-image"], pipeline_tag="image-to-image"),
+            ]
+
+    monkeypatch.setattr("huggingface_hub.HfApi", _PagedApi)
+    _PagedApi.calls.clear()
+    from src.ai.hf_search import search_hub_models
+
+    # category=None: entran todos los repos con categoría detectada o señal.
+    p0 = {r["hf_repo_id"] for r in search_hub_models(category=None, page=0, limit=2, use_cache=False)}
+    p1 = {r["hf_repo_id"] for r in search_hub_models(category=None, page=1, limit=2, use_cache=False)}
+    p2 = {r["hf_repo_id"] for r in search_hub_models(category=None, page=2, limit=2, use_cache=False)}
+
+    assert p0 == {"owner/4x-UltraSharp", "owner/rife-v4.6"}
+    assert p1 == {"owner/film-vfi"}
+    assert p2 == {"mystery/random-weights"}
+    # Sin solapes ni saltos entre páginas de distinto tamaño.
+    assert p0.isdisjoint(p1) and p1.isdisjoint(p2)
+    # El filtrado de categoría sigue aplicándose tras el slice.
+    assert "bigcorp/llm-7b" not in p0 | p1 | p2
 
 
 def test_search_hub_models_category_none_any_category(monkeypatch):

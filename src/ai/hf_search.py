@@ -18,6 +18,7 @@ imagen y heurísticas de categoría (upscale/interpolación/colorización/...).
 from __future__ import annotations
 
 import hashlib
+import itertools
 import logging
 import os
 import re
@@ -511,13 +512,18 @@ def search_hub_models(
 
     api = HfApi(token=_token)
     try:
+        # ``list_models`` returns a lazy generator that pages the server
+        # automatically. ``huggingface_hub`` 1.x removed the ``offset``
+        # kwarg, so we paginate client-side with ``islice``. We must NOT
+        # pass ``limit`` to the SDK either: it caps the TOTAL number of
+        # yielded models, which would break every page after the first.
         models = api.list_models(
             search=query or None,
-            sort="-downloads",
-            offset=page * limit,
-            limit=limit,
+            sort="downloads",
             expand=["siblings", "cardData"],
         )
+        start = page * limit
+        models = itertools.islice(models, start, start + limit)
     except Exception as exc:
         logger.warning("HF list_models failed: %s", exc)
         raise

@@ -741,6 +741,7 @@ class MainWindow(QMainWindow):
         self.workflow.engine_changed.connect(
             self._on_engine_changed
         )
+        self.workflow.video_dropped.connect(self._on_video_dropped)
         layout.addWidget(self.workflow)
 
         # Settings
@@ -943,6 +944,17 @@ class MainWindow(QMainWindow):
         )
         if not paths:
             return
+        self._accept_video_paths(paths)
+
+    def _accept_video_paths(self, paths):
+        """Fija la selección de videos a ``paths`` (archivos locales).
+
+        Compartido por el diálogo de selección y el drag & drop sobre la
+        casilla Import: ambos dejan los videos listos para la cola.
+        """
+        paths = [p for p in paths if p and os.path.exists(p)]
+        if not paths:
+            return
         self.input_paths = list(paths)
         # Backward compat: el primer video sigue siendo ``input_path`` para
         # los flujos single (preview / compress directo / last_job).
@@ -952,6 +964,10 @@ class MainWindow(QMainWindow):
         else:
             self.status_label.setText(f"Selected: {len(paths)} videos")
         self._update_original_bitrate(paths[0])
+
+    def _on_video_dropped(self, paths):
+        """Drag & drop de videos sobre la casilla Import."""
+        self._accept_video_paths(paths)
 
     def _update_original_bitrate(self, path):
         info = get_video_info(self.ffmpeg_path, path)

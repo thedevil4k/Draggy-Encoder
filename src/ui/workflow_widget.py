@@ -1,7 +1,7 @@
 import logging
 import os
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import Qt, QUrl, Signal
 from PySide6.QtGui import QPixmap
 from PySide6.QtWidgets import (
     QComboBox,
@@ -135,12 +135,48 @@ class WorkflowStep(QWidget):
 # Import step (preserved exactly)
 # -----------------------------------------------------------------------
 
+# Extensiones de video aceptadas en Import (mismas que el diálogo de
+# selección en MainWindow._select_video).
+_VIDEO_EXTS = (".mp4", ".mkv", ".avi", ".wmv", ".mov", ".webm", ".m4v")
+
+
+def video_paths_from_mime(mime) -> list[str]:
+    """Extrae rutas locales de video de un QMimeData de drag & drop.
+
+    Filtra por extensión y descarta URLs remotas o no locales, devolviendo
+    solo ficheros que existen en disco (en orden de arrastre).
+    """
+    import os
+
+    if mime is None or not mime.hasUrls():
+        return []
+    paths = []
+    for url in mime.urls():
+        local = url.toLocalFile()
+        if not local:
+            continue
+        if not local.lower().endswith(_VIDEO_EXTS):
+            continue
+        if not os.path.isfile(local):
+            continue
+        if local not in paths:
+            paths.append(local)
+    return paths
+
 
 class ImportStep(WorkflowStep):
-    """Paso de Import con espacio extra para mostrar info del video."""
+    """Paso de Import con espacio extra para mostrar info del video.
+
+    También acepta drag & drop de videos desde el explorador del SO:
+    suelta ficheros sobre la casilla para seleccionarlos (equivale a
+    pulsar el botón importar). Emite ``video_dropped(list[str])``.
+    """
+
+    video_dropped = Signal(list)
 
     def __init__(self, icon_path, parent=None):
         super().__init__("Import", icon_path, active=True, fixed_width=150, parent=parent)
+        self.setAcceptDrops(True)
 
     def _setup_ui(self, icon_path):
         layout = QVBoxLayout(self)
@@ -178,6 +214,33 @@ class ImportStep(WorkflowStep):
 
     def set_info(self, text):
         self.info_label.setText(text)
+
+    # -- drag & drop ----------------------------------------------------
+
+    def dragEnterEvent(self, event):
+        if video_paths_from_mime(event.mimeData()):
+            self.setStyleSheet(
+                "ImportStep { border: 2px solid #ffd700; border-radius: 8px; background-color: #16213e; }"
+            )
+            self.info_label.setStyleSheet("color: #ffd700; font-size: 8px;")
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dragLeaveEvent(self, event):
+        self.update_state()
+        self.info_label.setStyleSheet("color: #a0a0b0; font-size: 8px;")
+        super().dragLeaveEvent(event)
+
+    def dropEvent(self, event):
+        paths = video_paths_from_mime(event.mimeData())
+        self.update_state()
+        self.info_label.setStyleSheet("color: #a0a0b0; font-size: 8px;")
+        if paths:
+            event.acceptProposedAction()
+            self.video_dropped.emit(paths)
+        else:
+            event.ignore()
 
 
 # -----------------------------------------------------------------------
@@ -781,6 +844,9 @@ class WorkflowWidget(QWidget):
     model_selected = Signal(dict)
     # Emitted when any AI step's engine dropdown changes. Arg: (node_name, engine_id).
     engine_changed = Signal(str, str)
+    # Emitted when the user drops video files onto the Import step.
+    # Arg: list of local video paths.
+    video_dropped = Signal(list)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -790,6 +856,7 @@ class WorkflowWidget(QWidget):
 
     def _setup_steps(self):
         self.step_import = ImportStep(get_asset_path("Import.png"))
+        self.step_import.video_dropped.connect(self.video_dropped.emit)
         self.step_compress = WorkflowStep(
             "Compress", get_asset_path("Export.png"), active=True
         )
