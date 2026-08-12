@@ -28,9 +28,6 @@ try:
 except Exception:
     pass
 
-from src.app import DraggyEncoderApp
-
-
 def run_selftest() -> int:
     """Verificación rápida de salud sin abrir la GUI (flag ``--selftest``).
 
@@ -123,5 +120,9 @@ def run_selftest() -> int:
 if __name__ == "__main__":
     if "--selftest" in sys.argv:
         sys.exit(run_selftest())
+    # Import diferido: importar PySide6/QtGUI solo cuando se va a abrir la
+    # GUI de verdad. En entornos sin bibliotecas de ventana (CI, --selftest)
+    # la app no debe reventar antes de que el selftest pueda reportar.
+    from src.app import DraggyEncoderApp
     app = DraggyEncoderApp()
     sys.exit(app.run())
