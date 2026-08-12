@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import json
 import os
+import tempfile
 import threading
 from datetime import datetime, timezone
 from typing import Optional
@@ -60,12 +61,26 @@ def _load_raw() -> list:
 
 
 def _save_raw(tasks: list) -> bool:
+    """Persist task history atomically and durably."""
+    tmp_path = None
     try:
         ensure_runtime_dirs()
-        with open(_path(), "w", encoding="utf-8") as f:
+        path = _path()
+        fd, tmp_path = tempfile.mkstemp(
+            prefix=".tasks-", suffix=".tmp", dir=os.path.dirname(os.path.abspath(path))
+        )
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
             json.dump(tasks, f, indent=2, ensure_ascii=False)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, path)
         return True
     except Exception:
+        if tmp_path:
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
         return False
 
 
@@ -122,6 +137,27 @@ def update_phase(task_id: str, phase_id: str, label: str = "",
             "pct": int(pct),
         })
         return _save_raw(tasks)
+
+
+def recover_interrupted_tasks() -> int:
+    """Mark tasks still "running" from a previous session as interrupted.
+
+    Called once at startup, before the UI builds the task list. A task that
+    was mid-render when the app crashed or was force-closed stays "running"
+    forever otherwise, and the tasks panel would show it as active even
+    though no worker exists.
+    """
+    changed = 0
+    with _LOCK:
+        tasks = _load_raw()
+        for task in tasks:
+            if task.get("status") == "running" and not task.get("finished_at"):
+                task["status"] = "interrupted"
+                task["finished_at"] = _now()
+                changed += 1
+        if changed:
+            _save_raw(tasks)
+    return changed
 
 
 def finish_task(task_id: str, status: str) -> bool:

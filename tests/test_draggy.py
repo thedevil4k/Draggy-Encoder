@@ -3600,6 +3600,203 @@ def test_engine_row_backend_selector_shows_benchmarks(qapp):
 
 
 # ==--------------------------------------------------------------------==
+# P0: render stability contracts
+# ==--------------------------------------------------------------------==
+
+
+def test_process_supervisor_stops_registered_children():
+    from src.ffmpeg.process_supervisor import ProcessSupervisor
+
+    class FakeProcess:
+        pid = 999999999
+
+        def __init__(self):
+            self.returncode = None
+            self.terminated = False
+            self.killed = False
+
+        def poll(self):
+            return self.returncode
+
+        def terminate(self):
+            self.terminated = True
+            self.returncode = -15
+
+        def kill(self):
+            self.killed = True
+            self.returncode = -9
+
+        def wait(self, timeout=None):
+            return self.returncode
+
+    proc = FakeProcess()
+    supervisor = ProcessSupervisor()
+    supervisor.register(proc, "encoder")
+    assert supervisor.stop_all(grace_seconds=0.01, kill_seconds=0.01) == []
+    assert proc.terminated is True
+    assert proc.poll() is not None
+
+
+def test_render_preflight_rejects_bad_trim_and_accepts_valid_input(tmp_path, monkeypatch):
+    import src.processing.pipeline as pipeline
+
+    ffmpeg = tmp_path / "ffmpeg"
+    source = tmp_path / "input.mp4"
+    ffmpeg.write_bytes(b"binary")
+    source.write_bytes(b"video")
+    monkeypatch.setattr(
+        pipeline, "health_check_ffmpeg",
+        lambda *args, **kwargs: (True, "6.0", None),
+    )
+    monkeypatch.setattr(
+        pipeline, "get_video_info",
+        lambda *args, **kwargs: {
+            "width": "640", "height": "360", "duration": "10", "r_frame_rate": "30/1",
+        },
+    )
+    settings = {"codec": "libx264", "format": "mp4", "start_time": "8", "end_time": "4"}
+    errors = pipeline.validate_render_preflight(
+        str(ffmpeg), str(source), str(tmp_path / "out.mp4"), settings,
+    )
+    assert any("Trim end" in error for error in errors)
+
+    settings["end_time"] = "9"
+    assert pipeline.validate_render_preflight(
+        str(ffmpeg), str(source), str(tmp_path / "out.mp4"), settings,
+    ) == []
+
+
+def test_task_queue_enforces_render_state_transitions_and_recovery(tmp_path, monkeypatch):
+    import src.task_queue as queue
+
+    monkeypatch.setattr(queue, "_path", lambda: str(tmp_path / "queue.json"))
+    queue_id = queue.enqueue(
+        name="clip.mp4", input_path="/tmp/input.mp4", output_path="/tmp/output.mp4",
+        settings={"codec": "libx264"},
+    )
+    assert queue.set_status(queue_id, "done") is False
+    for state in ("validating", "preparing", "running", "muxing", "publishing", "done"):
+        assert queue.set_status(queue_id, state) is True
+    item = queue.get_item(queue_id)
+    assert item["status"] == "done"
+    assert len(item["state_history"]) == 6
+
+    interrupted = queue.enqueue(
+        name="interrupted.mp4", input_path="/tmp/input2.mp4", output_path="/tmp/output2.mp4",
+        settings={},
+    )
+    assert queue.set_status(interrupted, "running") is True
+    assert queue.recover_interrupted() == 1
+    recovered = queue.get_item(interrupted)
+    assert recovered["status"] == "queued"
+    assert recovered["recovery_count"] == 1
+
+
+def test_ai_chain_contract_catches_bad_engine_output():
+    """A node that returns RGB/gray or changes resolution without being an
+    upscaler must be flagged by the chain contract probe."""
+    import numpy as np
+    from src.processing.pipeline import validate_ai_chain_contract
+
+    class _Good:
+        engine_id = "good-upscaler"
+        _mode = "upscale"
+
+        def get_scale_factor(self):
+            return 2
+
+        def process_frame(self, frame):
+            return np.repeat(np.repeat(frame, 2, axis=0), 2, axis=1)
+
+    class _BadChannels:
+        engine_id = "rgb-returner"
+        _mode = "upscale"
+
+        def get_scale_factor(self):
+            return 1
+
+        def process_frame(self, frame):
+            return np.zeros((64, 64, 3), dtype=np.uint8)  # RGB-shaped is fine...
+
+    class _Gray:
+        engine_id = "gray-returner"
+        _mode = "upscale"
+
+        def get_scale_factor(self):
+            return 1
+
+        def process_frame(self, frame):
+            return np.zeros((64, 64), dtype=np.uint8)  # H,W only -> violation
+
+    # Valid chain passes.
+    assert validate_ai_chain_contract([_Good()], 64, 64) is True
+    # A gray (2D) frame violates the BGR (H, W, 3) contract.
+    with pytest.raises(RuntimeError, match=r"BGR \(H, W, 3\)"):
+        validate_ai_chain_contract([_BadChannels(), _Gray()], 64, 64)
+
+
+def test_ai_chain_contract_allows_upscalers_but_rejects_shape_change(tmp_path, monkeypatch):
+    """Upscalers may change H/W; a non-upscaler that changes resolution
+    (e.g. a broken denoiser) violates the contract."""
+    import numpy as np
+    from src.processing.pipeline import validate_ai_chain_contract
+
+    class _Denoise:
+        engine_id = "denoise"
+        _mode = "upscale"
+
+        def get_scale_factor(self):
+            return 1
+
+        def process_frame(self, frame):
+            return np.zeros((32, 32, 3), dtype=np.uint8)  # silently halves size
+
+    # The first step halves the probe from 64x64 to 32x32; the second
+    # step feeds on that smaller frame, so no shape mismatch is flagged
+    # between steps. But a lone denoiser must NOT change resolution.
+    with pytest.raises(RuntimeError, match="without being an upscaler"):
+        validate_ai_chain_contract([_Denoise()], 64, 64)
+
+
+def test_task_history_recovers_interrupted_tasks(tmp_path, monkeypatch):
+    """A task left 'running' by a crash is marked interrupted at startup."""
+    import src.task_history as th
+
+    monkeypatch.setattr(th, "_path", lambda: str(tmp_path / "tasks.json"))
+    th.start_task("crash-1", "video.mp4")
+    assert th.get_task("crash-1")["status"] == "running"
+
+    assert th.recover_interrupted_tasks() == 1
+    t = th.get_task("crash-1")
+    assert t["status"] == "interrupted"
+    assert t["finished_at"] is not None
+    # Already-finished tasks are untouched.
+    assert th.recover_interrupted_tasks() == 0
+
+
+def test_cleanup_stale_staging_removes_old_temp_files(tmp_path, monkeypatch):
+    """Abandoned .drag-audio-* / .draggy-render-* temp files older than the
+    threshold are removed; recent ones are kept."""
+    import time as _time
+    import src.processing.pipeline as pipeline
+
+    old_file = tmp_path / ".draggy-render-old.mp4"
+    fresh_file = tmp_path / ".draggy-render-fresh.mp4"
+    old_file.write_bytes(b"x")
+    fresh_file.write_bytes(b"x")
+    old = _time.time() - 7200
+    os.utime(old_file, (old, old))
+
+    monkeypatch.setattr(
+        pipeline, "tempfile",
+        type("FakeTemp", (), {"gettempdir": staticmethod(lambda: str(tmp_path))})(),
+    )
+    assert pipeline.cleanup_stale_staging(older_than_seconds=3600) == 1
+    assert not old_file.exists()
+    assert fresh_file.exists()
+
+
+# ==--------------------------------------------------------------------==
 # Standalone runner (works even without pytest installed)
 # ==--------------------------------------------------------------------==
 

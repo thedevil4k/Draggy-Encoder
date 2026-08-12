@@ -1,8 +1,11 @@
+from __future__ import annotations
+
 import json
 import logging
 import os
 import random
 import re
+import shutil
 import subprocess
 import tempfile
 import threading
@@ -16,10 +19,16 @@ from src.config import get_logs_dir, resolve_codec
 from src.ffmpeg.loudnorm import measure_loudness
 from src.ffmpeg.runner import (
     _build_loudnorm_filter,
+    _parse_time_to_seconds,
     build_args,
     extract_frame,
     get_video_info,
+    health_check_ffmpeg,
     run_ffmpeg,
+)
+from src.ffmpeg.process_supervisor import (
+    ProcessSupervisor,
+    process_group_popen_kwargs,
 )
 
 
@@ -55,6 +64,107 @@ def _get_duration_seconds(ffmpeg_path, video_path):
         return 0
 
 
+def validate_render_preflight(ffmpeg_path, input_path, output_path=None,
+                              settings=None):
+    """Return actionable errors that must be fixed before a render starts."""
+    settings = dict(settings or {})
+    errors = []
+    if not ffmpeg_path or not os.path.isfile(ffmpeg_path):
+        errors.append(f"FFmpeg binary is missing: {ffmpeg_path}")
+    else:
+        ok, _version, detail = health_check_ffmpeg(ffmpeg_path, timeout=10)
+        if not ok:
+            errors.append(f"FFmpeg health check failed: {detail or 'unknown error'}")
+
+    if not input_path or not os.path.isfile(input_path):
+        errors.append(f"Input video is missing: {input_path}")
+    else:
+        try:
+            if os.path.getsize(input_path) <= 0:
+                errors.append("Input video is empty.")
+        except OSError as exc:
+            errors.append(f"Input video cannot be inspected: {exc}")
+
+    output_dir = None
+    if output_path:
+        output_dir = os.path.dirname(os.path.abspath(output_path)) or "."
+        if os.path.abspath(input_path or "") == os.path.abspath(output_path):
+            errors.append("Input and output paths must be different.")
+        try:
+            os.makedirs(output_dir, exist_ok=True)
+            if not os.access(output_dir, os.W_OK):
+                errors.append(f"Output directory is not writable: {output_dir}")
+        except OSError as exc:
+            errors.append(f"Output directory is unavailable: {exc}")
+
+    if input_path and os.path.isfile(input_path):
+        info = get_video_info(ffmpeg_path, input_path)
+        try:
+            width, height = int(info.get("width", 0)), int(info.get("height", 0))
+        except (TypeError, ValueError):
+            width = height = 0
+        if width <= 0 or height <= 0:
+            errors.append("FFprobe could not detect a valid video stream.")
+        try:
+            duration = float(info.get("duration", 0) or 0)
+        except (TypeError, ValueError):
+            duration = 0
+        if duration <= 0:
+            errors.append("FFprobe could not detect a valid video duration.")
+
+        start = _parse_time_to_seconds(settings.get("start_time"))
+        end = _parse_time_to_seconds(settings.get("end_time"))
+        if start is not None and start < 0:
+            errors.append("Trim start cannot be negative.")
+        if end is not None and end <= 0:
+            errors.append("Trim end must be greater than zero.")
+        if start is not None and end is not None and end <= start:
+            errors.append("Trim end must be greater than trim start.")
+        if duration > 0 and start is not None and start >= duration:
+            errors.append("Trim start is beyond the input duration.")
+
+        if output_dir:
+            try:
+                # Conservative reserve for staging, mux and temporary audio.
+                required = max(64 * 1024 * 1024, os.path.getsize(input_path) * 2)
+                free = shutil.disk_usage(output_dir).free
+                if free < required:
+                    errors.append(
+                        f"Not enough free disk space (need about {required} bytes, "
+                        f"available {free})."
+                    )
+            except OSError:
+                pass
+
+    if not str(settings.get("codec", "")).strip():
+        errors.append("No video codec is selected.")
+    if settings.get("format") not in (None, "mp4", "mkv", "avi", "wmv", "mov", "webm"):
+        errors.append(f"Unsupported output format: {settings.get('format')}")
+    return errors
+
+
+def validate_render_output(ffmpeg_path, output_path, expected_duration=None):
+    """Validate a staged render before it can be published."""
+    if not output_path or not os.path.isfile(output_path):
+        return False, "Rendered output is missing."
+    try:
+        if os.path.getsize(output_path) <= 0:
+            return False, "Rendered output is empty."
+    except OSError as exc:
+        return False, f"Rendered output cannot be inspected: {exc}"
+    info = get_video_info(ffmpeg_path, output_path)
+    try:
+        width, height = int(info.get("width", 0)), int(info.get("height", 0))
+        duration = float(info.get("duration", 0) or 0)
+    except (TypeError, ValueError):
+        return False, "FFprobe returned invalid output metadata."
+    if width <= 0 or height <= 0 or duration <= 0:
+        return False, "Rendered output has no valid video stream or duration."
+    if expected_duration and duration < max(0.05, expected_duration * 0.25):
+        return False, "Rendered output is unexpectedly shorter than the requested clip."
+    return True, ""
+
+
 def _make_temp_output_path(output_path: str) -> str:
     """Create a same-directory temporary output name and reserve no handle.
 
@@ -72,6 +182,32 @@ def _make_temp_output_path(output_path: str) -> str:
     except OSError:
         pass
     return path
+
+
+def cleanup_stale_staging(older_than_seconds=3600):
+    """Remove abandoned render staging files left by a previous crash.
+
+    Staging files are created beside their destination (``.draggy-render-*``
+    / ``.drag-audio-*``); if the app died before ``os.replace`` they would
+    otherwise accumulate forever. Only files older than ``older_than_seconds``
+    are touched so a concurrent render in this same process is never harmed.
+    """
+    import glob as _glob
+    import time as _time
+    now = _time.time()
+    removed = 0
+    for pattern in (".draggy-render-*", ".drag-audio-*"):
+        try:
+            for path in _glob.glob(os.path.join(tempfile.gettempdir(), pattern)):
+                try:
+                    if now - os.path.getmtime(path) >= older_than_seconds:
+                        os.remove(path)
+                        removed += 1
+                except OSError:
+                    pass
+        except Exception:
+            pass
+    return removed
 
 
 def _cleanup_path(path):
@@ -94,7 +230,8 @@ def _needs_audio_reencode(settings):
 
 
 def _measure_if_needed(ffmpeg_path, input_path, settings, status_callback=None,
-                       start_time=None, end_time=None):
+                       start_time=None, end_time=None, abort_event=None,
+                       supervisor: ProcessSupervisor | None = None):
     """Mide loudness solo si audio_boost=True y vamos a re-codificar audio.
 
     Devuelve el dict medido (modulo de loudnorm) o None si no aplica / falla.
@@ -112,6 +249,8 @@ def _measure_if_needed(ffmpeg_path, input_path, settings, status_callback=None,
             ffmpeg_path, input_path,
             start_time=start_time, end_time=end_time,
             status_callback=status_callback,
+            abort_event=abort_event,
+            supervisor=supervisor,
         )
     except Exception:
         return None
@@ -119,7 +258,8 @@ def _measure_if_needed(ffmpeg_path, input_path, settings, status_callback=None,
 
 def compress_video(ffmpeg_path, input_path, output_path, settings,
                    progress_callback=None, status_callback=None, abort_event=None,
-                   ai_engines=None, on_process=None, phase_cb=None):
+                   ai_engines=None, on_process=None, phase_cb=None,
+                   supervisor: ProcessSupervisor | None = None):
     """Comprime un vídeo completo. Audio boost usa two-pass loudnorm.
 
     ``ai_engines`` is an optional mapping ``{"Upscale": "engine_id",
@@ -135,6 +275,15 @@ def compress_video(ffmpeg_path, input_path, output_path, settings,
     ``_abort_running_worker`` in ``src/ui/main_window.py``).
     """
     settings = dict(settings)
+    preflight_errors = validate_render_preflight(
+        ffmpeg_path, input_path, output_path, settings,
+    )
+    if preflight_errors:
+        message = "Preflight failed: " + " ".join(preflight_errors)
+        if status_callback:
+            status_callback(message)
+        logger.error(message)
+        return False
     settings["duration_seconds"] = _get_duration_seconds(ffmpeg_path, input_path)
 
     if ai_engines:
@@ -168,6 +317,8 @@ def compress_video(ffmpeg_path, input_path, output_path, settings,
         ffmpeg_path, input_path, settings, status_callback=status_callback,
         start_time=settings.get("start_time"),
         end_time=settings.get("end_time"),
+        abort_event=abort_event,
+        supervisor=supervisor,
     )
     if loudnorm_meas:
         _emit_phase(phase_cb, "start", "audio", label="Audio boost", pct=100)
@@ -181,13 +332,20 @@ def compress_video(ffmpeg_path, input_path, output_path, settings,
             progress_callback=progress_callback,
             abort_event=abort_event,
             on_process=on_process,
+            supervisor=supervisor,
         )
-        if result and os.path.exists(temp_output) and os.path.getsize(temp_output) > 0:
+        valid, detail = validate_render_output(
+            ffmpeg_path,
+            temp_output,
+            expected_duration=settings.get("duration_seconds"),
+        ) if result else (False, "FFmpeg returned a failure code.")
+        if valid:
             os.replace(temp_output, output_path)
             _emit_phase(phase_cb, "progress", "compress", pct=100)
             _emit_phase(phase_cb, "end", "compress")
             return True
-        _emit_phase(phase_cb, "failed", "compress")
+        logger.error("Standard render validation failed: %s", detail)
+        _emit_phase(phase_cb, "failed", "compress", msg=detail)
         return False
     finally:
         _cleanup_path(temp_output)
@@ -196,7 +354,7 @@ def compress_video(ffmpeg_path, input_path, output_path, settings,
 def generate_preview(ffmpeg_path, input_path, settings, progress_callback=None,
                      status_callback=None, abort_event=None, ai_engines=None,
                      inference_engines=None, on_process=None, on_processes=None,
-                     phase_cb=None):
+                     phase_cb=None, supervisor: ProcessSupervisor | None = None):
     """Genera un preview: codifica un clip corto y extrae un frame aleatorio.
 
     Devuelve una tupla ``(original_bytes, compressed_bytes)`` con los bytes de
@@ -211,6 +369,11 @@ def generate_preview(ffmpeg_path, input_path, settings, progress_callback=None,
     preview path.
     """
     settings = dict(settings)
+    preflight_errors = validate_render_preflight(
+        ffmpeg_path, input_path, None, settings,
+    )
+    if preflight_errors:
+        raise RuntimeError("Preflight failed: " + " ".join(preflight_errors))
     duration = _get_duration_seconds(ffmpeg_path, input_path)
     settings["duration_seconds"] = duration
     _emit_phase(phase_cb, "start", "preview", label="Preview clip", pct=0)
@@ -257,6 +420,8 @@ def generate_preview(ffmpeg_path, input_path, settings, progress_callback=None,
     loudnorm_meas = _measure_if_needed(
         ffmpeg_path, input_path, settings, status_callback=status_callback,
         start_time=start, end_time=end,
+        abort_event=abort_event,
+        supervisor=supervisor,
     )
 
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -288,6 +453,7 @@ def generate_preview(ffmpeg_path, input_path, settings, progress_callback=None,
                 on_process=on_process,
                 on_processes=on_processes,
                 phase_cb=phase_cb,
+                supervisor=supervisor,
             )
         else:
             args = build_args(input_path, compressed_path, preview_settings, loudnorm_meas=loudnorm_meas)
@@ -298,6 +464,7 @@ def generate_preview(ffmpeg_path, input_path, settings, progress_callback=None,
                 progress_callback=progress_callback,
                 abort_event=abort_event,
                 on_process=on_process,
+                supervisor=supervisor,
             )
         if not ok:
             raise RuntimeError(
@@ -309,11 +476,17 @@ def generate_preview(ffmpeg_path, input_path, settings, progress_callback=None,
         # Nunca pidamos un tiempo mayor que la duración real del clip.
         frame_time = min(random_frame_time, clip_length - 0.1)
         compressed_frame = os.path.join(tmpdir, "compressed_frame.jpg")
-        ok_comp = extract_frame(ffmpeg_path, compressed_path, frame_time, compressed_frame)
+        ok_comp = extract_frame(
+            ffmpeg_path, compressed_path, frame_time, compressed_frame,
+            abort_event=abort_event, supervisor=supervisor,
+        )
 
         original_time = start + frame_time
         original_frame = os.path.join(tmpdir, "original_frame.jpg")
-        ok_orig = extract_frame(ffmpeg_path, input_path, original_time, original_frame)
+        ok_orig = extract_frame(
+            ffmpeg_path, input_path, original_time, original_frame,
+            abort_event=abort_event, supervisor=supervisor,
+        )
 
         if not ok_comp:
             raise RuntimeError("Could not extract a frame from the compressed preview clip.")
@@ -360,6 +533,7 @@ def compress_video_with_ai(
     on_processes=None,
     inference_engines=None,
     phase_cb=None,
+    supervisor: ProcessSupervisor | None = None,
 ):
     """Decode -> AI chain -> encode in a single pass (frame-by-frame).
 
@@ -390,6 +564,20 @@ def compress_video_with_ai(
     ``on_process`` receives the encoder ``Popen`` object so the GUI can
     kill it directly on abort.
     """
+    # Direct callers may not provide a supervisor (the GUI does). Always
+    # create one here so decoder, encoder, audio and mux children still have
+    # a common kill path when a model or pipe fails unexpectedly.
+    supervisor = supervisor or ProcessSupervisor()
+    preflight_errors = validate_render_preflight(
+        ffmpeg_path, input_path, output_path, settings,
+    )
+    if preflight_errors:
+        message = "Preflight failed: " + " ".join(preflight_errors)
+        if status_callback:
+            status_callback(message)
+        logger.error(message)
+        return False
+
     if inference_engines is not None:
         engines = [e for e in inference_engines if e is not None]
     elif inference_engine is not None:
@@ -598,6 +786,7 @@ def compress_video_with_ai(
                     ffmpeg_path, input_path, settings,
                     status_callback=status_callback, phase_cb=phase_cb,
                     abort_event=abort_event,
+                    supervisor=supervisor,
                 )
             except Exception as exc:
                 audio_error[0] = exc
@@ -632,12 +821,15 @@ def compress_video_with_ai(
         "-v", "error",
         "pipe:1",
     ])
-    dec_proc = subprocess.Popen(
-        dec_cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        bufsize=src_w * src_h * 3 * 4,  # buffer ~4 frames
-    )
+    dec_kwargs = {
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.PIPE,
+        "bufsize": src_w * src_h * 3 * 4,  # buffer ~4 frames
+    }
+    dec_kwargs.update(process_group_popen_kwargs())
+    dec_proc = subprocess.Popen(dec_cmd, **dec_kwargs)
+    if supervisor is not None:
+        supervisor.register(dec_proc, "decoder")
     if on_processes:
         try:
             on_processes(dec_proc, "decoder")
@@ -738,12 +930,15 @@ def compress_video_with_ai(
     }
     _save_render_log(log_file, log_entry)
 
-    enc_proc = subprocess.Popen(
-        enc_cmd,
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-    )
+    enc_kwargs = {
+        "stdin": subprocess.PIPE,
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.PIPE,
+    }
+    enc_kwargs.update(process_group_popen_kwargs())
+    enc_proc = subprocess.Popen(enc_cmd, **enc_kwargs)
+    if supervisor is not None:
+        supervisor.register(enc_proc, "encoder")
     if on_process:
         on_process(enc_proc)
     if on_processes:
@@ -978,6 +1173,19 @@ def compress_video_with_ai(
         log_entry["status"] = "error"
         log_entry["error"] = str(exc)
         _save_render_log(log_file, log_entry)
+        # Stop parallel audio and any child still blocked on a pipe before
+        # propagating the exception. Without this, a model error could leave
+        # FFmpeg alive after the worker had already reported failure.
+        try:
+            if abort_event is not None:
+                abort_event.set()
+            supervisor.stop_all(grace_seconds=1.0, kill_seconds=1.0)
+        except Exception:
+            logger.exception("Could not stop AI child processes after failure")
+        if audio_thread is not None:
+            audio_thread.join(timeout=3.0)
+        if audio_tmp[0]:
+            _cleanup_path(audio_tmp[0])
         _cleanup_path(output_path)
         raise
     finally:
@@ -1072,10 +1280,19 @@ def compress_video_with_ai(
             container_format=settings.get("format", "mp4"),
             audio_file=audio_tmp[0],
             abort_event=abort_event,
+            supervisor=supervisor,
         )
         # Si el mux falló sin que el usuario abortase, lo surfaceamos
         # para que no parezca un éxito silencioso (la salida queda
         # sin audio y el usuario pensaría que iba bien).
+        if mux_ok:
+            mux_ok, mux_detail = validate_render_output(
+                ffmpeg_path,
+                output_path,
+                expected_duration=None,
+            )
+            if not mux_ok:
+                logger.error("Mux validation failed: %s", mux_detail)
         if not mux_ok and (not abort_event or not abort_event.is_set()):
             msg = (
                 f"\u26a0 Audio mux failed \u2014 '{os.path.basename(final_output_path)}' "
@@ -1096,8 +1313,16 @@ def compress_video_with_ai(
 
     # Final publication happens after video encoding and optional audio mux.
     # os.replace is atomic because staging lives beside the destination.
-    if not os.path.exists(output_path) or os.path.getsize(output_path) <= 0:
-        logger.error("AI pipeline produced no valid staged output: %s", output_path)
+    valid, detail = validate_render_output(
+        ffmpeg_path,
+        output_path,
+        expected_duration=(
+            _get_duration_seconds(ffmpeg_path, input_path)
+            if not settings.get("start_time") else None
+        ),
+    )
+    if not valid:
+        logger.error("AI pipeline produced invalid staged output: %s", detail)
         _cleanup_path(output_path)
         return False
     try:
@@ -1128,6 +1353,109 @@ def compress_video_with_ai(
         log_entry["output_size_bytes"] = os.path.getsize(final_output_path)
     _save_render_log(log_file, log_entry)
 
+    return True
+
+
+def _engine_scale(engine):
+    """Best-effort scale factor of an engine (1 for non-upscalers)."""
+    try:
+        return max(1, int(getattr(engine, "get_scale_factor", lambda: 1)() or 1))
+    except Exception:
+        return 1
+
+
+def _check_frame_contract(engine_id, frame, expected_shape=None):
+    """Validate the BGR/HWC/uint8 contract one engine must honour.
+
+    Every chain step must consume and produce BGR uint8 ``(H, W, 3)``
+    frames. Engines whose ``get_scale_factor() > 1`` may change H/W
+    (upscalers); the other steps must preserve the exact shape.
+    Detecting a violation here — instead of mid-render, when the
+    encoder pipe or a later engine fails — is what lets the UI show a
+    clear "engine X does not match the chain contract" error.
+    """
+    if frame is None:
+        raise RuntimeError(
+            f"AI engine '{engine_id}' returned None instead of a frame."
+        )
+    if not isinstance(frame, np.ndarray):
+        raise RuntimeError(
+            f"AI engine '{engine_id}' returned {type(frame).__name__}, "
+            "expected a numpy frame."
+        )
+    if frame.ndim != 3 or frame.shape[2] != 3:
+        raise RuntimeError(
+            f"AI engine '{engine_id}' returned shape {frame.shape}; the chain "
+            "contract requires BGR (H, W, 3) frames."
+        )
+    if frame.dtype != np.uint8:
+        raise RuntimeError(
+            f"AI engine '{engine_id}' returned dtype {frame.dtype}; the chain "
+            "contract requires uint8 frames."
+        )
+    if expected_shape is not None and frame.shape != expected_shape:
+        raise RuntimeError(
+            f"AI engine '{engine_id}' changed the frame shape to {frame.shape} "
+            f"(expected {expected_shape}) without being an upscaler."
+        )
+    return frame
+
+
+def validate_ai_chain_contract(engines, src_h=None, src_w=None):
+    """Probe the whole chain ONCE before the real render starts.
+
+    Runs a small synthetic frame through every engine in chain order and
+    validates the BGR/HWC/uint8 contract at each step. This catches
+    incompatible chains (an engine that returns RGB, a wrong channel
+    count, a non-upscaler that changes resolution, ...) before the user
+    wastes minutes of GPU time, instead of failing at frame 1 of 5000.
+
+    The probe is best-effort: engines whose ``process_frame`` fails on
+    synthetic input are skipped (the render would also degrade them via
+    ``_apply_steps``), and interpolation-only engines are exercised
+    through their dedicated ``interpolate_frame`` path when possible.
+    Raises RuntimeError only for contract violations.
+    """
+    steps_antes, steps_despues, interp_step = _split_ai_chain(engines)
+    h = int(src_h or 64)
+    w = int(src_w or 64)
+    probe = np.zeros((h, w, 3), dtype=np.uint8)
+    for _e in steps_antes:
+        scale = _engine_scale(_e)
+        expected = None if scale > 1 else probe.shape
+        try:
+            out = _e.process_frame(probe)
+        except Exception:
+            continue  # runtime degradation path covers this engine
+        try:
+            probe = _check_frame_contract(
+                getattr(_e, "engine_id", "?"), out,
+                expected_shape=expected,
+            )
+        except RuntimeError:
+            raise
+    if interp_step is not None:
+        try:
+            interp_out = interp_step.interpolate_frame(probe, probe)
+            _check_frame_contract(
+                getattr(interp_step, "engine_id", "?"), interp_out, probe.shape,
+            )
+        except Exception:
+            pass  # interpolation errors already degrade gracefully at runtime
+    for _e in steps_despues:
+        scale = _engine_scale(_e)
+        expected = None if scale > 1 else probe.shape
+        try:
+            out = _e.process_frame(probe)
+        except Exception:
+            continue
+        try:
+            probe = _check_frame_contract(
+                getattr(_e, "engine_id", "?"), out,
+                expected_shape=expected,
+            )
+        except RuntimeError:
+            raise
     return True
 
 
@@ -1243,7 +1571,8 @@ def _audio_mux_args(audio_codec, loudnorm_meas, audio_boost, container_format="m
 
 
 def _encode_audio_parallel(ffmpeg_path, input_path, settings,
-                           status_callback=None, phase_cb=None, abort_event=None):
+                           status_callback=None, phase_cb=None, abort_event=None,
+                           supervisor: ProcessSupervisor | None = None):
     """Codifica la pista de audio COMPLETA a un archivo temporal.
 
     Corre en un hilo daemon mientras el vídeo se renderiza con la GPU.
@@ -1268,6 +1597,7 @@ def _encode_audio_parallel(ffmpeg_path, input_path, settings,
     if audio_boost:
         loudnorm_meas = _measure_if_needed(
             ffmpeg_path, input_path, settings, status_callback=status_callback,
+            abort_event=abort_event, supervisor=supervisor,
         )
 
     mux_args = _audio_mux_args(
@@ -1313,13 +1643,19 @@ def _encode_audio_parallel(ffmpeg_path, input_path, settings,
 
     duration_s = _get_duration_seconds(ffmpeg_path, input_path) or 0
 
-    proc = subprocess.Popen(
-        cmd,
-        stdout=subprocess.PIPE if phase_cb is not None else subprocess.DEVNULL,
-        stderr=subprocess.PIPE,
-        encoding="utf-8",
-        errors="replace",
-    )
+    audio_kwargs = {
+        "stdout": subprocess.PIPE if phase_cb is not None else subprocess.DEVNULL,
+        # Do not leave FFmpeg's banner/stats in an undrained pipe: the
+        # Windows build can fill it before the encoder exits. Audio progress
+        # comes from stdout; stderr is diagnostic-only here.
+        "stderr": subprocess.DEVNULL,
+        "encoding": "utf-8",
+        "errors": "replace",
+    }
+    audio_kwargs.update(process_group_popen_kwargs())
+    proc = subprocess.Popen(cmd, **audio_kwargs)
+    if supervisor is not None:
+        supervisor.register(proc, "audio")
     try:
         # Track del último out_time_ms para emitir sólo cambios de %.
         last_pct = -1
@@ -1327,7 +1663,13 @@ def _encode_audio_parallel(ffmpeg_path, input_path, settings,
             if abort_event and abort_event.is_set():
                 try:
                     proc.terminate()
-                    proc.wait(timeout=5)
+                    proc.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    try:
+                        proc.kill()
+                        proc.wait(timeout=2)
+                    except Exception:
+                        pass
                 except Exception:
                     pass
                 return None
@@ -1362,10 +1704,10 @@ def _encode_audio_parallel(ffmpeg_path, input_path, settings,
                 _emit_phase(phase_cb, "progress", "audio",
                             label="Audio (parallel)", pct=100)
             return tmp_path
-        try:
-            stderr_tail = (proc.stderr.read() or "")[-512:]
-        except Exception:
-            stderr_tail = ""
+        # stderr is intentionally DEVNULL to keep this background path
+        # deadlock-free on Windows. The process return code remains the
+        # authoritative failure signal.
+        stderr_tail = ""
         logger.warning(
             "Parallel audio encode failed (rc=%s): %s", proc.returncode, stderr_tail,
         )
@@ -1384,7 +1726,8 @@ def _encode_audio_parallel(ffmpeg_path, input_path, settings,
 
 def _mux_audio(ffmpeg_path, input_path, output_path, audio_codec="copy",
                loudnorm_meas=None, audio_boost=False, container_format="mp4",
-               audio_file=None, abort_event=None):
+               audio_file=None, abort_event=None,
+               supervisor: ProcessSupervisor | None = None):
     """Mux audio from the original input into the upscaled output.
 
     Uses ``ffmpeg -i upscaled.{ext} -i original.mp4 -map 0:v -map 1:a
@@ -1443,13 +1786,18 @@ def _mux_audio(ffmpeg_path, input_path, output_path, audio_codec="copy",
                 )
             )
         cmd.extend(["-shortest", "-y", tmp_out])
-        proc = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            encoding="utf-8",
-            errors="replace",
-        )
+        mux_kwargs = {
+            "stdout": subprocess.DEVNULL,
+            # Mux progress is polled through proc.poll(); an undrained
+            # stderr PIPE can block FFmpeg before it reaches that point.
+            "stderr": subprocess.DEVNULL,
+            "encoding": "utf-8",
+            "errors": "replace",
+        }
+        mux_kwargs.update(process_group_popen_kwargs())
+        proc = subprocess.Popen(cmd, **mux_kwargs)
+        if supervisor is not None:
+            supervisor.register(proc, "mux")
         try:
             stderr_tail = ""
             try:
@@ -1473,13 +1821,10 @@ def _mux_audio(ffmpeg_path, input_path, output_path, audio_codec="copy",
                             except Exception:
                                 pass
                         return False
+                    # No leer stderr aquí: read() bloquearía hasta que
+                    # FFmpeg terminase y haría imposible observar abort_event.
                     time.sleep(0.1)
-                    # Capturamos stderr para diagnóstico si algo falla al final.
-                    try:
-                        stderr_text = proc.stderr.read() or ""
-                        stderr_tail = stderr_text[-512:]
-                    except Exception:
-                        stderr_tail = ""
+                stderr_tail = ""
             except Exception:
                 logger.exception("Unexpected error during mux polling")
                 if os.path.exists(tmp_out):

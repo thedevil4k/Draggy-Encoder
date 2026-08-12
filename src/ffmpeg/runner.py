@@ -1,13 +1,20 @@
+from __future__ import annotations
+
 import collections
 import logging
 import os
 import re
 import subprocess
 import threading
+import time
 from datetime import datetime
 
 from src.config import get_bin_dir, resolve_codec
 from src.ffmpeg.manager import get_ffprobe_path
+from src.ffmpeg.process_supervisor import (
+    ProcessSupervisor,
+    process_group_popen_kwargs,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -86,15 +93,16 @@ def _parse_time_to_seconds(value):
 # ffmpeg imprime en su progreso). `errors="replace"` reemplaza los caracteres
 # no decodificables por '?' sin abortar el proceso.
 def _popen_kwargs():
-    return {
+    kwargs = {
         "stdin": subprocess.DEVNULL,
         "stdout": subprocess.PIPE,
         "stderr": subprocess.STDOUT,
         "bufsize": 1,
         "encoding": "utf-8",
         "errors": "replace",
-        "creationflags": subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
     }
+    kwargs.update(process_group_popen_kwargs())
+    return kwargs
 
 
 def _run_kwargs():
@@ -118,7 +126,7 @@ _FFMPEG_POLL_INTERVAL_S = 0.25
 
 
 def run_ffmpeg(ffmpeg_path, args, progress_callback=None, abort_event=None,
-               on_process=None):
+               on_process=None, supervisor: ProcessSupervisor | None = None):
     """Ejecuta ffmpeg con los argumentos dados y opcionalmente reporta progreso.
 
     Devuelve ``True`` si ffmpeg terminó con ``returncode == 0`` y ``False`` en
@@ -134,6 +142,8 @@ def run_ffmpeg(ffmpeg_path, args, progress_callback=None, abort_event=None,
     """
     cmd = [ffmpeg_path] + args
     process = subprocess.Popen(cmd, **_popen_kwargs())
+    if supervisor is not None:
+        supervisor.register(process, "ffmpeg")
     if on_process is not None:
         try:
             on_process(process)
@@ -349,8 +359,9 @@ def health_check_ffmpeg(ffmpeg_path, timeout=10):
     return False, None, "Binary responded but no version line was found"
 
 
-def extract_frame(ffmpeg_path, video_path, time_sec, output_path):
-    """Extrae un frame a una imagen usando input seeking para velocidad."""
+def extract_frame(ffmpeg_path, video_path, time_sec, output_path,
+                  abort_event=None, supervisor: ProcessSupervisor | None = None):
+    """Extrae un frame sin dejar un ffmpeg bloqueado durante un abort."""
     cmd = [
         ffmpeg_path,
         "-ss", str(time_sec),
@@ -360,11 +371,56 @@ def extract_frame(ffmpeg_path, video_path, time_sec, output_path):
         "-y",
         output_path,
     ]
+    proc = None
     try:
-        result = subprocess.run(cmd, timeout=60, **_run_kwargs())
-        return result.returncode == 0
+        kwargs = _run_kwargs()
+        kwargs.pop("capture_output", None)
+        # This helper only needs the exit code and output image. Keeping
+        # FFmpeg's verbose stderr in an undrained pipe can deadlock the
+        # process on Windows once that pipe fills (the full build prints a
+        # multi-kilobyte banner even for a one-frame extraction).
+        kwargs.update({"stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL})
+        kwargs.update(process_group_popen_kwargs())
+        proc = subprocess.Popen(cmd, **kwargs)
+        if supervisor is not None:
+            supervisor.register(proc, "frame-extract")
+        deadline = time.monotonic() + 60
+        while proc.poll() is None:
+            if abort_event and abort_event.is_set():
+                if supervisor is not None:
+                    supervisor.stop_all(grace_seconds=1, kill_seconds=1)
+                else:
+                    proc.terminate()
+                    try:
+                        proc.wait(timeout=2)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
+                        proc.wait(timeout=2)
+                return False
+            if time.monotonic() >= deadline:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait(timeout=2)
+                return False
+            time.sleep(0.1)
+        ok = proc.returncode == 0
+        if not ok:
+            try:
+                logger.warning("Frame extraction failed: %s", (proc.stderr.read() or "")[-512:])
+            except Exception:
+                pass
+        return ok
     except Exception:
         return False
+    finally:
+        if proc is not None:
+            try:
+                proc.stderr.close()
+            except Exception:
+                pass
 
 
 def build_args(input_path, output_path, settings, loudnorm_meas=None):

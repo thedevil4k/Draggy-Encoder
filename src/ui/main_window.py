@@ -26,7 +26,15 @@ from PySide6.QtWidgets import (
 from src.config import APP_NAME, get_asset_path
 import src.preferences as preferences
 from src.ffmpeg.runner import get_video_info, health_check_ffmpeg
-from src.processing.pipeline import compress_video, compress_video_with_ai, generate_preview
+from src.ffmpeg.process_supervisor import ProcessSupervisor
+from src.processing.pipeline import (
+    compress_video,
+    compress_video_with_ai,
+    generate_preview,
+    validate_ai_chain_contract,
+    validate_render_preflight,
+    validate_render_output,
+)
 from src.last_job import has_last_job as has_pending_last_job
 from src.last_job import load_last_job as load_pending_last_job
 from src.last_job import save_last_job as persist_last_job
@@ -191,12 +199,14 @@ class CompressionWorker(QThread):
         self.preview_original = None
         self.preview_compressed = None
         self._procs = []
+        self.supervisor = ProcessSupervisor()
 
     def _register_process(self, process, role="ffmpeg"):
         """Keep every child process visible to the abort/close path."""
         if process is None:
             return
         self._procs.append(process)
+        self.supervisor.register(process, role)
         if role != "decoder":
             self._proc = process
 
@@ -204,6 +214,16 @@ class CompressionWorker(QThread):
         try:
             status_cb = self._emit_status
             phase_cb = self._emit_phase
+            preflight_errors = validate_render_preflight(
+                self.ffmpeg_path,
+                self.input_path,
+                self.output_path if self.mode == "compress" else None,
+                self.settings,
+            )
+            if preflight_errors:
+                self.error_message = "Preflight failed: " + " ".join(preflight_errors)
+                self.status_message.emit(self.error_message)
+                return
             # Determine if the AI chain should be used: any active workflow
             # node with an engine id (Upscale, Interp, Denoise, Colorize,
             # FaceRestore — in the re-ordered chain position).
@@ -259,9 +279,10 @@ class CompressionWorker(QThread):
                         progress_callback=self._emit_progress,
                         status_callback=status_cb,
                         abort_event=self.abort_event,
-                        on_process=lambda p: setattr(self, "_proc", p),
+                        on_process=self._register_process,
                         on_processes=self._register_process,
                         phase_cb=phase_cb,
+                        supervisor=self.supervisor,
                     )
                 else:
                     status_cb("AI preview: rendering the selected chain...")
@@ -274,9 +295,10 @@ class CompressionWorker(QThread):
                         ai_engines=self.ai_engines,
                         inference_engines=engines,
                         abort_event=self.abort_event,
-                        on_process=lambda p: setattr(self, "_proc", p),
+                        on_process=self._register_process,
                         on_processes=self._register_process,
                         phase_cb=phase_cb,
+                        supervisor=self.supervisor,
                     )
                     self.success = bool(
                         self.preview_original and self.preview_compressed
@@ -291,8 +313,9 @@ class CompressionWorker(QThread):
                     status_callback=status_cb,
                     ai_engines=self.ai_engines,
                     abort_event=self.abort_event,
-                    on_process=lambda p: setattr(self, "_proc", p),
+                    on_process=self._register_process,
                     phase_cb=phase_cb,
+                    supervisor=self.supervisor,
                 )
             elif self.mode == "preview":
                 self.preview_original, self.preview_compressed = generate_preview(
@@ -303,9 +326,10 @@ class CompressionWorker(QThread):
                     status_callback=status_cb,
                     ai_engines=self.ai_engines,
                     abort_event=self.abort_event,
-                    on_process=lambda p: setattr(self, "_proc", p),
+                    on_process=self._register_process,
                     on_processes=self._register_process,
                     phase_cb=phase_cb,
+                    supervisor=self.supervisor,
                 )
                 self.success = bool(
                     self.preview_original and self.preview_compressed
@@ -631,6 +655,21 @@ class CompressionWorker(QThread):
                 "AI chain partially loaded; %d node(s) skipped: %s",
                 len(errors), " | ".join(errors),
             )
+
+        # Contracto estricto de la cadena: cada engine debe consumir y
+        # devolver frames BGR uint8 (H, W, 3). Un nodo que devuelve RGB,
+        # otro número de canales o cambia la resolución sin ser un
+        # upscaler se detecta AHORA (con un frame de prueba barato), no
+        # en el frame 5000 del render. Se degrada a warning: el render
+        # sigue siendo posible si el usuario lo desea.
+        try:
+            validate_ai_chain_contract(engines)
+            status_cb("AI chain contract validated (BGR/uint8/HWC)")
+        except RuntimeError as exc:
+            logger.warning("AI chain contract violation: %s", exc)
+            status_cb(f"Warning: {exc}")
+        except Exception as exc:
+            logger.warning("AI chain contract probe failed: %s", exc)
         return engines, labels
 
 
@@ -2116,6 +2155,17 @@ class MainWindow(QMainWindow):
         if not task_id:
             return
         self.tasks_panel.update_phase_event(task_id, ev)
+        if getattr(self, "_queue_active", False):
+            try:
+                import src.task_queue as task_queue
+                phase_id = str(ev.get("id", ""))
+                phase_ev = str(ev.get("ev", ""))
+                if phase_ev == "failed":
+                    task_queue.set_status(task_id, "failed", error=ev.get("msg", ""))
+                elif phase_id == "mux" and phase_ev in ("start", "progress"):
+                    task_queue.set_status(task_id, "muxing")
+            except Exception:
+                pass
         try:
             import src.task_history as task_history
             phase_status = {
@@ -2149,7 +2199,13 @@ class MainWindow(QMainWindow):
         """Carga el histórico persistente de tareas en el panel."""
         try:
             import src.task_history as task_history
+            interrupted = task_history.recover_interrupted_tasks()
             self.tasks_panel.rebuild(task_history.list_tasks(limit=50))
+            if interrupted:
+                self._on_status_message(
+                    f"{interrupted} task(s) from a previous session were marked "
+                    "as interrupted (the app closed before they finished)."
+                )
         except Exception:
             pass
 
@@ -2167,6 +2223,19 @@ class MainWindow(QMainWindow):
         """Carga la cola persistente en la pestaña Queue (arranque)."""
         try:
             import src.task_queue as task_queue
+            recovered = task_queue.recover_interrupted()
+            from src.processing.pipeline import cleanup_stale_staging
+            stale = cleanup_stale_staging()
+            if stale:
+                self._on_status_message(
+                    f"Cleaned up {stale} abandoned temporary file(s) from a "
+                    "previous session."
+                )
+            if recovered:
+                self._on_status_message(
+                    f"{recovered} queued render(s) recovered after an interrupted "
+                    "session and marked for retry."
+                )
             self.tasks_panel.rebuild_queue(task_queue.list_items())
         except Exception:
             self.tasks_panel.rebuild_queue([])
@@ -2432,13 +2501,24 @@ class MainWindow(QMainWindow):
             return
 
         # ---------------- Standard worker-finished -----------------
+        # Publishing is a distinct state: only enter it after all render
+        # phases passed and before the atomic rename.
+        if worker.success and getattr(self, "_queue_active", False):
+            try:
+                import src.task_queue as task_queue
+                task_queue.set_status(worker.task_id, "publishing")
+            except Exception:
+                pass
         # Publish the staged file only after every pipeline stage succeeded.
         if worker.success and getattr(worker, "final_output_path", None):
             staged = getattr(worker, "output_path", None)
             final = worker.final_output_path
-            if not staged or not os.path.exists(staged) or os.path.getsize(staged) <= 0:
+            valid, detail = validate_render_output(
+                self.ffmpeg_path, staged,
+            ) if staged else (False, "Render produced no staging path.")
+            if not valid:
                 worker.success = False
-                worker.error_message = "Render finished without a valid output file."
+                worker.error_message = f"Render finished with invalid output: {detail}"
             else:
                 try:
                     os.replace(staged, final)
@@ -2547,15 +2627,22 @@ class MainWindow(QMainWindow):
                 worker.abort_event.set()
         except Exception:
             pass
-        # 2) Bounded wait. run_ffmpeg polls every stdout line so this
-        #    finishes within microseconds for short clips.
-        if not worker.wait(5000):
-            # 3) Last-resort: force-terminate the QThread wrapper.
+        # 2) Stop the complete process tree, not only the last Popen.
+        #    This covers decoder, encoder, audio and mux children even when
+        #    one of them is blocked on a pipe and cannot observe the event.
+        try:
+            worker.supervisor.stop_all(grace_seconds=2.0, kill_seconds=2.0)
+        except Exception:
+            pass
+        # 3) Wait for Python cleanup. QThread.terminate() remains an absolute
+        #    last resort only; normally the supervisor makes the worker leave
+        #    every blocking read and lets its finally blocks run.
+        if not worker.wait(8000):
             try:
                 worker.terminate()
             except Exception:
                 pass
-        worker.wait(2000)
+            worker.wait(2000)
         # 3b) Direct child-process kill: when ``worker.terminate()``
         #     runs, the Python wrapper thread dies, but the ffmpeg
         #     ``subprocess.Popen`` child can survive (signals don't

@@ -17,10 +17,19 @@ It must NOT import anything back from pipeline.py or anything that imports
 pipeline.py, to avoid a circular dependency.
 """
 
+from __future__ import annotations
+
 import json
 import os
 import re
 import subprocess
+import threading
+import time
+
+from src.ffmpeg.process_supervisor import (
+    ProcessSupervisor,
+    process_group_popen_kwargs,
+)
 from datetime import datetime
 
 from src.config import get_bin_dir
@@ -49,7 +58,8 @@ def _append_log(status, detail):
 
 
 def measure_loudness(ffmpeg_path, input_path, timeout_seconds=600,
-                       start_time=None, end_time=None, status_callback=None):
+                       start_time=None, end_time=None, status_callback=None,
+                       abort_event=None, supervisor: ProcessSupervisor | None = None):
     """Run pass-1 loudnorm measurement and return parsed JSON dict, or None.
 
     Returns a dict with keys: input_i, input_tp, input_lra, input_thresh,
@@ -91,23 +101,76 @@ def measure_loudness(ffmpeg_path, input_path, timeout_seconds=600,
         "-",
     ])
 
+    proc = None
     try:
-        result = subprocess.run(cmd, timeout=timeout_seconds, **_run_kwargs())
+        kwargs = _run_kwargs()
+        kwargs.pop("capture_output", None)
+        # The JSON is emitted on stderr, so drain it concurrently. Waiting
+        # for poll() before reading a PIPE can deadlock when FFmpeg's banner
+        # and filter diagnostics exceed the Windows pipe buffer.
+        kwargs.update({"stdout": subprocess.DEVNULL, "stderr": subprocess.PIPE})
+        kwargs.update(process_group_popen_kwargs())
+        proc = subprocess.Popen(cmd, **kwargs)
+        if supervisor is not None:
+            supervisor.register(proc, "loudnorm")
+        stderr_chunks = []
+
+        def _drain_stderr():
+            try:
+                for line in iter(proc.stderr.readline, ""):
+                    if line:
+                        stderr_chunks.append(line)
+            except (ValueError, OSError):
+                pass
+
+        stderr_reader = threading.Thread(target=_drain_stderr, daemon=True, name="loudnorm-stderr")
+        stderr_reader.start()
+        deadline = time.monotonic() + timeout_seconds
+        while proc.poll() is None:
+            if abort_event and abort_event.is_set():
+                if supervisor is not None:
+                    supervisor.stop_all(grace_seconds=1, kill_seconds=1)
+                else:
+                    proc.terminate()
+                    try:
+                        proc.wait(timeout=2)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
+                        proc.wait(timeout=2)
+                stderr_reader.join(timeout=2)
+                return None
+            if time.monotonic() >= deadline:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait(timeout=2)
+                stderr_reader.join(timeout=2)
+                _append_log("FAIL", f"timeout after {timeout_seconds}s ({input_path})")
+                return None
+            time.sleep(0.1)
+        stderr_reader.join(timeout=2)
+        stderr = "".join(stderr_chunks)
     except subprocess.TimeoutExpired:
+        try:
+            proc.kill()
+        except Exception:
+            pass
         _append_log("FAIL", f"timeout after {timeout_seconds}s ({input_path})")
         return None
     except Exception as exc:
         _append_log("FAIL", f"subprocess exception: {exc} ({input_path})")
         return None
 
-    if result.returncode != 0:
+    if proc.returncode != 0:
         # Truncar stderr para no saturar el log
-        short = (result.stderr or "").strip().splitlines()[-3:]
+        short = (stderr or "").strip().splitlines()[-3:]
         reason = " || ".join(s.strip() for s in short if s.strip())[:300]
-        _append_log("FAIL", f"rc={result.returncode} | {reason}")
+        _append_log("FAIL", f"rc={proc.returncode} | {reason}")
         return None
 
-    stderr = result.stderr or ""
+    stderr = stderr or ""
     # El filtro loudnorm imprime siempre un único bloque JSON cuyo primer key
     # es ``input_i``. Un match no-greedy nos mantiene dentro de ese bloque
     # incluso si ffmpeg imprime texto adicional después.
