@@ -1,6 +1,7 @@
 import os
 import sys
 import threading
+import tempfile
 import time
 
 from PySide6.QtCore import QThread, QTimer, Qt, Signal
@@ -170,9 +171,8 @@ class CompressionWorker(QThread):
         self.mode = mode
         # Optional mapping {"Upscale": "upscale-realesrgan-x4plus", ...}.
         # Source of truth is the WorkflowWidget at click time. Empty
-        # means "no AI steps active right now". The pipeline logs the
-        # selection so the user sees the chain wired end-to-end even
-        # before real inference is hooked up.
+        # means "no AI steps active right now". Compression and preview
+        # resolve this snapshot into the same loaded inference chain.
         self.ai_engines = ai_engines
         # Cross-thread abort signal: setting this from the GUI thread
         # causes ``run_ffmpeg`` to terminate() the ffmpeg subprocess
@@ -190,6 +190,15 @@ class CompressionWorker(QThread):
         self.error_message = ""
         self.preview_original = None
         self.preview_compressed = None
+        self._procs = []
+
+    def _register_process(self, process, role="ffmpeg"):
+        """Keep every child process visible to the abort/close path."""
+        if process is None:
+            return
+        self._procs.append(process)
+        if role != "decoder":
+            self._proc = process
 
     def run(self):
         try:
@@ -208,11 +217,11 @@ class CompressionWorker(QThread):
                     use_ai = True
                     break
 
-            if self.mode == "compress" and use_ai:
-                # Build the AI CHAIN: each active workflow node (Upscale,
-                # Interp, Denoise, Colorize, FaceRestore) resolves to a
-                # loaded engine, in the re-ordered chain position. Engines
-                # that cannot be loaded fail fast with a clear message.
+            if use_ai and self.mode in ("compress", "preview"):
+                # Build the same AI CHAIN for compression and preview. The
+                # preview must not silently fall back to an FFmpeg-only clip:
+                # otherwise it shows a result different from the render the
+                # user is about to launch.
                 try:
                     engines, chain_labels = self._build_ai_chain(status_cb)
                 except Exception as exc:
@@ -228,32 +237,50 @@ class CompressionWorker(QThread):
 
                 # Escala total de la cadena = producto de los factores de
                 # escala de las engines que realmente upscalean. Se inyecta
-                # en settings para que el encoder dimensione correctamente.
+                # en settings para que tanto render como preview dimensionen
+                # correctamente el encoder.
                 from src.processing.pipeline import _compute_total_scale
                 total_scale = _compute_total_scale(engines)
                 self.settings["ai_scale"] = total_scale
-                # "Model native": el nodo pide la resolución tal cual el
-                # modelo la produce. La pipeline medirá el frame real de la
-                # cadena para dimensionar el encoder (sin re-encaje).
                 self.settings["ai_native"] = any(
                     isinstance(v, dict) and bool(v.get("native"))
                     for v in (self.ai_engines or {}).values()
                 )
 
                 status_cb("AI chain: " + " -> ".join(chain_labels))
-                status_cb("AI chain: frame-by-frame processing...")
-                self.success = compress_video_with_ai(
-                    self.ffmpeg_path,
-                    self.input_path,
-                    self.output_path,
-                    self.settings,
-                    inference_engines=engines,
-                    progress_callback=self._emit_progress,
-                    status_callback=status_cb,
-                    abort_event=self.abort_event,
-                    on_process=lambda p: setattr(self, "_proc", p),
-                    phase_cb=phase_cb,
-                )
+                if self.mode == "compress":
+                    status_cb("AI chain: frame-by-frame processing...")
+                    self.success = compress_video_with_ai(
+                        self.ffmpeg_path,
+                        self.input_path,
+                        self.output_path,
+                        self.settings,
+                        inference_engines=engines,
+                        progress_callback=self._emit_progress,
+                        status_callback=status_cb,
+                        abort_event=self.abort_event,
+                        on_process=lambda p: setattr(self, "_proc", p),
+                        on_processes=self._register_process,
+                        phase_cb=phase_cb,
+                    )
+                else:
+                    status_cb("AI preview: rendering the selected chain...")
+                    self.preview_original, self.preview_compressed = generate_preview(
+                        self.ffmpeg_path,
+                        self.input_path,
+                        self.settings,
+                        progress_callback=self._emit_progress,
+                        status_callback=status_cb,
+                        ai_engines=self.ai_engines,
+                        inference_engines=engines,
+                        abort_event=self.abort_event,
+                        on_process=lambda p: setattr(self, "_proc", p),
+                        on_processes=self._register_process,
+                        phase_cb=phase_cb,
+                    )
+                    self.success = bool(
+                        self.preview_original and self.preview_compressed
+                    )
             elif self.mode == "compress":
                 self.success = compress_video(
                     self.ffmpeg_path,
@@ -277,9 +304,12 @@ class CompressionWorker(QThread):
                     ai_engines=self.ai_engines,
                     abort_event=self.abort_event,
                     on_process=lambda p: setattr(self, "_proc", p),
+                    on_processes=self._register_process,
                     phase_cb=phase_cb,
                 )
-                self.success = bool(self.preview_original and self.preview_compressed)
+                self.success = bool(
+                    self.preview_original and self.preview_compressed
+                )
                 if not self.success and not self.error_message:
                     self.error_message = "Could not generate preview frames"
         except Exception as exc:
@@ -411,72 +441,110 @@ class CompressionWorker(QThread):
                 inference_engine = None
                 node_errors = []
 
-                # 1) Existing .onnx next to .pth or from registry
-                onnx_path = None
-                if pth_path:
-                    candidate = os.path.splitext(pth_path)[0] + ".onnx"
-                    if os.path.exists(candidate):
-                        onnx_path = candidate
-                if not onnx_path:
-                    onnx_path = get_model_path(eid, "onnxruntime")
-                if onnx_path:
-                    try:
-                        engine_candidate = create_inference_engine("onnxruntime", onnx_path)
-                    except Exception as exc:
-                        node_errors.append(f"ONNX Runtime failed: {exc}")
-                    else:
-                        active_providers = getattr(engine_candidate, "get_active_providers", None)
-                        active = (
-                            active_providers()
-                            if callable(active_providers)
-                            else getattr(engine_candidate, "_providers", [])
-                        )
-                        if (
-                            "CUDAExecutionProvider" not in active
-                            and "TensorrtExecutionProvider" not in active
-                            and pth_path
-                            and is_torch_available()
-                        ):
-                            try:
-                                torch_engine = PyTorchInferenceEngine(pth_path, eid)
-                                if torch_engine.load():
-                                    inference_engine = torch_engine
-                                else:
-                                    node_errors.append(
-                                        "PyTorch load failed; keeping ONNX Runtime (CPU)"
-                                    )
-                                    inference_engine = engine_candidate
-                            except Exception as exc:
-                                node_errors.append(f"PyTorch (CUDA) failed: {exc}")
-                                inference_engine = engine_candidate
-                        else:
-                            inference_engine = engine_candidate
+                # Backend de inferencia del motor. ``_get_backend`` es la
+                # PREFERENCIA del usuario ("auto"|"torch"|"onnxruntime");
+                # ``_resolve_backend`` la convierte en el backend CONCRETO:
+                #   "auto"        -> el más rápido medido (ONNX vs PyTorch)
+                #                    cuando existen benchmarks de ambos en
+                #                    este equipo; si no, ONNX si hay .onnx
+                #                    (GPU si es posible), si no PyTorch
+                #   "torch"       -> forzar PyTorch: nunca usar .onnx ni
+                #                    auto-convertir
+                #   "onnxruntime" -> forzar ONNX: buscar/convertir .onnx;
+                #                    nunca caer a PyTorch
+                from src.ai.engines_state import get_backend as _get_backend
+                from src.ai.engines_state import resolve_backend as _resolve_backend
+                backend = _get_backend(eid)
+                effective = _resolve_backend(eid)
+                use_onnx = effective in ("auto", "onnxruntime")
 
-                # 2) Convert .pth -> .onnx (needs torch)
-                if inference_engine is None or not getattr(inference_engine, "is_loaded", False):
-                    if pth_path and is_torch_available():
-                        onnx_converted, conv_error = convert_pth_to_onnx_ex(pth_path)
-                        if onnx_converted:
-                            try:
-                                inference_engine = create_inference_engine("onnxruntime", onnx_converted)
-                            except Exception as exc:
-                                node_errors.append(f"ONNX converted but load failed: {exc}")
-                        elif conv_error:
-                            node_errors.append(
-                                f"ONNX conversion skipped for {eid}: {conv_error}"
-                            )
-                    elif pth_path:
-                        node_errors.append(
-                            "PyTorch is not installed (required to convert .pth to ONNX)"
-                        )
-
-                # 3) PyTorch direct
-                if inference_engine is None or not getattr(inference_engine, "is_loaded", False):
-                    if pth_path and is_torch_available():
+                if use_onnx:
+                    # 1) Existing .onnx next to .pth or from registry
+                    onnx_path = None
+                    if pth_path:
+                        candidate = os.path.splitext(pth_path)[0] + ".onnx"
+                        if os.path.exists(candidate):
+                            onnx_path = candidate
+                    if not onnx_path:
+                        onnx_path = get_model_path(eid, "onnxruntime")
+                    if onnx_path:
                         try:
-                            inference_engine = create_inference_engine("torch", pth_path)
+                            engine_candidate = create_inference_engine("onnxruntime", onnx_path)
+                        except Exception as exc:
+                            node_errors.append(f"ONNX Runtime failed: {exc}")
+                        else:
+                            active_providers = getattr(engine_candidate, "get_active_providers", None)
+                            active = (
+                                active_providers()
+                                if callable(active_providers)
+                                else getattr(engine_candidate, "_providers", [])
+                            )
+                            prefer_torch_over_cpu_onnx = (
+                                effective == "auto"
+                                and "CUDAExecutionProvider" not in active
+                                and "TensorrtExecutionProvider" not in active
+                                and pth_path
+                                and is_torch_available()
+                            )
+                            if prefer_torch_over_cpu_onnx:
+                                try:
+                                    torch_engine = PyTorchInferenceEngine(pth_path, eid)
+                                    if torch_engine.load():
+                                        inference_engine = torch_engine
+                                    else:
+                                        node_errors.append(
+                                            "PyTorch load failed; keeping ONNX Runtime (CPU)"
+                                        )
+                                        inference_engine = engine_candidate
+                                except Exception as exc:
+                                    node_errors.append(f"PyTorch (CUDA) failed: {exc}")
+                                    inference_engine = engine_candidate
+                            else:
+                                inference_engine = engine_candidate
+
+                    # 2) Convert .pth -> .onnx (needs torch)
+                    if inference_engine is None or not getattr(inference_engine, "is_loaded", False):
+                        if pth_path and is_torch_available():
+                            onnx_converted, conv_error = convert_pth_to_onnx_ex(pth_path)
+                            if onnx_converted:
+                                try:
+                                    inference_engine = create_inference_engine("onnxruntime", onnx_converted)
+                                except Exception as exc:
+                                    node_errors.append(f"ONNX converted but load failed: {exc}")
+                            elif conv_error:
+                                node_errors.append(
+                                    f"ONNX conversion skipped for {eid}: {conv_error}"
+                                )
+                        elif pth_path:
+                            node_errors.append(
+                                "PyTorch is not installed (required to convert .pth to ONNX)"
+                            )
+
+                # 3) PyTorch direct (backend 'torch' o 'auto' sin ONNX)
+                if (
+                    (inference_engine is None or not getattr(inference_engine, "is_loaded", False))
+                    and effective in ("auto", "torch")
+                ):
+                    # Si el usuario eligió un archivo .onnx en el workflow
+                    # pero forzó PyTorch, resolver el peso torch del engine.
+                    torch_path = pth_path
+                    if torch_path and torch_path.lower().endswith(".onnx"):
+                        torch_path = get_model_path(eid, "torch")
+                    if torch_path and is_torch_available():
+                        try:
+                            inference_engine = create_inference_engine("torch", torch_path)
                         except Exception as exc:
                             node_errors.append(f"PyTorch fallback failed: {exc}")
+                    elif effective == "torch":
+                        if not torch_path:
+                            node_errors.append(
+                                "Backend 'PyTorch' needs a .pth/.safetensors weight file; "
+                                "only .onnx is present in the model folder."
+                            )
+                        elif not is_torch_available():
+                            node_errors.append(
+                                "Backend forced to PyTorch but PyTorch is not installed."
+                            )
 
                 if inference_engine is None or not getattr(inference_engine, "is_loaded", False):
                     detail = " | ".join(node_errors) if node_errors else "No model weights found."
@@ -486,6 +554,24 @@ class CompressionWorker(QThread):
                             "This engine has no weight files installed. Open "
                             "Manage Dependencies → Runtimes & Binaries and click "
                             "'Add Engine' on the model row to download them."
+                        )
+                    if backend == "onnxruntime":
+                        hint += (
+                            "\nThis engine is set to 'ONNX Runtime' in the AI Engines "
+                            "tab. The .pth is converted to .onnx automatically; if "
+                            "that failed, switch to 'Auto' or 'PyTorch' in Manage "
+                            "Dependencies → Runtimes & Binaries."
+                        )
+                    elif backend == "torch":
+                        hint += (
+                            "\nThis engine is set to 'PyTorch' in the AI Engines tab."
+                        )
+                    elif effective == "onnxruntime":
+                        hint += (
+                            "\nAuto chose ONNX Runtime (fastest measured on this "
+                            "machine) but it could not be loaded. Switch to "
+                            "'PyTorch' in Manage Dependencies → Runtimes & Binaries "
+                            "to force the PyTorch backend."
                         )
                     raise RuntimeError(
                         f"{node_label} could not load.\nDetails: {detail}\n{hint}"
@@ -1972,10 +2058,26 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
 
+        # Compress runs against a same-directory staging path. The final
+        # filename is published with os.replace only after the worker reports
+        # success, so cancellation, encoder failure or a power loss cannot
+        # leave a truncated video under the user's chosen name.
+        worker_output = output_path
+        if output_path:
+            output_dir = os.path.dirname(os.path.abspath(output_path)) or "."
+            os.makedirs(output_dir, exist_ok=True)
+            ext = os.path.splitext(output_path)[1] or ".tmp"
+            fd, worker_output = tempfile.mkstemp(
+                prefix=".draggy-staging-", suffix=ext, dir=output_dir
+            )
+            os.close(fd)
+            self._try_remove(worker_output)
+
         self.worker = CompressionWorker(
-            self.ffmpeg_path, src, output_path, settings,
+            self.ffmpeg_path, src, worker_output, settings,
             mode=mode, ai_engines=ai_engines,
         )
+        self.worker.final_output_path = output_path
         self.worker.task_id = self._current_task_id
         self.worker.progress.connect(self._on_worker_progress)
         self.worker.status_message.connect(self._on_status_message)
@@ -2330,6 +2432,21 @@ class MainWindow(QMainWindow):
             return
 
         # ---------------- Standard worker-finished -----------------
+        # Publish the staged file only after every pipeline stage succeeded.
+        if worker.success and getattr(worker, "final_output_path", None):
+            staged = getattr(worker, "output_path", None)
+            final = worker.final_output_path
+            if not staged or not os.path.exists(staged) or os.path.getsize(staged) <= 0:
+                worker.success = False
+                worker.error_message = "Render finished without a valid output file."
+            else:
+                try:
+                    os.replace(staged, final)
+                except Exception as exc:
+                    worker.success = False
+                    worker.error_message = f"Could not publish output atomically: {exc}"
+                    self._try_remove(staged)
+
         self.progress.setValue(100 if worker.success else 0)
         mode = getattr(worker, "mode", "compress")
         self._mark_task_finished("success" if worker.success else "failed")
@@ -2448,14 +2565,21 @@ class MainWindow(QMainWindow):
         #     to init and our program exits orphaning it. Killing
         #     ``worker._proc`` directly is the safety net the
         #     cooperative path would have set up.
+        # Kill every child known to the AI pipeline (decoder + encoder),
+        # not just the last encoder reference. This matters when the Python
+        # QThread has to be force-terminated while the decoder is blocked
+        # in a raw pipe read.
+        processes = list(getattr(worker, "_procs", []) or [])
         proc = getattr(worker, "_proc", None)
-        if proc is not None:
+        if proc is not None and proc not in processes:
+            processes.append(proc)
+        for child in processes:
             try:
-                proc.kill()
+                child.kill()
             except Exception:
                 pass
             try:
-                proc.wait(timeout=2)
+                child.wait(timeout=2)
             except Exception:
                 pass
         # 4) Delete partial output. On Windows a freshly terminated

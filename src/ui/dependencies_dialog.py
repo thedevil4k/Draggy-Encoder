@@ -40,6 +40,7 @@ from src.ai.engines_state import (
     mark_onnx as engines_mark_onnx,
     mark_uninstalled as engines_mark_uninstalled,
     patch as engines_state_patch,
+    set_backend as engines_set_backend,
     clear_benchmark as engines_clear_benchmark,
 )
 from src.ai.fetcher import (
@@ -53,6 +54,22 @@ from src.ai.registry import CATALOG, get_engine_dir
 from src.ai.engines_state import dir_has_weights
 from src.config import get_logs_dir
 from src.ffmpeg.full_download_worker import FFmpegFullDownloadWorker
+
+
+# Fases del worker de conversión a mensajes amigables para la fila del
+# modelo (el usuario final no debe ver inglés técnico del worker).
+_CONVERT_STATUS_MAP = {
+    "Locating model weights...": "Buscando los pesos del modelo...",
+    "Converting to ONNX with torch.onnx.export...": "Convirtiendo a ONNX (torch.onnx.export)...",
+    "export complete": "Conversión completada.",
+}
+
+
+def _friendly_convert_status(raw: str) -> str:
+    """Traduce las fases crudas del OnnxConvertWorker a español."""
+    return _CONVERT_STATUS_MAP.get(str(raw or "").strip(), str(raw or ""))
+
+
 from src.ffmpeg.manager import (
     get_local_ffmpeg_full_path,
     has_libplacebo_support,
@@ -173,11 +190,12 @@ class _EngineRemoveWorker(QThread):
 
 
 class _BenchmarkWorker(QThread):
-    """Mide ms/frame de un motor recién instalado en background.
+    """Mide ms/frame de UN motor (ambos backends) en background.
 
-    Silencioso a propósito: solo alimenta la caché de benchmarks que usa
-    el ETA del render. Si falla (motor sin pesos, libs sin cargar) no
-    perturbamos el flujo de instalación.
+    Silencioso a propósito: alimenta la caché de benchmarks que usa el
+    selector de backend de la fila (ONNX vs PyTorch) y el ETA del render.
+    Si un backend no se puede medir (sin .onnx, torch no instalado, ...)
+    se salta; no perturbamos el flujo de instalación/conversión.
     """
 
     def __init__(self, engine_id, target_dir, parent=None):
@@ -187,8 +205,16 @@ class _BenchmarkWorker(QThread):
 
     def run(self):
         try:
-            from src.ai.benchmark import benchmark_engine
-            benchmark_engine(self.engine_id, target_dir=self.target_dir, use_cache=False)
+            from src.ai.benchmark import benchmark_backend
+            for backend in ("onnx", "torch"):
+                try:
+                    benchmark_backend(
+                        self.engine_id, backend,
+                        target_dir=self.target_dir,
+                        use_cache=True,
+                    )
+                except Exception:
+                    pass
         except Exception:
             pass
 
@@ -216,7 +242,7 @@ class _UpstreamCheckWorker(QThread):
             pass
         # Warm-up del probe libplacebo (spawn de ``ffmpeg -filters``,
         # ~250 ms la primera vez). Correrlo aquí evita que el primer
-        # ``get_state()`` de los engines FSR 2.0/3.1 bloquee la GUI con
+        # ``get_state()`` de los engines FSR 3.1 no bloquee la GUI con
         # un subproceso síncrono en el hilo principal.
         try:
             from src.ffmpeg.manager import has_libplacebo_support
@@ -527,8 +553,8 @@ class DependenciesDialog(QDialog):
         # el destructor del QThread libera solo).
         self._git_worker = None
         self._onnx_worker = None
-        # Worker de descarga de FFmpeg "full" para FSR 2.0 (libplacebo).
-        self._fsr2_worker = None
+        # Worker de descarga de FFmpeg "full" para FSR 3.1 (libplacebo).
+        self._fsr31_worker = None
         # Worker de borrado de motores IA (modelos / FFmpeg full).
         self._remove_worker = None
         # Tab a enfocar en el primer paint ("ai_engines" o "binaries").
@@ -687,8 +713,10 @@ class DependenciesDialog(QDialog):
         try:
             tab = EnginesTab(self)
             tab.install_requested.connect(self._on_engine_install)
-            tab.fsr2_download_requested.connect(self._on_fsr2_download)
+            tab.fsr31_download_requested.connect(self._on_fsr31_download)
             tab.convert_requested.connect(self._on_engine_convert)
+            tab.backend_changed.connect(self._on_engine_backend_changed)
+            tab.cancel_convert_requested.connect(self._on_engine_cancel_convert)
             tab.open_folder.connect(self._on_engine_open_folder)
             tab.remove_requested.connect(self._on_engine_remove)
             return tab
@@ -980,8 +1008,10 @@ class DependenciesDialog(QDialog):
             self.tabs.removeTab(current_index)
             self.engines_tab = EnginesTab(self)
             self.engines_tab.install_requested.connect(self._on_engine_install)
-            self.engines_tab.fsr2_download_requested.connect(self._on_fsr2_download)
+            self.engines_tab.fsr31_download_requested.connect(self._on_fsr31_download)
             self.engines_tab.convert_requested.connect(self._on_engine_convert)
+            self.engines_tab.backend_changed.connect(self._on_engine_backend_changed)
+            self.engines_tab.cancel_convert_requested.connect(self._on_engine_cancel_convert)
             self.engines_tab.open_folder.connect(self._on_engine_open_folder)
             self.engines_tab.remove_requested.connect(self._on_engine_remove)
             self.tabs.insertTab(current_index, self.engines_tab, "AI Engines")
@@ -1127,20 +1157,11 @@ class DependenciesDialog(QDialog):
         except Exception:
             logger.exception("Failed to enrich user model record for %s", engine_id)
 
-        # Benchmark en background: alimenta la caché ms/frame que usa el
-        # ETA del render (y la línea "Estimated AI time" del worker).
-        # Guard: si ya hay un benchmark en marcha (instalación anterior
-        # no terminó), no lanzar otro — la caché quedaría con carrera.
-        bench_running = (
-            getattr(self, "_bench_worker", None) is not None
-            and self._bench_worker.isRunning()
-        )
-        if has_weights and not bench_running:
-            self._bench_worker = _BenchmarkWorker(engine_id, target_dir, parent=self)
-            self._bench_worker.finished.connect(
-                lambda: setattr(self, "_bench_worker", None)
-            )
-            self._bench_worker.start()
+        # Benchmark en background: mide ONNX y PyTorch para que el selector
+        # de backend de la fila compare ms/frame y el ETA del render tenga
+        # datos. Guard: si ya hay un benchmark en marcha no lanzar otro.
+        if has_weights:
+            self._maybe_benchmark_backends(engine_id, target_dir)
 
         self._refresh_engines_tab()
         QMessageBox.information(
@@ -1239,25 +1260,28 @@ class DependenciesDialog(QDialog):
             )
 
     # -----------------------------------------------------------------
-    # FSR 2.0 install flow (downloads FFmpeg full + libplacebo)
+    # FSR 3.1 install flow (downloads FFmpeg full + libplacebo)
     # -----------------------------------------------------------------
 
-    _FSR2_ENGINE_IDS = (
-        "upscale-fsr-2x-v2",
-        "upscale-fsr-3x-v2",
-        "upscale-fsr-4x-v2",
+    _FSR31_ENGINE_IDS = (
+        "upscale-fsr31-2x",
+        "upscale-fsr31-2x-interp",
+        "upscale-fsr31-3x",
+        "upscale-fsr31-3x-interp",
+        "upscale-fsr31-4x",
+        "upscale-fsr31-4x-interp",
     )
 
-    def _on_fsr2_download(self, engine_id: str) -> None:
-        """Handle 'Download FFmpeg' click on any FSR 2.0 row.
+    def _on_fsr31_download(self, engine_id: str) -> None:
+        """Handle 'Download FFmpeg' click on any FSR 3.1 row.
 
-        All three FSR 2.0 engines share the same FFmpeg-full binary at
+        All three FSR 3.1 engines share the same FFmpeg-full binary at
         ``bin/ffmpeg-full/ffmpeg.exe``. A single download marks all three
         rows as installed.
         """
-        if engine_id not in self._FSR2_ENGINE_IDS:
+        if engine_id not in self._FSR31_ENGINE_IDS:
             return
-        if self._fsr2_worker and self._fsr2_worker.isRunning():
+        if self._fsr31_worker and self._fsr31_worker.isRunning():
             QMessageBox.information(
                 self, "Busy",
                 "A FFmpeg-full download is already in progress.",
@@ -1268,16 +1292,16 @@ class DependenciesDialog(QDialog):
         # all three as ready without re-downloading.
         existing = get_local_ffmpeg_full_path()
         if os.path.exists(existing) and has_libplacebo_support(existing):
-            self._mark_fsr2_ready()
+            self._mark_fsr31_ready()
             QMessageBox.information(
-                self, "FSR 2.0 ready",
+                self, "FSR 3.1 ready",
                 "FFmpeg full with libplacebo is already installed.\n"
-                "All FSR 2.0 engines are ready to use.",
+                "All FSR 3.1 engines are ready to use.",
             )
             return
 
         progress = QProgressDialog(
-            "Downloading FFmpeg full (with libplacebo for FSR 2.0)...",
+            "Downloading FFmpeg full (with libplacebo for FSR 3.1)...",
             None, 0, 100, self,
         )
         progress.setWindowModality(Qt.WindowModality.WindowModal)
@@ -1285,39 +1309,39 @@ class DependenciesDialog(QDialog):
         progress.setAutoClose(False)
         progress.setWindowTitle("Downloading FFmpeg full")
 
-        self._fsr2_worker = FFmpegFullDownloadWorker(parent=self)
-        self._fsr2_worker.progress.connect(progress.setValue)
-        self._fsr2_worker.finished_ok.connect(
-            lambda _path: self._on_fsr2_download_ok(progress)
+        self._fsr31_worker = FFmpegFullDownloadWorker(parent=self)
+        self._fsr31_worker.progress.connect(progress.setValue)
+        self._fsr31_worker.finished_ok.connect(
+            lambda _path: self._on_fsr31_download_ok(progress)
         )
-        self._fsr2_worker.failed.connect(
-            lambda msg: self._on_fsr2_download_failed(msg, progress)
+        self._fsr31_worker.failed.connect(
+            lambda msg: self._on_fsr31_download_failed(msg, progress)
         )
-        self._fsr2_worker.start()
+        self._fsr31_worker.start()
 
-    def _on_fsr2_download_ok(self, progress: QProgressDialog) -> None:
+    def _on_fsr31_download_ok(self, progress: QProgressDialog) -> None:
         progress.close()
-        self._fsr2_worker = None
+        self._fsr31_worker = None
         # Verify libplacebo before marking ready.
         ffmpeg_full = get_local_ffmpeg_full_path()
         if not (os.path.exists(ffmpeg_full) and has_libplacebo_support(ffmpeg_full)):
-            self._on_fsr2_download_failed(
+            self._on_fsr31_download_failed(
                 "Downloaded binary does not expose libplacebo. Aborting.", progress
             )
             return
-        self._mark_fsr2_ready()
+        self._mark_fsr31_ready()
         QMessageBox.information(
-            self, "FSR 2.0 ready",
+            self, "FSR 3.1 ready",
             "FFmpeg full with libplacebo installed at:\n"
             f"{ffmpeg_full}\n\n"
-            "All FSR 2.0 engines (x2 / x3 / x4) are ready to use.",
+            "All FSR 3.1 engines (x2 / x3 / x4) are ready to use.",
         )
 
-    def _on_fsr2_download_failed(self, msg: str, progress: QProgressDialog) -> None:
+    def _on_fsr31_download_failed(self, msg: str, progress: QProgressDialog) -> None:
         progress.close()
-        self._fsr2_worker = None
+        self._fsr31_worker = None
         # Mark all three engines with the same error so the row UI shows it.
-        for eid in self._FSR2_ENGINE_IDS:
+        for eid in self._FSR31_ENGINE_IDS:
             try:
                 engines_state_patch(
                     eid,
@@ -1339,10 +1363,10 @@ class DependenciesDialog(QDialog):
             "    {}".format(msg, get_local_ffmpeg_full_path()),
         )
 
-    def _mark_fsr2_ready(self) -> None:
-        """Mark all three FSR 2.0 engines as installed+enabled in engines.json."""
+    def _mark_fsr31_ready(self) -> None:
+        """Mark all three FSR 3.1 engines as installed+enabled in engines.json."""
         ffmpeg_full = get_local_ffmpeg_full_path()
-        for eid in self._FSR2_ENGINE_IDS:
+        for eid in self._FSR31_ENGINE_IDS:
             try:
                 engines_state_patch(
                     eid,
@@ -1380,54 +1404,135 @@ class DependenciesDialog(QDialog):
 
         target_dir = state.get("install_path") or get_engine_dir(engine_id)
 
-        progress = QProgressDialog(
-            f"Converting {engine.get('display_name', engine_id)} to ONNX...",
-            None, 0, 100, self,
-        )
-        progress.setWindowModality(Qt.WindowModality.WindowModal)
-        progress.setMinimumDuration(0)
-        progress.setAutoClose(False)
-
+        # Conversión en segundo plano: el progreso se muestra en la propia
+        # fila del modelo (barra + estado + botón Cancelar). Nada bloquea la
+        # UI; el usuario puede seguir usando el diálogo mientras convierte.
         self._onnx_worker = OnnxConvertWorker(
             engine_id,
             target_dir,
             engine.get("category", ""),
             parent=self,
         )
-        self._onnx_worker.progress.connect(progress.setValue)
+        self._onnx_worker_engine_id = engine_id
+        self._onnx_worker.progress.connect(
+            lambda p: self.engines_tab.set_engine_converting(
+                engine_id, True, progress=p
+            )
+        )
+        self._onnx_worker.status.connect(
+            lambda s: self.engines_tab.set_engine_converting(
+                engine_id, True, status=_friendly_convert_status(s)
+            )
+        )
         self._onnx_worker.finished_ok.connect(
-            lambda out: self._on_engine_convert_ok(engine_id, out, progress)
+            lambda out: self._on_engine_convert_ok(engine_id, out)
         )
         self._onnx_worker.failed.connect(
-            lambda msg: self._on_engine_convert_failed(engine_id, msg, progress)
+            lambda msg: self._on_engine_convert_failed(engine_id, msg)
+        )
+        self.engines_tab.set_engine_converting(
+            engine_id, True, status="Preparando la conversión..."
         )
         self._onnx_worker.start()
 
-    def _on_engine_convert_ok(self, engine_id, out_path, progress):
-        progress.close()
+    def _on_engine_convert_ok(self, engine_id, out_path):
+        """Conversión terminada: marca el estado ONNX (el repintado muestra el
+        pill 'INSTALLED · ONNX'). Sin diálogo modal."""
         try:
             engines_mark_onnx(engine_id, onnx_path=out_path, converted=True)
         except Exception:
             pass
         self._onnx_worker = None
+        self._onnx_worker_engine_id = None
+        # Medir el backend ONNX recién convertido en background para que el
+        # selector muestre ms/frame comparado (ONNX vs PyTorch).
+        self._maybe_benchmark_backends(engine_id)
         self._refresh_engines_tab()
-        QMessageBox.information(
-            self, "ONNX conversion finished",
-            f"'{engine_id}' -> ONNX at:\n{out_path}",
-        )
 
-    def _on_engine_convert_failed(self, engine_id, msg, progress):
-        progress.close()
+    def _on_engine_convert_failed(self, engine_id, msg):
+        """Conversión fallida/cancelada: el error queda visible en la fila.
+
+        No se escribe estado ni se muestra diálogo modal: un fallo de
+        reconversión no debe desmarcar un .onnx válido previo, y el mensaje
+        rojo en la fila es la retroalimentación inmediata.
+        """
+        self._onnx_worker = None
+        self._onnx_worker_engine_id = None
+        self.engines_tab.set_engine_converting(engine_id, False)
+        if "cancell" in (msg or "").lower():
+            self.engines_tab.show_engine_convert_cancelled(engine_id)
+        else:
+            self.engines_tab.show_engine_convert_error(engine_id, msg)
+
+    def _maybe_benchmark_backends(self, engine_id, target_dir=None):
+        """Lanza (una sola vez) la medición de ambos backends en background.
+
+        Guard de carrera: si un benchmark previo sigue en marcha no se
+        lanza otro — la caché quedaría con dos writers pisándose.
+        """
         try:
-            engines_mark_onnx(engine_id, onnx_path=None, converted=False)
+            if target_dir is None:
+                state = engines_state_get(engine_id)
+                target_dir = state.get("install_path") or get_engine_dir(engine_id)
+            if not target_dir or not os.path.isdir(target_dir):
+                return
+        except Exception:
+            return
+        bench_running = (
+            getattr(self, "_bench_worker", None) is not None
+            and self._bench_worker.isRunning()
+        )
+        if bench_running:
+            return
+        self._bench_worker = _BenchmarkWorker(engine_id, target_dir, parent=self)
+        self._bench_worker.finished.connect(
+            lambda: setattr(self, "_bench_worker", None)
+        )
+        self._bench_worker.start()
+
+    def _on_engine_cancel_convert(self, engine_id):
+        """El usuario pulsó Cancelar en la fila: el worker coopera para
+        abortar entre fases (un export de torch en marcha no se interrumpe
+        a mitad, pero el resultado se descarta como cancelado)."""
+        worker = self._onnx_worker
+        if not worker or not worker.isRunning():
+            return
+        worker.cancel()
+        self.engines_tab.set_engine_converting(
+            engine_id, True, status="Cancelando..."
+        )
+        self.engines_tab.set_cancel_convert_enabled(engine_id, False)
+
+    def _on_engine_backend_changed(self, engine_id, backend):
+        """Persiste el motor de inferencia elegido (auto/torch/onnxruntime).
+
+        Si el usuario fuerza ONNX Runtime y el modelo aún no tiene .onnx,
+        se lanza la conversión automáticamente para que la elección sea
+        real: el render podrá usar ONNX en cuanto termine.
+        """
+        if not engine_id:
+            return
+        backend = str(backend or "auto").strip().lower()
+        if backend not in ("torch", "onnxruntime"):
+            backend = "auto"
+        try:
+            engines_set_backend(engine_id, backend)
         except Exception:
             pass
-        self._onnx_worker = None
         self._refresh_engines_tab()
-        QMessageBox.critical(
-            self, "Conversion failed",
-            f"{msg}",
-        )
+        if backend != "onnxruntime":
+            return
+        try:
+            state = engines_state_get(engine_id)
+            if state.get("onnx_converted"):
+                return
+            model_dir = state.get("install_path") or get_engine_dir(engine_id)
+            from src.ai.inference import find_onnx_model
+            if find_onnx_model(model_dir):
+                return
+        except Exception:
+            return
+        self._on_engine_convert(engine_id)
 
     def _on_engine_open_folder(self, engine_id):
         engine = self._find_engine(engine_id)
@@ -1475,29 +1580,18 @@ class DependenciesDialog(QDialog):
         if not state.get("installed"):
             return
 
-        is_fsr2 = engine_id.endswith("-v2")
         is_fsr31 = "fsr31" in engine_id
-        is_fsr1 = (
-            engine_id.startswith("upscale-fsr") and not is_fsr2 and not is_fsr31
-        )
-        if is_fsr1:
-            QMessageBox.information(
-                self, "Built-in",
-                "FSR 1.0 está integrado en la aplicación y no se puede borrar.",
-            )
-            return
-
-        if is_fsr2 or is_fsr31:
+        if is_fsr31:
             # Borra el build FFmpeg full (libplacebo) compartido por todos
-            # los motores FSR 2.0 / FSR 3.1.
+            # los motores FSR 3.1.
             from src.config import get_ffmpeg_full_dir
             target_dir = get_ffmpeg_full_dir()
             what = "FFmpeg full (libplacebo)\n  " + target_dir
             affected = [
                 e["engine_id"] for e in CATALOG
-                if e["engine_id"].endswith("-v2") or "fsr31" in e["engine_id"]
+                if "fsr31" in e["engine_id"]
             ]
-            extra = "\n\nEsto afectará a todos los motores FSR 2.0 / FSR 3.1."
+            extra = "\n\nEsto afectará a todos los motores FSR 3.1."
         else:
             target_dir = state.get("install_path") or get_engine_dir(engine_id)
             what = "model weights\n  " + target_dir
@@ -1582,7 +1676,7 @@ class DependenciesDialog(QDialog):
         super().reject()
 
     def _kill_workers(self):
-        for w_attr in ("_git_worker", "_onnx_worker", "_fsr2_worker",
+        for w_attr in ("_git_worker", "_onnx_worker", "_fsr31_worker",
                        "_uninstall_worker", "_remove_worker", "_bench_worker",
                        "_upstream_worker", "_active_worker"):
             w = getattr(self, w_attr, None)

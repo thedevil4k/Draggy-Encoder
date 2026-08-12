@@ -10,6 +10,7 @@ so behaviour is consistent across binary and AI flows.
 from __future__ import annotations
 
 import logging
+from typing import Optional
 
 from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtWidgets import (
@@ -31,13 +32,16 @@ class _CategorySection(QWidget):
     """A small section header + a vertical stack of engine rows."""
 
     install_requested = Signal(str)
-    fsr2_download_requested = Signal(str)
+    fsr31_download_requested = Signal(str)
     convert_requested = Signal(str)
+    backend_changed = Signal(str, str)
+    cancel_convert_requested = Signal(str)
     open_folder = Signal(str)
     remove_requested = Signal(str)
 
     def __init__(self, category: str, engines: list[dict], parent=None):
         super().__init__(parent)
+        self._rows: dict[str, EngineRow] = {}
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 6, 0, 6)
         layout.setSpacing(6)
@@ -52,9 +56,12 @@ class _CategorySection(QWidget):
         for engine in engines:
             try:
                 row = EngineRow(engine, parent=self)
+                self._rows[engine.get("engine_id", "")] = row
                 row.install_requested.connect(self.install_requested.emit)
-                row.fsr2_download_requested.connect(self.fsr2_download_requested.emit)
+                row.fsr31_download_requested.connect(self.fsr31_download_requested.emit)
                 row.convert_requested.connect(self.convert_requested.emit)
+                row.backend_changed.connect(self.backend_changed.emit)
+                row.cancel_convert_requested.connect(self.cancel_convert_requested.emit)
                 row.open_folder.connect(self.open_folder.emit)
                 row.remove_requested.connect(self.remove_requested.emit)
                 layout.addWidget(row)
@@ -77,16 +84,23 @@ class EnginesTab(QWidget):
     """
 
     install_requested = Signal(str)            # engine_id
-    fsr2_download_requested = Signal(str)      # engine_id (FSR 2.0)
+    fsr31_download_requested = Signal(str)      # engine_id (FSR 3.1)
     convert_requested = Signal(str)            # engine_id
+    backend_changed = Signal(str, str)         # (engine_id, "auto"|"torch"|"onnxruntime")
+    cancel_convert_requested = Signal(str)     # engine_id
     open_folder = Signal(str)                  # engine_id
     remove_requested = Signal(str)             # engine_id
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self._section_widgets = []
+        self._rows_by_id: dict[str, EngineRow] = {}
         self._chunks: list[tuple[str, list[dict]]] = []
         self._loading_label: QLabel | None = None
+        # Conversión en curso (engine_id + estado): sobrevive a los
+        # repopulates para que el progreso no se pierda al repintar.
+        self._converting_id: str | None = None
+        self._converting_status = ""
         self._timer = QTimer(self)
         self._timer.setSingleShot(True)
         self._timer.setInterval(15)
@@ -175,12 +189,17 @@ class EnginesTab(QWidget):
             try:
                 section = _CategorySection(cat, engines, parent=self._container)
                 section.install_requested.connect(self.install_requested.emit)
-                section.fsr2_download_requested.connect(self.fsr2_download_requested.emit)
+                section.fsr31_download_requested.connect(self.fsr31_download_requested.emit)
                 section.convert_requested.connect(self.convert_requested.emit)
+                section.backend_changed.connect(self.backend_changed.emit)
+                section.cancel_convert_requested.connect(self.cancel_convert_requested.emit)
                 section.open_folder.connect(self.open_folder.emit)
                 section.remove_requested.connect(self.remove_requested.emit)
                 self._container_layout.addWidget(section)
                 self._section_widgets.append(section)
+                self._rows_by_id.update(section._rows)
+                # Re-aplicar la conversión en curso a la fila reconstruida.
+                self._apply_conversion_state()
             except Exception as exc:
                 logger.exception("Failed to build category section %s", cat)
                 error_lbl = QLabel(f"Could not build {cat} section: {exc}")
@@ -222,6 +241,57 @@ class EnginesTab(QWidget):
                 w.setParent(None)
                 w.deleteLater()
         self._section_widgets.clear()
+        self._rows_by_id.clear()
 
         layout.addWidget(self._make_intro())
         self._start_progressive_build()
+
+    # -----------------------------------------------------------------
+    # ONNX conversion state (progreso en la propia fila)
+    # -----------------------------------------------------------------
+
+    def set_engine_converting(self, engine_id: str, converting: bool,
+                              progress: Optional[int] = None,
+                              status: str = "") -> None:
+        """Muestra/oculta la conversión ONNX en la fila de ``engine_id``.
+
+        Con ``converting=True`` se recuerda el engine en curso para volver a
+        aplicar el estado a la fila si un repopulate la reconstruye a mitad
+        de conversión. Con ``converting=False`` se limpia esa memoria.
+        """
+        if converting:
+            self._converting_id = engine_id
+            if status:
+                self._converting_status = status
+        else:
+            if getattr(self, "_converting_id", None) == engine_id:
+                self._converting_id = None
+                self._converting_status = ""
+        row = self._rows_by_id.get(engine_id)
+        if row is not None:
+            row.set_converting(converting, progress, status)
+
+    def _apply_conversion_state(self) -> None:
+        """Re-aplica el estado de conversión a la fila reconstruida (si hay
+        una conversión en curso)."""
+        eid = getattr(self, "_converting_id", None)
+        if not eid:
+            return
+        row = self._rows_by_id.get(eid)
+        if row is not None:
+            row.set_converting(True, status=self._converting_status or "Converting to ONNX...")
+
+    def show_engine_convert_error(self, engine_id: str, msg: str) -> None:
+        row = self._rows_by_id.get(engine_id)
+        if row is not None:
+            row.show_convert_error(msg)
+
+    def show_engine_convert_cancelled(self, engine_id: str) -> None:
+        row = self._rows_by_id.get(engine_id)
+        if row is not None:
+            row.show_convert_cancelled()
+
+    def set_cancel_convert_enabled(self, engine_id: str, enabled: bool) -> None:
+        row = self._rows_by_id.get(engine_id)
+        if row is not None:
+            row.set_cancel_enabled(enabled)

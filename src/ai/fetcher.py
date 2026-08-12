@@ -514,7 +514,23 @@ class OnnxConvertWorker(QThread):
         self._cancel.set()
 
     def _find_weight_file(self) -> Optional[str]:
-        """Return the first convertible weight file under ``engine_dir``."""
+        """Return the convertible weight file that BEST matches engine_id.
+
+        El directorio de un engine puede contener MUCHOS pesos (el repo de
+        Real-ESRGAN trae 9 .pth: 6 RRDBNet + 3 SRVGG). Coger el primero
+        del walk era un azar: el conversor podía convertir un RRDBNet de
+        67 MB en vez del SRVGG de 2,4 MB del AnimeVideo v3, o fallar en
+        un peso envuelto con formato antiguo. Se reutiliza el mismo
+        scoring que ``get_model_path(..., 'torch')``.
+        """
+        try:
+            from src.ai.inference import pick_weight_file
+            picked = pick_weight_file(self.engine_dir, self.engine_id)
+            if picked and os.path.isfile(picked):
+                return picked
+        except Exception:
+            pass
+        # Fallback: primer peso convertible del walk (comportamiento previo).
         if not os.path.isdir(self.engine_dir):
             return None
         for root, _dirs, files in os.walk(self.engine_dir):
@@ -567,6 +583,15 @@ class OnnxConvertWorker(QThread):
             return
 
         onnx_path, error_msg = convert_pth_to_onnx_ex(weight_path)
+
+        # Cancelación pedida DURANTE la exportación: torch.onnx.export no se
+        # puede abortar a mitad (haría falta matar el thread), así que la
+        # conversión termina y se descarta como cancelada. El .onnx generado
+        # queda en disco (es válido) pero no se marca como convertido.
+        if self._cancel.is_set():
+            self.failed.emit("cancelled by user")
+            return
+
         if not onnx_path or not os.path.exists(onnx_path):
             self.failed.emit(
                 "ONNX conversion failed.\n\n"

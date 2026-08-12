@@ -1,0 +1,27 @@
+app-id: com.draggyencoder.DraggyEncoder
+runtime: org.freedesktop.Platform
+runtime-version: '24.08'
+sdk: org.freedesktop.Sdk
+command: draggy-encoder
+
+finish-args:
+  - --share=ipc
+  - --share=network
+  - --socket=x11
+  - --socket=wayland
+  - --device=dri
+  - --filesystem=home
+
+modules:
+  - name: draggy-encoder
+    buildsystem: simple
+    build-commands:
+      - install -d /app/draggy-encoder /app/bin /app/share/applications /app/share/icons/hicolor/256x256/apps
+      - cp -a DraggyEncoder/. /app/draggy-encoder/
+      - install -Dm755 flatpak-wrapper /app/bin/draggy-encoder
+      - install -Dm644 flatpak.desktop /app/share/applications/com.draggyencoder.DraggyEncoder.desktop
+      - install -Dm644 draggy-encoder.png /app/share/icons/hicolor/256x256/apps/com.draggyencoder.DraggyEncoder.png
+      - install -Dm644 com.draggyencoder.DraggyEncoder.metainfo.xml /app/share/metainfo/com.draggyencoder.DraggyEncoder.metainfo.xml
+    sources:
+      - type: dir
+        path: flatpak-staging

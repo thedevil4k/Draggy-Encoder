@@ -7,7 +7,7 @@ DRAGGY ENCODER combines FFmpeg-based encoding with ONNX/PyTorch AI models for vi
 ## Features
 
 - GPU-accelerated AI upscaling (Real-ESRGAN, OmniSR, CUGAN, SwinIR) via ONNX Runtime (CUDA/TensorRT)
-- AMD FSR 1.0 (CPU), FSR 2.0 (Vulkan/libplacebo), FSR 3.1 (upscale + frame interpolation)
+- AMD FSR 3.1 (libplacebo upscale + frame interpolation)
 - Frame-by-frame decode → AI → encode pipeline with audio passthrough
 - Auto-downloading FFmpeg (including libplacebo builds) and AI models from HuggingFace
 - NVENC / AMF / QuickSync GPU encoder support
@@ -65,6 +65,58 @@ DRAGGY_ENCODER/
 - Git (for model downloads; fallback to huggingface_hub if unavailable)
 
 See `requirements.txt` for the full Python dependency list.
+
+## Portable builds
+
+GitHub Actions publishes these platform-specific artifacts:
+
+- **Windows:** `DraggyEncoder-Setup-*.exe`, built with PyInstaller and Inno Setup.
+- **Linux x86_64:** `DraggyEncoder-Linux-x86_64-*.tar.gz`, portable archive.
+- **Debian/Ubuntu:** `DraggyEncoder-Linux-x86_64-*.deb`, with a desktop launcher.
+- **Fedora/RHEL/openSUSE:** `DraggyEncoder-Linux-x86_64-*.rpm`, with a desktop launcher.
+- **Linux desktop:** `DraggyEncoder-Linux-x86_64-*.AppImage`, directly executable.
+- **Flatpak:** `DraggyEncoder-Linux-x86_64-*.flatpak`, installable with Flatpak.
+
+The Linux archive is portable: extract it and run `./DraggyEncoder/DraggyEncoder`.
+The `.deb` and `.rpm` packages install a desktop entry and command
+`draggy-encoder`; the AppImage can be marked executable and launched from the
+file manager. The standalone Flatpak can be installed with `flatpak install --user
+DraggyEncoder-Linux-x86_64-*.flatpak`. Installed Linux
+formats store writable data under `${XDG_DATA_HOME:-~/.local/share}/draggy-encoder`
+so `/opt` and a read-only AppImage mount are never modified. The first launch
+downloads FFmpeg and models into that user data directory.
+
+All bundles include a private Python 3.13 interpreter used only to install the
+optional PyTorch and ONNX Runtime packages on demand; the large AI runtimes are
+not shipped inside the release artifact. On Linux, use a distribution with a
+recent glibc and make the executable runnable if your extraction tool did not
+preserve permissions (`chmod +x DraggyEncoder/DraggyEncoder`).
+
+### Flatpak repository and automatic updates
+
+GitHub Actions publishes the Flatpak OSTree repository to GitHub Pages:
+
+```bash
+flatpak remote-add --if-not-exists --no-gpg-verify draggy-encoder \
+  https://thedevil4k.github.io/Draggy-Encoder/
+flatpak install --user draggy-encoder com.draggyencoder.DraggyEncoder
+flatpak update
+```
+
+After the remote is added, normal `flatpak update` detects new commits from
+releases published by the project; users no longer need to download individual
+`.flatpak` files. The repository is deployed by the Linux workflow, so GitHub
+Pages must be enabled once in the repository settings with **Source: GitHub
+Actions**. The current repository is intentionally unsigned, hence
+`--no-gpg-verify`; before a public production release, configure a persistent
+Flatpak GPG signing key in GitHub Actions and remove that flag.
+
+For source development on Linux:
+
+```bash
+source venv/bin/activate
+python main.py
+```
 
 ## Usage
 

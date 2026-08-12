@@ -25,14 +25,17 @@ import os
 import platform
 import subprocess
 from datetime import datetime
+from typing import Optional
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QPainter
 from PySide6.QtWidgets import (
+    QComboBox,
     QFrame,
     QHBoxLayout,
     QLabel,
     QMessageBox,
+    QProgressBar,
     QPushButton,
     QSizePolicy,
     QSpacerItem,
@@ -114,11 +117,15 @@ class EngineRow(QFrame):
 
     Signals:
         install_requested(str) - engine_id to install (HF clone / git clone).
-        fsr2_download_requested(str) - engine_id; FSR 2.0 entry clicked. The
+        fsr31_download_requested(str) - engine_id; FSR 3.1 entry clicked. The
             parent dialog handles this by downloading the FFmpeg "full" build
             (with libplacebo) into ``bin/ffmpeg-full/`` instead of cloning a
             model repo. Marked installed on success.
         convert_requested(str) - engine_id to convert to ONNX.
+        backend_changed(str, str) - (engine_id, "auto"|"torch"|"onnxruntime")
+            fired when the user switches the inference backend for this engine.
+        cancel_convert_requested(str) - engine_id; the user clicked Cancel
+            while the ONNX conversion was running.
         open_folder(str) - engine_id; user wants to see the local weights dir.
 
     Note:
@@ -128,8 +135,10 @@ class EngineRow(QFrame):
     """
 
     install_requested = Signal(str)
-    fsr2_download_requested = Signal(str)
+    fsr31_download_requested = Signal(str)
     convert_requested = Signal(str)
+    backend_changed = Signal(str, str)
+    cancel_convert_requested = Signal(str)
     open_folder = Signal(str)
     remove_requested = Signal(str)
 
@@ -219,9 +228,13 @@ class EngineRow(QFrame):
     # -- build ------------------------------------------------------------
 
     def _build(self) -> None:
-        outer = QHBoxLayout(self)
-        outer.setSpacing(14)
+        # Estructura de la tarjeta: fila principal (left/middle/right) + una
+        # franja inferior oculta para el progreso de conversión a ONNX.
+        outer = QVBoxLayout(self)
+        outer.setSpacing(4)
         outer.setContentsMargins(14, 12, 14, 12)
+        top = QHBoxLayout()
+        top.setSpacing(14)
 
         eng = self.engine
         eid = eng.get("engine_id", "")
@@ -299,7 +312,7 @@ class EngineRow(QFrame):
             tip.setWordWrap(True)
             left.addWidget(tip)
 
-        outer.addLayout(left, stretch=1)
+        top.addLayout(left, stretch=1)
 
         # ---- Middle column: quality bars + state pill ----
         middle = QVBoxLayout()
@@ -319,64 +332,97 @@ class EngineRow(QFrame):
                                      tooltip=f"Quality score: {qual}/100"))
         middle.addLayout(qual_row)
 
-        # State badge
+        # State badge — también muestra el motor de inferencia en uso
+        # (PYTORCH por defecto, ONNX cuando está convertido; la preferencia
+        # del usuario manda vía ``inference_backend``).
         state = eng.get("state", {}) or {}
         installed = bool(state.get("installed"))
         converted = bool(state.get("onnx_converted"))
-        is_fsr = eng.get("engine_id", "").startswith("upscale-fsr")
-        is_fsr2 = eng.get("engine_id", "").endswith("-v2")
+        backend = str(state.get("inference_backend") or "auto").strip().lower()
+        if backend not in ("torch", "onnxruntime"):
+            backend = "auto"
+        # El pill muestra el backend CONCRETO que usará el render: con
+        # "auto" y benchmarks de ambos, el más rápido medido (misma regla
+        # que ``resolve_backend`` en el render); sin benchmarks, la
+        # heurística clásica (ONNX si hay .onnx, si no PyTorch).
+        display_backend = backend
+        if backend == "auto":
+            try:
+                from src.ai.engines_state import resolve_backend as _resolve_backend
+                resolved = _resolve_backend(eng.get("engine_id", ""))
+                if resolved in ("torch", "onnxruntime"):
+                    display_backend = resolved
+            except Exception:
+                pass
         is_fsr31 = "fsr31" in eng.get("engine_id", "")
+        is_fsr = is_fsr31
 
-        state_text = self._state_label(installed, converted, is_fsr, is_fsr2, is_fsr31)
-        state_lbl = QLabel(state_text)
-        # Inline the stylesheet so a stale .pyc or import problem cannot
-        # trigger "'EngineRow' object has no attribute '_state_stylesheet'".
-        if not installed:
-            state_qss = (
-                "QLabel { background-color: #2c3e50; color: #a0a0b0; "
-                "border-radius: 8px; padding: 2px 8px; font-size: 10px; font-weight: bold; }"
-            )
-        elif is_fsr31:
-            # FSR 3.0 (GPU via libplacebo + interpolation) - teal-blue color
-            state_qss = (
-                "QLabel { background-color: #16a085; color: #ffffff; "
-                "border-radius: 8px; padding: 2px 8px; font-size: 10px; font-weight: bold; }"
-            )
-        elif is_fsr2:
-            # FSR 2.0 (GPU via libplacebo) - blue color
-            state_qss = (
-                "QLabel { background-color: #2980b9; color: #ffffff; "
-                "border-radius: 8px; padding: 2px 8px; font-size: 10px; font-weight: bold; }"
-            )
-        elif is_fsr:
-            # FSR 1.0 (CPU) - purple color
-            state_qss = (
-                "QLabel { background-color: #8e44ad; color: #ffffff; "
-                "border-radius: 8px; padding: 2px 8px; font-size: 10px; font-weight: bold; }"
-            )
-        elif converted:
-            state_qss = (
-                "QLabel { background-color: #00d2d3; color: #0f0f1a; "
-                "border-radius: 8px; padding: 2px 8px; font-size: 10px; font-weight: bold; }"
-            )
-        else:
-            state_qss = (
-                "QLabel { background-color: #16a085; color: #ffffff; "
-                "border-radius: 8px; padding: 2px 8px; font-size: 10px; font-weight: bold; }"
-            )
+        engine_label = self._engine_label(installed, converted, display_backend, is_fsr31)
+        state_lbl = QLabel(engine_label)
+        state_qss = self._state_qss(installed, converted, display_backend, is_fsr31)
         state_lbl.setStyleSheet(state_qss)
         state_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
         state_lbl.setMaximumWidth(180)
         middle.addWidget(state_lbl, alignment=Qt.AlignmentFlag.AlignLeft)
 
-        outer.addLayout(middle)
+        # Benchmarks medidos en este equipo por backend (ms/frame).
+        bench = eng.get("benchmarks") or {}
+        onnx_bench = bench.get("onnx") or None
+        torch_bench = bench.get("torch") or None
+
+        # Selector de motor de inferencia (Auto / PyTorch / ONNX Runtime).
+        # Los items muestran los ms/frame medidos cuando existen.
+        self.combo_backend = QComboBox()
+        self.combo_backend.addItem("Auto", "auto")
+        self.combo_backend.addItem(
+            self._backend_item_label("PyTorch", torch_bench), "torch"
+        )
+        self.combo_backend.addItem(
+            self._backend_item_label("ONNX Runtime", onnx_bench), "onnxruntime"
+        )
+        backend_idx = self.combo_backend.findData(backend)
+        self.combo_backend.setCurrentIndex(backend_idx if backend_idx >= 0 else 0)
+        is_backend_switchable = bool(
+            implemented and installed and not is_fsr
+        )
+        self.combo_backend.setEnabled(is_backend_switchable)
+        if not is_backend_switchable:
+            self.combo_backend.setToolTip(
+                "Backend selector requires an installed model engine "
+                "(FSR engines are algorithmic and have no model backend)."
+            )
+        else:
+            self.combo_backend.setToolTip(
+                "Inference backend for this engine:\n"
+                "  Auto        - the fastest measured backend (ONNX vs PyTorch)\n"
+                "                when both are benchmarked; otherwise ONNX if\n"
+                "                a .onnx exists, PyTorch if not.\n"
+                "  PyTorch     - always use PyTorch (never converts).\n"
+                "  ONNX Runtime - always use ONNX; converts the weights if needed.\n\n"
+                "ms/frame medidos en este equipo a 512x288 cuando hay datos."
+            )
+        self.combo_backend.currentIndexChanged.connect(self._on_backend_changed)
+        backend_row = QHBoxLayout()
+        backend_row.setSpacing(6)
+        backend_lbl = QLabel("Backend:")
+        backend_lbl.setStyleSheet("color: #a0a0b0; font-size: 10px;")
+        backend_row.addWidget(backend_lbl)
+        backend_row.addWidget(self.combo_backend)
+        backend_row.addStretch()
+        middle.addLayout(backend_row)
+
+        # Sugerencia automática: cuál de los dos backends es más rápido en
+        # este equipo (solo con ambos medidos) + botón 'Usar' para aplicarlo.
+        self._build_backend_suggestion(middle, onnx_bench, torch_bench)
+
+        top.addLayout(middle)
 
         # ---- Right column: buttons + toggle ----
         right = QVBoxLayout()
         right.setSpacing(6)
 
         # Primary: Add Engine / Reinstall / Open Folder
-        self.btn_install = QPushButton(self._install_label(installed, is_fsr, is_fsr2, is_fsr31))
+        self.btn_install = QPushButton(self._install_label(installed, is_fsr31))
         self.btn_install.setObjectName("primaryBtn")
         if not implemented:
             self.btn_install.setEnabled(False)
@@ -390,19 +436,6 @@ class EngineRow(QFrame):
                 self.btn_install.setEnabled(True)
                 self.btn_install.setText("Download FFmpeg")
                 self.btn_install.setToolTip("FSR 3.1 requires FFmpeg full with libplacebo. Click to download.")
-        elif is_fsr and not is_fsr2:
-            self.btn_install.setEnabled(False)
-            self.btn_install.setText("Built-in")
-            self.btn_install.setToolTip("FSR 1.0 is built into the application — no download needed.")
-        elif is_fsr2:
-            if installed:
-                self.btn_install.setEnabled(False)
-                self.btn_install.setText("Ready")
-                self.btn_install.setToolTip("FSR 2.0 is ready — FFmpeg full with libplacebo is available.")
-            else:
-                self.btn_install.setEnabled(True)
-                self.btn_install.setText("Download FFmpeg")
-                self.btn_install.setToolTip("FSR 2.0 requires FFmpeg full with libplacebo. Click to download.")
         self.btn_install.setToolTip(self._install_tooltip(eng))
         self.btn_install.clicked.connect(self._on_install_clicked)
         right.addWidget(self.btn_install)
@@ -446,15 +479,14 @@ class EngineRow(QFrame):
         right.addWidget(self.btn_open)
 
         # Remove installed weights / binary (borrar desde la app).
-        is_fsr1 = is_fsr and not is_fsr2 and not is_fsr31
-        can_remove = installed and not is_fsr1
+        can_remove = installed
         self.btn_remove = QPushButton("Remove")
         self.btn_remove.setObjectName("removeBtn")
         self.btn_remove.setEnabled(can_remove)
-        if is_fsr2 or is_fsr31:
+        if is_fsr31:
             self.btn_remove.setToolTip(
                 "Removes the FFmpeg full (libplacebo) build and uninstalls "
-                "this engine (affects all FSR 2.0 / FSR 3.1 engines)."
+                "this engine (affects all FSR 3.1 engines)."
             )
         else:
             self.btn_remove.setToolTip(
@@ -484,32 +516,252 @@ class EngineRow(QFrame):
         right.addWidget(self.btn_similar)
 
         right.addStretch()
-        outer.addLayout(right)
+        top.addLayout(right)
 
-        # Spacer at the end so cards don't compact too much.
-        outer.addItem(QSpacerItem(0, 0, QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Expanding))
+        outer.addLayout(top)
+        # Franja de progreso de conversión a ONNX (oculta por defecto).
+        self._build_convert_area(outer)
+        outer.addStretch(1)
+
+    # -- Backend suggestion (measured ms/frame) ----------------------------
+
+    @staticmethod
+    def _backend_item_label(name: str, bench) -> str:
+        """Texto del item del selector: nombre + ms/frame medido si existe."""
+        label = name
+        if bench and bench.get("ms_per_frame"):
+            return f"{label} — {bench['ms_per_frame']} ms/f"
+        return label
+
+    @staticmethod
+    def _recommended_backend(onnx_bench, torch_bench) -> Optional[str]:
+        """Backend más rápido medido ("onnx"|"torch"), o None sin datos.
+
+        Con empate se prefiere ONNX (el backend por defecto cuando existe
+        .onnx)."""
+        onnx_ms = onnx_bench.get("ms_per_frame") if onnx_bench else None
+        torch_ms = torch_bench.get("ms_per_frame") if torch_bench else None
+        if onnx_ms is None and torch_ms is None:
+            return None
+        if onnx_ms is None:
+            return "torch"
+        if torch_ms is None:
+            return "onnx"
+        if torch_ms < onnx_ms:
+            return "torch"
+        return "onnx"
+
+    def _build_backend_suggestion(self, parent_layout, onnx_bench, torch_bench) -> None:
+        """Línea '⚡ Más rápido: X (a ms/f vs b ms/f)' + botón 'Usar'."""
+        self.lbl_backend_suggest = QLabel("")
+        self.lbl_backend_suggest.setStyleSheet("color: #00d2d3; font-size: 10px;")
+        self.lbl_backend_suggest.setVisible(False)
+        self.btn_use_recommended = QPushButton("Usar")
+        self.btn_use_recommended.setEnabled(False)
+        self.btn_use_recommended.setVisible(False)
+        self.btn_use_recommended.clicked.connect(self._on_use_recommended)
+        rec_row = QHBoxLayout()
+        rec_row.setSpacing(6)
+        rec_row.addWidget(self.lbl_backend_suggest, stretch=1)
+        rec_row.addWidget(self.btn_use_recommended)
+        parent_layout.addLayout(rec_row)
+
+        rec = self._recommended_backend(onnx_bench, torch_bench)
+        if not rec or not (onnx_bench and torch_bench):
+            # Solo se sugiere cuando hay ambos backends medidos y comparables.
+            return
+        fast = onnx_bench if rec == "onnx" else torch_bench
+        slow = torch_bench if rec == "onnx" else onnx_bench
+        fast_name = "ONNX Runtime" if rec == "onnx" else "PyTorch"
+        slow_name = "PyTorch" if rec == "onnx" else "ONNX Runtime"
+        self.lbl_backend_suggest.setText(
+            f"⚡ Más rápido: {fast_name} ({fast['ms_per_frame']} ms/f vs "
+            f"{slow_name} {slow['ms_per_frame']} ms/f)"
+        )
+        self.lbl_backend_suggest.setToolTip(
+            "Medido en este equipo a 512x288. Pulsa 'Usar' para cambiar "
+            "el backend al más rápido."
+        )
+        self.lbl_backend_suggest.setVisible(True)
+        self.btn_use_recommended.setEnabled(True)
+        self.btn_use_recommended.setVisible(True)
+        self._recommended = rec
+
+    def _on_use_recommended(self) -> None:
+        rec = getattr(self, "_recommended", None)
+        if not rec:
+            return
+        self.backend_changed.emit(self.engine.get("engine_id", ""), rec)
+
+    # -- ONNX conversion progress strip ------------------------------------
+
+    def _build_convert_area(self, parent_layout) -> None:
+        """Franja inferior de la tarjeta con el progreso de conversión a ONNX.
+
+        Oculto por defecto; ``set_converting(True, ...)`` lo muestra mientras
+        el worker convierte en segundo plano y ``show_convert_error`` deja el
+        mensaje de fallo visible en rojo.
+        """
+        area = QVBoxLayout()
+        area.setSpacing(4)
+
+        self.conv_bar = QProgressBar()
+        self.conv_bar.setRange(0, 100)
+        self.conv_bar.setValue(0)
+        self.conv_bar.setTextVisible(True)
+        self.conv_bar.setFixedHeight(14)
+        self.conv_bar.setVisible(False)
+        area.addWidget(self.conv_bar)
+
+        self.conv_status = QLabel("")
+        self.conv_status.setStyleSheet("color: #a0a0b0; font-size: 10px;")
+        self.conv_status.setWordWrap(True)
+        self.conv_status.setVisible(False)
+
+        self.btn_cancel_convert = QPushButton("Cancel")
+        self.btn_cancel_convert.setObjectName("removeBtn")
+        self.btn_cancel_convert.setEnabled(False)
+        self.btn_cancel_convert.setVisible(False)
+        self.btn_cancel_convert.clicked.connect(self._on_cancel_convert_clicked)
+
+        status_row = QHBoxLayout()
+        status_row.setSpacing(8)
+        status_row.addWidget(self.conv_status, stretch=1)
+        status_row.addWidget(self.btn_cancel_convert)
+        area.addLayout(status_row)
+
+        parent_layout.addLayout(area)
+        self._conv_area = area
+
+    def set_converting(self, converting: bool, progress: Optional[int] = None,
+                       status: str = "") -> None:
+        """Muestra/oculta la franja de conversión y bloquea las acciones de la
+        fila mientras el worker de ONNX está en marcha."""
+        if not hasattr(self, "conv_bar"):
+            return  # fila a medio construir o sin área (tests)
+        if converting:
+            if not getattr(self, "_converting_active", False):
+                # Capturar los estados habilitados actuales para restaurarlos
+                # al terminar (la fila NO se repuebla en fallo/cancel).
+                self._convert_was_enabled = self.btn_convert.isEnabled()
+                self._remove_was_enabled = self.btn_remove.isEnabled()
+                self._backend_was_enabled = self.combo_backend.isEnabled()
+            self._converting_active = True
+            if progress is None or progress < 0:
+                self.conv_bar.setRange(0, 0)  # modo ocupado / indeterminado
+            else:
+                self.conv_bar.setRange(0, 100)
+                self.conv_bar.setValue(int(progress))
+            self.conv_bar.setVisible(True)
+            self.conv_status.setVisible(True)
+            self.btn_cancel_convert.setVisible(True)
+            self.btn_cancel_convert.setEnabled(True)
+            self.btn_cancel_convert.setText("Cancel")
+            if status:
+                self.conv_status.setText(status)
+                self.conv_status.setStyleSheet("color: #a0a0b0; font-size: 10px;")
+            self.btn_convert.setEnabled(False)
+            self.btn_remove.setEnabled(False)
+            self.combo_backend.setEnabled(False)
+        else:
+            self._converting_active = False
+            self.conv_bar.setVisible(False)
+            self.conv_status.setVisible(False)
+            self.btn_cancel_convert.setVisible(False)
+            # Restaurar los estados anteriores solo si estaban capturados.
+            if hasattr(self, "_convert_was_enabled"):
+                self.btn_convert.setEnabled(self._convert_was_enabled)
+            if hasattr(self, "_remove_was_enabled"):
+                self.btn_remove.setEnabled(self._remove_was_enabled)
+            if hasattr(self, "_backend_was_enabled"):
+                self.combo_backend.setEnabled(self._backend_was_enabled)
+
+    def set_cancel_enabled(self, enabled: bool) -> None:
+        """Habilita/deshabilita el botón Cancelar ("Cancelling..." mientras
+        el worker coopera para abortar)."""
+        if not hasattr(self, "btn_cancel_convert"):
+            return
+        self.btn_cancel_convert.setEnabled(enabled)
+        self.btn_cancel_convert.setText("Cancelling..." if not enabled else "Cancel")
+
+    def show_convert_error(self, msg: str) -> None:
+        """Deja el error de conversión visible en rojo en la fila."""
+        if not hasattr(self, "conv_status"):
+            return
+        self.conv_bar.setVisible(False)
+        self.btn_cancel_convert.setVisible(False)
+        self.conv_status.setText(msg)
+        self.conv_status.setStyleSheet(
+            "color: #e74c3c; font-size: 10px; font-weight: bold;"
+        )
+        self.conv_status.setVisible(True)
+
+    def show_convert_cancelled(self) -> None:
+        """Aviso neutro de cancelación, auto-oculto a los 3 segundos."""
+        if not hasattr(self, "conv_status"):
+            return
+        self.conv_bar.setVisible(False)
+        self.btn_cancel_convert.setVisible(False)
+        self.conv_status.setText("Conversion cancelled.")
+        self.conv_status.setStyleSheet("color: #a0a0b0; font-size: 10px;")
+        self.conv_status.setVisible(True)
+        # Con contexto (``self``): si la fila se destruye antes de que el
+        # timer dispare, Qt descarta el callback — un singleShot sin
+        # contexto invocaría el método sobre un QWidget ya destruido y
+        # reventaría con access violation en el hilo de la GUI.
+        QTimer.singleShot(3000, self, self._hide_convert_status)
+
+    def _hide_convert_status(self) -> None:
+        if hasattr(self, "conv_status"):
+            self.conv_status.setVisible(False)
+
+    def _on_cancel_convert_clicked(self) -> None:
+        self.cancel_convert_requested.emit(self.engine.get("engine_id", ""))
 
     # -- helpers ----------------------------------------------------------
 
-    def _state_label(self, installed: bool, converted: bool, is_fsr: bool = False, is_fsr2: bool = False, is_fsr31: bool = False) -> str:
+    @staticmethod
+    def _engine_label(installed: bool, converted: bool, backend: str,
+                      is_fsr31: bool = False) -> str:
+        """Etiqueta del motor en uso: PYTORCH por defecto, ONNX si hay .onnx
+        (o si el usuario forzó el backend correspondiente)."""
         if not installed:
             return "NOT INSTALLED"
         if is_fsr31:
             return "FSR 3.1 (GPU)"
-        if is_fsr2:
-            return "FSR 2.0 (GPU)"
-        if is_fsr:
-            return "FSR 1.0 (CPU)"
-        if converted:
-            return "INSTALLED · ONNX"
-        return "INSTALLED"
+        if backend == "torch" or (backend == "auto" and not converted):
+            return "INSTALLED · PYTORCH"
+        return "INSTALLED · ONNX"
 
-    def _install_label(self, installed: bool, is_fsr: bool = False, is_fsr2: bool = False, is_fsr31: bool = False) -> str:
+    @staticmethod
+    def _state_qss(installed: bool, converted: bool, backend: str,
+                   is_fsr31: bool = False) -> str:
+        """Color del pill de estado según el motor activo."""
+        if not installed:
+            return (
+                "QLabel { background-color: #2c3e50; color: #a0a0b0; "
+                "border-radius: 8px; padding: 2px 8px; font-size: 10px; font-weight: bold; }"
+            )
         if is_fsr31:
-            return "Download FFmpeg" if not installed else "Ready"
-        if is_fsr and not is_fsr2:
-            return "Built-in"
-        if is_fsr2:
+            # FSR 3.1 (GPU via libplacebo + interpolation) - teal-green
+            return (
+                "QLabel { background-color: #16a085; color: #ffffff; "
+                "border-radius: 8px; padding: 2px 8px; font-size: 10px; font-weight: bold; }"
+            )
+        if backend == "torch" or (backend == "auto" and not converted):
+            # PYTORCH (por defecto) - naranja
+            return (
+                "QLabel { background-color: #e67e22; color: #ffffff; "
+                "border-radius: 8px; padding: 2px 8px; font-size: 10px; font-weight: bold; }"
+            )
+        # ONNX - teal
+        return (
+            "QLabel { background-color: #00d2d3; color: #0f0f1a; "
+            "border-radius: 8px; padding: 2px 8px; font-size: 10px; font-weight: bold; }"
+        )
+
+    def _install_label(self, installed: bool, is_fsr31: bool = False) -> str:
+        if is_fsr31:
             return "Download FFmpeg" if not installed else "Ready"
         return "Re-clone" if installed else "Add Engine"
 
@@ -528,16 +780,23 @@ class EngineRow(QFrame):
 
     def _on_install_clicked(self) -> None:
         eid = self.engine.get("engine_id", "")
-        # FSR 2.0 and FSR 3.0 entries route to a different signal so the parent dialog
+        # FSR 3.1 entries route to a different signal so the parent dialog
         # downloads the FFmpeg "full" binary instead of trying to git-clone
         # an HF repo (which has no model weights for FSR).
-        if (eid.endswith("-v2") or "fsr31" in eid) and eid.startswith("upscale-fsr"):
-            self.fsr2_download_requested.emit(eid)
+        if "fsr31" in eid and eid.startswith("upscale-fsr"):
+            self.fsr31_download_requested.emit(eid)
             return
         self.install_requested.emit(eid)
 
     def _on_convert_clicked(self) -> None:
         self.convert_requested.emit(self.engine.get("engine_id", ""))
+
+    def _on_backend_changed(self, index: int) -> None:
+        eid = self.engine.get("engine_id", "")
+        if not eid:
+            return
+        backend = self.combo_backend.itemData(index)
+        self.backend_changed.emit(eid, backend or "auto")
 
     def _on_remove_clicked(self) -> None:
         self.remove_requested.emit(self.engine.get("engine_id", ""))

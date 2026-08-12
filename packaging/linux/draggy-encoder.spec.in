@@ -1,0 +1,45 @@
+Name: draggy-encoder
+Version: @VERSION@
+Release: 1%{?dist}
+Summary: AI-powered video compression and upscaling
+License: MIT
+URL: https://github.com/YOUR_USER/DRAGGY_ENCODER
+
+Requires: glibc >= 2.31
+Requires: glib2
+Requires: mesa-libGL
+Requires: libX11
+Requires: libX11-xcb
+Requires: libxcb
+Requires: libXext
+Requires: libXrender
+Requires: libXrandr
+Requires: libXi
+Requires: libxkbcommon
+Requires: libxkbcommon-x11
+
+Source0: draggy-encoder-bundle.tar.gz
+
+%description
+Draggy Encoder is a PySide6 desktop application for video encoding, AI
+upscaling, frame interpolation and related workflows.
+
+%prep
+%setup -q -n draggy-encoder-bundle
+
+%install
+mkdir -p %{buildroot}
+cp -a ./* %{buildroot}/
+
+%files
+%defattr(-,root,root,-)
+/opt/draggy-encoder
+/usr/bin/draggy-encoder
+/usr/share/applications/com.draggyencoder.DraggyEncoder.desktop
+/usr/share/metainfo/com.draggyencoder.DraggyEncoder.metainfo.xml
+/usr/share/icons/hicolor/256x256/apps/draggy-encoder.png
+/usr/share/icons/hicolor/256x256/apps/com.draggyencoder.DraggyEncoder.png
+
+%changelog
+* Thu Jan 01 1970 Draggy Encoder contributors - @VERSION@-1
+- Automated GitHub Actions build.

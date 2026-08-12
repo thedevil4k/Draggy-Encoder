@@ -608,73 +608,12 @@ class PyTorchInferenceEngine(AIInferenceEngine):
         self._loaded = False
 
 
-class FSREngine(AIInferenceEngine):
-    """FSR 1.0 (FidelityFX Super Resolution) — lightweight, no model download.
+class _LibplaceboEngine(AIInferenceEngine):
+    """Internal libplacebo-backed scaler used by the FSR 3.1 engine.
 
-    Implements the FSR 1.0 algorithm: contrast-adaptive sharpening (CAS)
-    combined with edge-directed upscaling. Pure NumPy, runs on CPU.
-    No external model files required.
-    """
-
-    def __init__(self, model_path: str, engine_id: str):
-        super().__init__(model_path, engine_id)
-        self._scale = 2
-        self._sharpness = 0.8  # CAS sharpness (0.0 = off, 1.0 = max)
-
-    def load(self) -> bool:
-        # FSR 1.0 doesn't need any model files.
-        # Parse scale from engine_id (e.g., "upscale-fsr-2x" -> 2).
-        import re
-        m = re.search(r"fsr-(\d+)x", self.engine_id or "")
-        if m:
-            self._scale = int(m.group(1))
-        else:
-            # Fallback: try parsing from model_path basename
-            try:
-                scale_str = os.path.basename(self.model_path).replace("fsr-", "").replace(".pth", "")
-                self._scale = int(scale_str) if scale_str.isdigit() else 2
-            except (ValueError, AttributeError):
-                self._scale = 2
-        self._loaded = True
-        logger.info("FSR 1.0 engine loaded (scale=%d, sharpness=%.2f)", self._scale, self._sharpness)
-        return True
-
-    def process_frame(self, frame: np.ndarray) -> np.ndarray:
-        """Upscale a BGR uint8 frame using FSR 1.0."""
-        if not self._loaded:
-            raise RuntimeError("FSR engine not loaded")
-
-        h, w = frame.shape[:2]
-
-        # Step 1: Edge-directed upscale (bilinear as base, then CAS sharpen)
-        # Convert BGR to RGB float [0,1]
-        rgb = frame[:, :, ::-1].astype(np.float32) / 255.0
-
-        # Bilinear upscale
-        upscaled = np.zeros((h * self._scale, w * self._scale, 3), dtype=np.float32)
-        for c in range(3):
-            upscaled[:, :, c] = _bilinear_upscale(rgb[:, :, c], self._scale)
-
-        # Step 2: Contrast-Adaptive Sharpening (CAS)
-        upscaled = _cas_sharpen(upscaled, self._sharpness)
-
-        # Clamp and convert back to BGR uint8
-        upscaled = np.clip(upscaled * 255.0, 0, 255).astype(np.uint8)
-        bgr = upscaled[:, :, ::-1]
-        return np.ascontiguousarray(bgr)
-
-    def get_scale_factor(self) -> int:
-        return self._scale
-
-    def unload(self) -> None:
-        self._loaded = False
-
-
-class FSR2Engine(AIInferenceEngine):
-    """FSR 2.0 (FidelityFX Super Resolution 2.0) via FFmpeg libplacebo filter.
-
-    Uses FFmpeg's libplacebo filter for GPU-accelerated upscaling with
-    FSR 2.0 algorithm. Requires FFmpeg full build with libplacebo support.
+    FSR 3.1 is the only exposed FSR engine. This base class is deliberately
+    private because it is an implementation detail, not a separate catalog
+    option.
     """
 
     def __init__(self, model_path: str, engine_id: str):
@@ -684,10 +623,10 @@ class FSR2Engine(AIInferenceEngine):
         self._sharpness = 0.7  # libplacebo CAS sharpness
 
     def load(self) -> bool:
-        """Load FSR 2.0 engine by verifying FFmpeg has libplacebo support."""
-        # Parse scale from engine_id (e.g., "upscale-fsr-2x-v2" -> 2).
+        """Load the libplacebo backend required by FSR 3.1."""
+        # Parse the scale from the FSR 3.1 engine id.
         import re
-        m = re.search(r"fsr-(\d+)x", self.engine_id or "")
+        m = re.search(r"fsr31-(\d+)x", self.engine_id or "")
         if m:
             self._scale = int(m.group(1))
         else:
@@ -695,22 +634,22 @@ class FSR2Engine(AIInferenceEngine):
 
         # Get FFmpeg path with libplacebo support
         try:
-            from src.ffmpeg.manager import get_ffmpeg_path_for_fsr2, has_libplacebo_support
-            self._ffmpeg_path = get_ffmpeg_path_for_fsr2()
+            from src.ffmpeg.manager import get_ffmpeg_path_for_fsr31, has_libplacebo_support
+            self._ffmpeg_path = get_ffmpeg_path_for_fsr31()
             if not self._ffmpeg_path or not os.path.exists(self._ffmpeg_path):
-                logger.error("FFmpeg not found for FSR 2.0")
+                logger.error("FFmpeg not found for FSR 3.1")
                 return False
 
             # Verify libplacebo support
             if not has_libplacebo_support(self._ffmpeg_path):
-                logger.error("FFmpeg does not have libplacebo support for FSR 2.0")
+                logger.error("FFmpeg does not have libplacebo support for FSR 3.1")
                 return False
 
             self._loaded = True
-            logger.info("FSR 2.0 engine loaded (scale=%d, ffmpeg=%s)", self._scale, self._ffmpeg_path)
+            logger.info("FSR 3.1 libplacebo backend loaded (scale=%d, ffmpeg=%s)", self._scale, self._ffmpeg_path)
             return True
         except Exception as exc:
-            logger.error("Failed to load FSR 2.0 engine: %s", exc)
+            logger.error("Failed to load FSR 3.1 libplacebo backend: %s", exc)
             return False
 
     def process_frame(self, frame: np.ndarray) -> np.ndarray:
@@ -724,7 +663,7 @@ class FSR2Engine(AIInferenceEngine):
         Popen por frame es la única vía correcta.
         """
         if not self._loaded or not self._ffmpeg_path:
-            raise RuntimeError("FSR 2.0 engine not loaded")
+            raise RuntimeError("FSR 3.1 libplacebo backend not loaded")
 
         h, w = frame.shape[:2]
         new_h, new_w = h * self._scale, w * self._scale
@@ -741,8 +680,7 @@ class FSR2Engine(AIInferenceEngine):
         #   * w / h: output dimensions
         #   * upscaler / downscaler: scaler name
         #   * deband: boolean (NOT ``apply_debanding``; older builds)
-        #   * sigmoid: boolean, default True. FSR 2.0 expects a sigmoid
-        #              tonemap-like curve, so we keep it on.
+        #   * sigmoid: boolean, default True for the libplacebo scaler.
         cmd = [
             self._ffmpeg_path,
             "-loglevel", "error",
@@ -792,7 +730,7 @@ class FSR2Engine(AIInferenceEngine):
             proc.kill()
             raise RuntimeError("FFmpeg libplacebo timeout")
         except Exception as exc:
-            logger.error("FSR 2.0 processing failed: %s", exc)
+            logger.error("FSR 3.1 libplacebo processing failed: %s", exc)
             raise
 
     # Scaler selection is cached at class level so we only probe once
@@ -818,9 +756,9 @@ class FSR2Engine(AIInferenceEngine):
         ffmpeg = cls.__module__  # noqa: F841 (we read it later via instance)
         # We need the actual ffmpeg path; we get it from a temporary
         # instantiation. Cheap because __init__ is trivial.
-        tmp = cls("", "upscale-fsr-2x-v2")
-        from src.ffmpeg.manager import get_ffmpeg_path_for_fsr2
-        ffmpeg_path = get_ffmpeg_path_for_fsr2()
+        tmp = cls("", "upscale-fsr31-2x")
+        from src.ffmpeg.manager import get_ffmpeg_path_for_fsr31
+        ffmpeg_path = get_ffmpeg_path_for_fsr31()
         if not ffmpeg_path or not os.path.exists(ffmpeg_path):
             cls._SCALER_CACHE[cache_key] = ("spline36", "spline36")
             return cls._SCALER_CACHE[cache_key]
@@ -849,7 +787,7 @@ class FSR2Engine(AIInferenceEngine):
         up = next((s for s in upscaler_candidates if _probe(s, "upscaler")), "spline36")
         down = next((s for s in downscaler_candidates if _probe(s, "downscaler")), "spline36")
         cls._SCALER_CACHE[cache_key] = (up, down)
-        logger.info("FSR 2.0 scaler selection: upscaler=%s, downscaler=%s", up, down)
+        logger.info("FSR 3.1 scaler selection: upscaler=%s, downscaler=%s", up, down)
         return up, down
 
     def get_scale_factor(self) -> int:
@@ -860,15 +798,15 @@ class FSR2Engine(AIInferenceEngine):
         self._loaded = False
 
 
-class FSR31Engine(FSR2Engine):
-    """FSR 3.1 engine: FSR 2.0 upscaling + libplacebo frame interpolation.
+class FSR31Engine(_LibplaceboEngine):
+    """FSR 3.1 engine: libplacebo upscaling + frame interpolation.
 
     FSR 3.1's actual frame generation (optical flow) requires DirectX 12/Vulkan
     swapchain integration and is not available in FFmpeg/libplacebo for batch
     video processing. This engine provides the closest available approximation:
 
-    - **Upscaling**: FSR 2.0 temporal upscaling via libplacebo ``upscaler=fsr``
-      (inherited from FSR2Engine).
+    - **Upscaling**: libplacebo temporal upscaling via ``upscaler=fsr``
+      (inherited from the private libplacebo backend).
     - **Frame interpolation**: libplacebo ``frame_mixer`` temporal blending,
       which synthesizes intermediate frames by blending consecutive frames
       based on their timestamps. While not optical-flow-based, it produces
@@ -876,9 +814,9 @@ class FSR31Engine(FSR2Engine):
 
     Three modes are supported via ``mode`` parameter:
 
-    - ``"upscale"`` — FSR 2.0 upscaling only (no frame interpolation).
+    - ``"upscale"`` — FSR 3.1 upscaling only (no frame interpolation).
     - ``"interpolate"`` — Frame interpolation only (no upscaling).
-    - ``"both"`` — FSR 2.0 upscaling + frame interpolation combined.
+    - ``"both"`` — FSR 3.1 upscaling + frame interpolation combined.
 
     The interpolation mode requires the pipeline to pass ``prev_frame`` and
     ``next_frame`` to ``process_frame()``. When ``mode == "both"``, frames are
@@ -910,7 +848,7 @@ class FSR31Engine(FSR2Engine):
             interpolated frame between prev_frame and next_frame.
         """
         if self._mode == "upscale":
-            # Pure FSR 2.0 upscaling, no interpolation
+            # Pure FSR 3.1 upscaling, no interpolation
             return super().process_frame(frame)
 
         if self._mode == "interpolate":
@@ -967,98 +905,6 @@ class FSR31Engine(FSR2Engine):
         super().unload()
 
 
-def _bilinear_upscale(img: np.ndarray, scale: int) -> np.ndarray:
-    """Bilinear upscale of a 2D float32 array."""
-    h, w = img.shape
-    new_h, new_w = h * scale, w * scale
-    # Use numpy repeat + interpolation for bilinear
-    # First, create coordinate maps
-    y = np.linspace(0, h - 1, new_h)
-    x = np.linspace(0, w - 1, new_w)
-    # Bilinear interpolation
-    y0 = np.floor(y).astype(int)
-    y1 = np.minimum(y0 + 1, h - 1)
-    x0 = np.floor(x).astype(int)
-    x1 = np.minimum(x0 + 1, w - 1)
-    wy = (y - y0).reshape(-1, 1)
-    wx = (x - x0).reshape(1, -1)
-    # Interpolate
-    Ia = img[y0[:, None], x0[None, :]]
-    Ib = img[y0[:, None], x1[None, :]]
-    Ic = img[y1[:, None], x0[None, :]]
-    Id = img[y1[:, None], x1[None, :]]
-    top = Ia * (1 - wx) + Ib * wx
-    bottom = Ic * (1 - wx) + Id * wx
-    return top * (1 - wy) + bottom * wy
-
-
-def _cas_sharpen(img: np.ndarray, sharpness: float) -> np.ndarray:
-    """Contrast-Adaptive Sharpening (CAS) from FSR 1.0.
-
-    Args:
-        img: RGB float32 array in [0, 1], shape (H, W, 3)
-        sharpness: 0.0 to 1.0
-    """
-    if sharpness <= 0:
-        return img
-
-    h, w, c = img.shape
-    # Pad image by replicating edges
-    padded = np.pad(img, ((1, 1), (1, 1), (0, 0)), mode='edge')
-
-    # Compute local min/max in 3x3 neighborhood
-    min_img = np.minimum(np.minimum(
-        np.minimum(padded[:-2, :-2, :], padded[:-2, 1:-1, :]),
-        padded[:-2, 2:, :]),
-        np.minimum(padded[1:-1, :-2, :], padded[1:-1, 2:, :]),
-    )
-    min_img = np.minimum(min_img, np.minimum(
-        padded[2:, :-2, :], np.minimum(padded[2:, 1:-1, :], padded[2:, 2:, :])
-    ))
-
-    max_img = np.maximum(np.maximum(
-        np.maximum(padded[:-2, :-2, :], padded[:-2, 1:-1, :]),
-        padded[:-2, 2:, :]),
-        np.maximum(padded[1:-1, :-2, :], padded[1:-1, 2:, :]),
-    )
-    max_img = np.maximum(max_img, np.maximum(
-        padded[2:, :-2, :], np.maximum(padded[2:, 1:-1, :], padded[2:, 2:, :])
-    ))
-
-    # Center pixel
-    center = padded[1:-1, 1:-1, :]
-
-    # CAS algorithm
-    # 1. Compute local contrast
-    local_contrast = max_img - min_img
-    # 2. Compute sharpening factor
-    # FSR 1.0 uses: 1 / (local_contrast / (4 * (center - local_min)) + 1)
-    # Simplified version:
-    denom = local_contrast / (4.0 * (center - min_img + 1e-5))
-    denom = np.clip(denom, 0, 1.0 / (sharpness * sharpness))
-    factor = 1.0 / (denom + 1.0)
-
-    # 3. Apply sharpening
-    # CAS uses a 3x3 weighted kernel
-    kernel = np.array([
-        [0, 0.25, 0],
-        [0.25, 0, 0.25],
-        [0, 0.25, 0],
-    ], dtype=np.float32)
-
-    # Apply convolution
-    result = np.zeros_like(img)
-    for dy in range(3):
-        for dx in range(3):
-            if kernel[dy, dx] == 0:
-                continue
-            result += kernel[dy, dx] * padded[dy:dy+h, dx:dx+w, :]
-
-    # Blend with original based on factor
-    result = center + (result - center) * factor * sharpness * 2.0
-    return np.clip(result, 0, 1)
-
-
 # ---------------------------------------------------------------------------
 # Factory
 # ---------------------------------------------------------------------------
@@ -1085,9 +931,9 @@ def create_inference_engine(
     """
     last_error = None
 
-    # FSR engines don't need model files — pure algorithmic upscale
-    if engine_id and engine_id.startswith("upscale-fsr"):
-        if "fsr31" in engine_id:
+    # FSR 3.1 is the only exposed algorithmic engine; it uses the
+    # bundled FFmpeg/libplacebo backend and needs no model file.
+    if engine_id and "fsr31" in engine_id:
             # FSR 3.1: mode derivado del sufijo del engine id.
             if engine_id.endswith("-interp"):
                 mode = "interpolate"
@@ -1102,25 +948,6 @@ def create_inference_engine(
             except Exception as exc:
                 last_error = f"FSR 3.1 engine failed: {exc}"
                 logger.error(last_error)
-        elif engine_id.endswith("-v2"):
-            # FSR 2.0 requires FFmpeg full with libplacebo
-            try:
-                engine = FSR2Engine(model_path, engine_id)
-                if engine.load():
-                    return engine
-            except Exception as exc:
-                last_error = f"FSR 2.0 engine failed: {exc}"
-                logger.error(last_error)
-        else:
-            # FSR 1.0 (CPU-based)
-            try:
-                engine = FSREngine(model_path, engine_id)
-                if engine.load():
-                    return engine
-            except Exception as exc:
-                last_error = f"FSR engine failed: {exc}"
-                logger.error(last_error)
-
     # If we already have an .onnx file, go straight to ONNX Runtime.
     if model_path and model_path.endswith(".onnx"):
         try:
@@ -1224,10 +1051,16 @@ def find_onnx_model(model_dir: str) -> Optional[str]:
     return None
 
 
-def _onnx_input_channels_ok(onnx_path: str) -> bool:
-    """Probe barata de una sesión ORT: True si el canal de entrada fijo del
-    modelo es 3 (o dinámico). Usado para no reutilizar un .onnx huérfano
-    convertido desde el archivo equivocado (p.ej. un RRDBNet de 12 canales)."""
+def _onnx_input_channels_ok(onnx_path: str) -> Optional[bool]:
+    """Probe barata de una sesión ORT.
+
+    True  -> el canal de entrada fijo del modelo es 3 (o dinámico).
+    False -> canal fijo != 3 (un .onnx huérfano convertido desde el archivo
+             equivocado, p.ej. un RRDBNet de 12 canales).
+    None  -> no se pudo verificar (onnxruntime ausente, sesión rota...). El
+             llamador NO debe borrar el archivo: un .onnx previo puede ser
+             perfectamente válido aunque ORT no pueda abrirlo en este entorno.
+    """
     try:
         import onnxruntime as ort
         sess = ort.InferenceSession(onnx_path, providers=["CPUExecutionProvider"])
@@ -1236,7 +1069,7 @@ def _onnx_input_channels_ok(onnx_path: str) -> bool:
             return shape[1] == 3
         return True
     except Exception:
-        return False
+        return None
 
 
 def convert_pth_to_onnx(pth_path: str) -> Optional[str]:
@@ -1265,9 +1098,13 @@ def convert_pth_to_onnx_ex(pth_path: str) -> tuple[Optional[str], str]:
     if os.path.exists(onnx_path):
         # Reutilizar el .onnx solo si es compatible con el pipeline: un
         # .onnx huérfano (convertido desde el archivo equivocado, p.ej. con
-        # 12 canales de entrada) reventaría el render. Si no sirve, se
-        # borra y se reconvierte.
-        if _onnx_input_channels_ok(onnx_path):
+        # 12 canales de entrada) reventaría el render. Si el probe no puede
+        # verificar (None: onnxruntime ausente o sesión rota) se MANTIENE el
+        # archivo: fue creado por una conversión previa y borrarlo sin poder
+        # reconvertir dejaría al usuario sin ONNX. Solo se borra cuando se
+        # prueba POSITIVAMENTE que el canal fijo no es 3.
+        probe = _onnx_input_channels_ok(onnx_path)
+        if probe is not False:
             return onnx_path, ""
         try:
             os.remove(onnx_path)
@@ -1390,6 +1227,79 @@ def convert_pth_to_onnx_ex(pth_path: str) -> tuple[Optional[str], str]:
         return None, f"Unexpected error during conversion: {exc}"
 
 
+# Extensiones de pesos PyTorch que el pipeline puede cargar directamente.
+_TORCH_WEIGHT_EXTS = (".safetensors", ".bin", ".pth", ".pt")
+
+
+def pick_weight_file(model_dir: str, engine_id: str,
+                     recursive: bool = True) -> Optional[str]:
+    """Elige el archivo de pesos que MEJOR coincide con ``engine_id``.
+
+    Los repos de modelos contienen varios pesos (p.ej. el repo de
+    Real-ESRGAN trae 9 .pth: 6 RRDBNet + 3 SRVGG). Coger "el primero en
+    orden de listado" era un azar: el conversor ONNX podía convertir el
+    modelo equivocado (un RRDBNet de 67 MB en vez del SRVGG de 2,4 MB
+    del AnimeVideo v3) o un peso con 12 canales de entrada que reventaba
+    el render. Se puntúa cada archivo por coincidencia con los tokens
+    del engine_id y se elige el mejor; en empate gana el más superficial
+    (los pesos del catálogo viven en la raíz).
+
+    ``recursive=False`` limita la búsqueda a la raíz de ``model_dir``
+    (comportamiento histórico de ``get_model_path``).
+    """
+    if not model_dir or not os.path.isdir(model_dir):
+        return None
+    skip_parts = ("upscale", "interpolate", "denoise", "colorize", "facerestore")
+    tokens = [
+        t for t in re.split(r"[^a-z0-9]+", (engine_id or "").lower())
+        if t and t not in skip_parts
+    ]
+    joined = "-".join(tokens)
+
+    candidates: list[tuple[int, str]] = []  # (depth, abspath)
+    if recursive:
+        try:
+            for root, dirs, files in os.walk(model_dir):
+                dirs[:] = [d for d in dirs if not d.startswith(".") and d != "__pycache__"]
+                depth = root[len(model_dir):].count(os.sep)
+                for fname in files:
+                    if fname.lower().endswith(_TORCH_WEIGHT_EXTS):
+                        candidates.append((depth, os.path.join(root, fname)))
+        except OSError:
+            pass
+    else:
+        try:
+            candidates = [
+                (0, os.path.join(model_dir, fname))
+                for fname in os.listdir(model_dir)
+                if fname.lower().endswith(_TORCH_WEIGHT_EXTS)
+            ]
+        except OSError:
+            pass
+    if not candidates:
+        return None
+
+    def _score(fname: str) -> int:
+        n = re.sub(r"[^a-z0-9]+", "-", fname.lower()).strip("-")
+        score = sum(1 for t in tokens if t in n)
+        if joined and joined in n:
+            score += 1
+        return score
+
+    best_path: Optional[str] = None
+    best_key = (-1, 0)  # (score, -depth): a igual score gana la raíz
+    for depth, path in candidates:
+        score = _score(os.path.basename(path))
+        key = (score, -depth)
+        if key > best_key:
+            best_key, best_path = key, path
+    if best_path is None or best_key[0] <= 0:
+        # Sin coincidencia con los tokens: orden estable por (profundidad,
+        # ruta) para no depender del orden aleatorio del walk.
+        best_path = min(candidates, key=lambda c: (c[0], c[1].lower()))[1]
+    return best_path
+
+
 def get_model_path(engine_id_catalog: str, engine_id_inference: str = "onnxruntime") -> Optional[str]:
     """Obtiene la ruta al modelo para un engine del catálogo.
 
@@ -1421,35 +1331,10 @@ def get_model_path(engine_id_catalog: str, engine_id_inference: str = "onnxrunti
             # No hay ONNX disponible
             return None
         elif engine_id_inference == "torch":
-            # Buscar archivos de peso de PyTorch.
-            weight_exts = (".safetensors", ".bin", ".pth", ".pt")
-            candidates = sorted(
-                fname for fname in os.listdir(model_dir)
-                if fname.lower().endswith(weight_exts)
-            )
-            if not candidates:
-                return None
-            # Los repos de modelos contienen varios pesos (p.ej. el repo de
-            # Real-ESRGAN trae 9 .pth). "El primero en orden de listado" era
-            # un azar: podía caer un modelo con 12 canales de entrada que
-            # reventaba el render. Puntuamos cada archivo por coincidencia
-            # con los tokens del engine_id y elegimos el mejor.
-            tokens = [
-                t for t in re.split(r"[^a-z0-9]+", engine_id_catalog.lower())
-                if t and t not in ("upscale", "interpolate", "denoise", "colorize", "facerestore")
-            ]
-            joined = "-".join(tokens)
-            best, best_score = None, -1
-            for fname in candidates:
-                n = re.sub(r"[^a-z0-9]+", "-", fname.lower()).strip("-")
-                score = sum(1 for t in tokens if t in n)
-                if joined and joined in n:
-                    score += 1
-                if score > best_score:
-                    best, best_score = fname, score
-            if best is None or best_score <= 0:
-                best = candidates[0]
-            return os.path.join(model_dir, best)
+            # Buscar archivos de peso de PyTorch puntuando por coincidencia
+            # con el engine_id (misma lógica que pick_weight_file, limitada a
+            # la raíz para no cambiar el comportamiento histórico).
+            return pick_weight_file(model_dir, engine_id_catalog, recursive=False)
 
     except Exception as exc:
         logger.error("Failed to get model path: %s", exc)

@@ -13,13 +13,33 @@ def get_base_dir():
     return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
+def get_data_dir():
+    """Directorio escribible para modelos, runtimes, logs y preferencias.
+
+    Los bundles portables mantienen los datos junto al ejecutable. Los
+    paquetes instalados en Linux (Debian/AppImage) pueden vivir en /opt o en
+    un montaje de solo lectura, así que sus lanzadores establecen
+    ``DRAGGY_DATA_DIR`` y usan el perfil del usuario.
+    """
+    override = os.environ.get("DRAGGY_DATA_DIR")
+    if override:
+        return os.path.abspath(os.path.expanduser(override))
+    if getattr(sys, "frozen", False) and sys.platform.startswith("linux") and (
+        os.environ.get("APPIMAGE") or os.environ.get("APPDIR")
+    ):
+        data_home = os.environ.get("XDG_DATA_HOME") or os.path.join(
+            os.path.expanduser("~"), ".local", "share"
+        )
+        return os.path.join(data_home, "draggy-encoder")
+    return get_base_dir()
+
+
 def get_bin_dir():
     """Directorio raíz donde se almacenan todos los assets externos:
-    binarios, modelos, runtimes, logs. Reside junto al ejecutable para que
-    cualquier release (pip/PyInstaller) tenga su propia copia autocontenida.
+    binarios, modelos, runtimes, logs. Reside junto al ejecutable en bundles
+    portables y en el perfil del usuario cuando se instala en Linux.
     """
-    base = get_base_dir()
-    return os.path.join(base, "bin")
+    return os.path.join(get_data_dir(), "bin")
 
 
 def get_ffmpeg_dir():
@@ -28,7 +48,7 @@ def get_ffmpeg_dir():
 
 
 def get_ffmpeg_full_dir():
-    """Subcarpeta dedicada a FFmpeg completo con libplacebo (FSR 2.0)."""
+    """Subcarpeta dedicada a FFmpeg completo con libplacebo (FSR 3.1)."""
     return os.path.join(get_bin_dir(), "ffmpeg-full")
 
 
@@ -164,7 +184,7 @@ FFMPEG_DOWNLOAD_URLS = {
     },
 }
 
-# URLs de descarga de FFmpeg completo con libplacebo (FSR 2.0 support)
+# URLs de descarga de FFmpeg completo con libplacebo (FSR 3.1 support)
 # libplacebo is LGPL so it's included in BOTH gpl and lgpl BtbN variants.
 # Strategy: try smaller lgpl-shared first, then larger gpl-shared, then johnvansickle.com.
 FFMPEG_FULL_DOWNLOAD_URLS = {

@@ -128,9 +128,8 @@ class ModelSearchResult(QFrame):
         installed = bool(eng.get("installed", False))
         enabled = bool(eng.get("enabled", False))
         onnx_converted = bool(eng.get("onnx_converted", False))
-        is_fsr = eng.get("engine_id", "").startswith("upscale-fsr")
-        is_fsr2 = eng.get("engine_id", "").endswith("-v2")
         is_fsr31 = "fsr31" in eng.get("engine_id", "")
+        is_fsr = is_fsr31
         compat = eng.get("compatibility") or {}
         needs_conversion = compat.get("needs_conversion", False)
         compat_reason = compat.get("reason", "")
@@ -237,10 +236,10 @@ class ModelSearchResult(QFrame):
         middle.addLayout(pop_row)
 
         # State badge
-        state_text = self._state_label(installed, enabled, onnx_converted, is_fsr, is_fsr2, is_fsr31)
+        state_text = self._state_label(installed, enabled, onnx_converted, is_fsr31)
         state_lbl = QLabel(state_text)
         state_lbl.setObjectName("stateBadge")
-        state_lbl.setStyleSheet(self._state_stylesheet(installed, enabled, onnx_converted, is_fsr, is_fsr2, is_fsr31))
+        state_lbl.setStyleSheet(self._state_stylesheet(installed, enabled, onnx_converted, is_fsr31))
         state_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
         state_lbl.setMaximumWidth(180)
         middle.addWidget(state_lbl, alignment=Qt.AlignmentFlag.AlignLeft)
@@ -252,7 +251,7 @@ class ModelSearchResult(QFrame):
         right.setSpacing(6)
 
         # Primary button: Install / Re-clone / Open folder
-        self.btn_install = QPushButton(self._install_label(installed, is_fsr, is_fsr2, is_fsr31))
+        self.btn_install = QPushButton(self._install_label(installed, is_fsr31))
         self.btn_install.setObjectName("primaryBtn")
         if not eng.get("is_implemented", False):
             self.btn_install.setEnabled(False)
@@ -266,19 +265,6 @@ class ModelSearchResult(QFrame):
                 self.btn_install.setEnabled(True)
                 self.btn_install.setText("Download FFmpeg")
                 self.btn_install.setToolTip("FSR 3.1 requires FFmpeg full with libplacebo. Click to download.")
-        elif is_fsr and not is_fsr2:
-            self.btn_install.setEnabled(False)
-            self.btn_install.setText("Built-in")
-            self.btn_install.setToolTip("FSR 1.0 is built into the application — no download needed.")
-        elif is_fsr2:
-            if installed:
-                self.btn_install.setEnabled(False)
-                self.btn_install.setText("Ready")
-                self.btn_install.setToolTip("FSR 2.0 is ready — FFmpeg full with libplacebo is available.")
-            else:
-                self.btn_install.setEnabled(True)
-                self.btn_install.setText("Download FFmpeg")
-                self.btn_install.setToolTip("FSR 2.0 requires FFmpeg full with libplacebo. Click to download.")
         self.btn_install.clicked.connect(self._on_install_clicked)
         right.addWidget(self.btn_install)
 
@@ -365,38 +351,26 @@ class ModelSearchResult(QFrame):
             return f"{n / 1000:.1f}K"
         return str(n)
 
-    def _state_label(self, installed: bool, enabled: bool, converted: bool, is_fsr: bool = False, is_fsr2: bool = False, is_fsr31: bool = False) -> str:
+    def _state_label(self, installed: bool, enabled: bool, converted: bool, is_fsr31: bool = False) -> str:
         if not installed:
             return "NOT INSTALLED"
         if is_fsr31:
             return "FSR 3.1 (GPU)"
-        if is_fsr2:
-            return "FSR 2.0 (GPU)"
-        if is_fsr:
-            return "FSR 1.0 (CPU)"
         if enabled:
             return "ENABLED" + (" · ONNX" if converted else "")
         return "INSTALLED · DISABLED"
 
-    def _state_stylesheet(self, installed: bool, enabled: bool, converted: bool, is_fsr: bool = False, is_fsr2: bool = False, is_fsr31: bool = False) -> str:
+    def _state_stylesheet(self, installed: bool, enabled: bool, converted: bool, is_fsr31: bool = False) -> str:
         if not installed:
             return "background-color: #e74c3c; color: #ffffff; border-radius: 8px; padding: 2px 10px; font-weight: bold; font-size: 11px;"
         if is_fsr31:
             return "background-color: #16a085; color: #ffffff; border-radius: 8px; padding: 2px 10px; font-weight: bold; font-size: 11px;"
-        if is_fsr2:
-            return "background-color: #2980b9; color: #ffffff; border-radius: 8px; padding: 2px 10px; font-weight: bold; font-size: 11px;"
-        if is_fsr:
-            return "background-color: #8e44ad; color: #ffffff; border-radius: 8px; padding: 2px 10px; font-weight: bold; font-size: 11px;"
         if enabled:
             return "background-color: #00d2d3; color: #0f0f1a; border-radius: 8px; padding: 2px 10px; font-weight: bold; font-size: 11px;"
         return "background-color: #2c3e50; color: #a0a0b0; border-radius: 8px; padding: 2px 10px; font-weight: bold; font-size: 11px;"
 
-    def _install_label(self, installed: bool, is_fsr: bool = False, is_fsr2: bool = False, is_fsr31: bool = False) -> str:
+    def _install_label(self, installed: bool, is_fsr31: bool = False) -> str:
         if is_fsr31:
-            return "Download FFmpeg" if not installed else "Ready"
-        if is_fsr and not is_fsr2:
-            return "Built-in"
-        if is_fsr2:
             return "Download FFmpeg" if not installed else "Ready"
         return "Re-clone" if installed else "Install"
 

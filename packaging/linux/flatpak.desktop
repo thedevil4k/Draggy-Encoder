@@ -1,0 +1,9 @@
+[Desktop Entry]
+Name=Draggy Encoder
+Comment=AI-powered video compression and upscaling
+Exec=draggy-encoder
+Icon=com.draggyencoder.DraggyEncoder
+Terminal=false
+Type=Application
+Categories=AudioVideo;Video;Graphics;
+StartupNotify=true

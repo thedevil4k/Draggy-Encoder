@@ -44,23 +44,30 @@ def get_runtime_modules_dir() -> str:
 
 
 def get_embed_python_path() -> str | None:
-    """Ruta al Python embebido que instala el instalador (frozen), si existe.
+    """Return the private Python used to install AI runtimes in a bundle.
 
-    El bundle PyInstaller NO incluye torch/onnxruntime: se descargan bajo
-    demanda. Para ello hace falta un intérprete real; ``sys.executable``
-    en modo congelado es el EXE y no sabe ejecutar ``-m pip``. El
-    instalador coloca un Python embebido (con pip bootstrapado) junto al
-    ejecutable y ``_pip_python()`` lo usa. En modo fuente devuelve None.
+    PyInstaller's executable cannot run ``-m pip`` itself. Windows bundles
+    carry ``embed-python/python.exe``; Linux bundles carry a relocatable
+    ``runtime-python/bin/python3.13`` tree. Source checkouts use the current
+    interpreter directly and therefore return None here.
     """
     if not getattr(sys, "frozen", False):
         return None
-    candidates = (
-        os.path.join(get_bin_dir(), "embed-python", "python.exe"),
-        os.path.join(os.path.dirname(sys.executable), "embed-python", "python.exe"),
-    )
-    for c in candidates:
-        if os.path.isfile(c):
-            return c
+    root = os.path.dirname(sys.executable)
+    if sys.platform == "win32":
+        candidates = (
+            os.path.join(get_bin_dir(), "embed-python", "python.exe"),
+            os.path.join(root, "embed-python", "python.exe"),
+        )
+    else:
+        candidates = (
+            os.path.join(root, "runtime-python", "bin", "python3.13"),
+            os.path.join(root, "runtime-python", "bin", "python3"),
+            os.path.join(get_bin_dir(), "runtime-python", "bin", "python3.13"),
+        )
+    for candidate in candidates:
+        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
     return None
 
 
@@ -78,8 +85,8 @@ def _pip_python() -> str:
     if embed is not None:
         return embed
     raise RuntimeError(
-        "No se encontró el Python embebido (embed-python/python.exe) junto "
-        "al ejecutable. Reinstala la aplicación: los runtimes de IA no se "
+        "No se encontró el Python privado para instalar runtimes junto al "
+        "ejecutable. Reinstala la aplicación: los runtimes de IA no se "
         "pueden instalar sin él, así que la inferencia IA quedará "
         "deshabilitada hasta entonces."
     )
@@ -599,6 +606,11 @@ def install_pytorch(
         progress_callback(100, "PyTorch listo")
     inject_runtime_paths()
     ensure_runtime_dlls_on_path()
+    if not _can_import("torch"):
+        raise RuntimeError(
+            "PyTorch installation finished but the local runtime could not "
+            "be imported. The installation may be incomplete or incompatible."
+        )
     return used_variant
 
 
@@ -626,6 +638,11 @@ def install_onnxruntime(
         progress_callback(100, "ONNX Runtime listo")
     inject_runtime_paths()
     ensure_runtime_dlls_on_path()
+    if not _can_import("onnxruntime"):
+        raise RuntimeError(
+            "ONNX Runtime installation finished but the local runtime could "
+            "not be imported. The installation may be incomplete or incompatible."
+        )
     return used_variant
 
 
@@ -675,9 +692,20 @@ def install_runtimes(
     if progress_callback:
         progress_callback(100, "Runtimes de IA listos")
 
-    # Después de instalar, reinjectar por si acaso
+    # Después de instalar, reinjectar por si acaso y verificar ambos
+    # paquetes. Pip puede terminar con código 0 aunque un wheel nativo no
+    # sea importable en la versión/arquitectura actual.
     inject_runtime_paths()
     ensure_runtime_dlls_on_path()
+    missing = [
+        name for name in ("torch", "onnxruntime")
+        if not _can_import(name)
+    ]
+    if missing:
+        raise RuntimeError(
+            "Runtime installation finished but these local packages could "
+            "not be imported: " + ", ".join(missing)
+        )
     return used_variant
 
 

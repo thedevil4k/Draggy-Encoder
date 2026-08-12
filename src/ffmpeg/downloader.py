@@ -2,6 +2,7 @@ import logging
 import os
 import platform
 import shutil
+import stat
 import sys
 import tarfile
 import tempfile
@@ -273,6 +274,47 @@ def _download_parallel(
             raise
 
 
+def _safe_archive_member_path(root_dir, member_name):
+    """Return a safe extraction path or raise on traversal attempts."""
+    name = str(member_name or "").replace("\\\\", "/")
+    # Reject POSIX/Windows absolute paths and parent traversal before joining.
+    if name.startswith("/") or (len(name) >= 2 and name[1] == ":"):
+        raise RuntimeError(f"Unsafe archive member path: {member_name!r}")
+    parts = [part for part in name.split("/") if part not in ("", ".")]
+    if any(part == ".." for part in parts):
+        raise RuntimeError(f"Unsafe archive member path: {member_name!r}")
+    root = os.path.abspath(root_dir)
+    target = os.path.abspath(os.path.join(root, *parts))
+    try:
+        if os.path.commonpath((root, target)) != root:
+            raise RuntimeError(f"Unsafe archive member path: {member_name!r}")
+    except ValueError as exc:
+        raise RuntimeError(f"Unsafe archive member path: {member_name!r}") from exc
+    return target
+
+
+def _safe_extract_zip(archive, extract_dir):
+    """Extract a ZIP without allowing traversal or symlink entries."""
+    for member in archive.infolist():
+        _safe_archive_member_path(extract_dir, member.filename)
+        mode = (member.external_attr >> 16) & 0o170000
+        if mode == stat.S_IFLNK:
+            raise RuntimeError(f"Symlink entries are not allowed: {member.filename!r}")
+    for member in archive.infolist():
+        archive.extract(member, extract_dir)
+
+
+def _safe_extract_tar(archive, extract_dir):
+    """Extract a TAR without allowing traversal, links or device files."""
+    members = archive.getmembers()
+    for member in members:
+        _safe_archive_member_path(extract_dir, member.name)
+        if member.issym() or member.islnk() or member.isdev():
+            raise RuntimeError(f"Link/device entries are not allowed: {member.name!r}")
+    for member in members:
+        archive.extract(member, extract_dir)
+
+
 # ---------------------------------------------------------------------------
 # Búsqueda de ejecutables tras extracción
 # ---------------------------------------------------------------------------
@@ -383,10 +425,10 @@ def download_ffmpeg(progress_callback=None, parent=None):
         try:
             if archive_type == "zip":
                 with zipfile.ZipFile(archive_path, "r") as z:
-                    z.extractall(extract_dir)
+                    _safe_extract_zip(z, extract_dir)
             elif archive_type == "tar.xz":
                 with tarfile.open(archive_path, "r:xz") as t:
-                    t.extractall(extract_dir)
+                    _safe_extract_tar(t, extract_dir)
         except (zipfile.BadZipFile, tarfile.TarError, OSError) as exc:
             raise RuntimeError("Archive extraction failed: {}".format(exc)) from exc
 
@@ -450,7 +492,7 @@ def _download_and_extract_archive(url, archive_type, tmpdir, archive_name, progr
         if archive_type in ("zip", "7z"):
             try:
                 with zipfile.ZipFile(archive_path, "r") as z:
-                    z.extractall(extract_dir)
+                    _safe_extract_zip(z, extract_dir)
             except zipfile.BadZipFile:
                 # Try 7z command
                 import subprocess
@@ -467,7 +509,7 @@ def _download_and_extract_archive(url, archive_type, tmpdir, archive_name, progr
                     )
         elif archive_type == "tar.xz":
             with tarfile.open(archive_path, "r:xz") as t:
-                t.extractall(extract_dir)
+                _safe_extract_tar(t, extract_dir)
     except (zipfile.BadZipFile, tarfile.TarError, OSError) as exc:
         raise RuntimeError("Archive extraction failed: {}".format(exc)) from exc
 
@@ -475,7 +517,7 @@ def _download_and_extract_archive(url, archive_type, tmpdir, archive_name, progr
 
 
 def download_ffmpeg_full(progress_callback=None, parent=None):
-    """Download FFmpeg full (with libplacebo) for FSR 2.0 support.
+    """Download FFmpeg full (with libplacebo) for FSR 3.1 support.
 
     Downloads from BtbN lgpl-shared build (smaller, includes libplacebo).
     Falls back to gpl-shared, then johnvansickle.com static build.

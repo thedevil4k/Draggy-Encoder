@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>com.draggyencoder.DraggyEncoder</id>
+  <name>Draggy Encoder</name>
+  <summary>AI-powered video compression and upscaling</summary>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>MIT</project_license>
+  <developer_name>Draggy Encoder contributors</developer_name>
+  <description>
+    <p>Visual video encoding with AI upscaling, frame interpolation, denoising and colorization workflows.</p>
+    <p>Build video pipelines visually, compare previews, preserve audio and choose the fastest measured inference backend.</p>
+  </description>
+  <categories>
+    <category>AudioVideo</category>
+    <category>Video</category>
+    <category>Graphics</category>
+  </categories>
+  <keywords>
+    <keyword>video</keyword>
+    <keyword>encoder</keyword>
+    <keyword>upscaling</keyword>
+    <keyword>AI</keyword>
+    <keyword>FFmpeg</keyword>
+    <keyword>GPU</keyword>
+  </keywords>
+  <url type="homepage">https://github.com/thedevil4k/Draggy-Encoder</url>
+  <url type="bugtracker">https://github.com/thedevil4k/Draggy-Encoder/issues</url>
+  <icon type="local">com.draggyencoder.DraggyEncoder</icon>
+  <launchable type="desktop-id">com.draggyencoder.DraggyEncoder.desktop</launchable>
+  <provides>
+    <binary>draggy-encoder</binary>
+  </provides>
+  <screenshots>
+    <screenshot type="default">
+      <caption>Build a visual video workflow with AI processing steps</caption>
+      <image>https://github.com/thedevil4k/Draggy-Encoder/releases/latest/download/DraggyEncoder-screenshot-workflow.png</image>
+    </screenshot>
+    <screenshot>
+      <caption>Manage AI engines, runtimes and inference backends</caption>
+      <image>https://github.com/thedevil4k/Draggy-Encoder/releases/latest/download/DraggyEncoder-screenshot-engines.png</image>
+    </screenshot>
+  </screenshots>
+  <content_rating type="oars-1.1"/>
+</component>

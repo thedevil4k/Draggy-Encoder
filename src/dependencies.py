@@ -417,7 +417,7 @@ def _ffmpeg_status():
 
 
 def _ffmpeg_full_status():
-    """Estado del binario FFmpeg 'full' (con libplacebo, FSR 2.0/3.1)."""
+    """Estado del binario FFmpeg 'full' (con libplacebo, FSR 3.1)."""
     ensure_runtime_dirs()
     from src.ffmpeg.manager import (
         get_local_ffmpeg_full_path,
@@ -429,7 +429,7 @@ def _ffmpeg_full_status():
         status = STATUS_INSTALLED
         detail = (
             "FFmpeg full (libplacebo) installed in the program folder. "
-            "Required for FSR 2.0 / FSR 3.1."
+            "Required for FSR 3.1."
         )
     elif exists:
         status = STATUS_ERROR
@@ -438,7 +438,7 @@ def _ffmpeg_full_status():
         status = STATUS_MISSING
         detail = (
             "Not installed. Download it from the 'AI Engines' tab "
-            "(FSR 2.0 / FSR 3.1 rows)."
+            "(FSR 3.1 rows)."
         )
     return {
         "id": "ffmpeg_full",

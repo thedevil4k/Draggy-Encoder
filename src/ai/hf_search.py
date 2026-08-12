@@ -292,7 +292,7 @@ def search_catalog_models(
             if query_lower not in display_name.lower() and query_lower not in repo_id.lower():
                 continue
 
-        # Engines sin repo HF (FSR, FSR 2.0, etc.) no tienen metadata
+        # Engines sin repo HF (FSR 3.1, etc.) no tienen metadata
         # en HuggingFace. Saltamos la query silenciosamente en lugar de
         # invocar ``_query_model_info("")`` que falla con "Repo id must
         # use alphanumeric chars" en cada refresh del diálogo.

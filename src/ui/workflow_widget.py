@@ -506,14 +506,14 @@ class AIWorkflowStep(QFrame):
         self.combo_scale.blockSignals(True)
         self.combo_scale.clear()
 
-        # FSR engines: scale is encoded in the engine_id (fsr-2x, fsr-3x, fsr-4x)
+        # FSR 3.1 scale is encoded in the engine_id (fsr31-2x, fsr31-3x, fsr31-4x)
         if engine_id and engine_id.startswith("upscale-fsr"):
             import re
             from src.ai.registry import get_entry
-            m = re.search(r'fsr-(\d+)x', engine_id)
+            m = re.search(r'fsr31-(\d+)x', engine_id)
             scale = int(m.group(1)) if m else 2
 
-            # FSR 3.0 engines have a "mode" field in the catalog entry
+            # FSR 3.1 engines have a "mode" field in the catalog entry
             # (upscale, interpolate, both). Pass it through so the pipeline
             # knows whether to interpolate frames.
             mode = "upscale"  # default

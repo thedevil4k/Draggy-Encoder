@@ -55,6 +55,33 @@ def _get_duration_seconds(ffmpeg_path, video_path):
         return 0
 
 
+def _make_temp_output_path(output_path: str) -> str:
+    """Create a same-directory temporary output name and reserve no handle.
+
+    Keeping the temporary file beside the destination makes ``os.replace``
+    atomic on the same filesystem and prevents a failed FFmpeg run from
+    exposing a truncated file under the user's final name.
+    """
+    directory = os.path.dirname(os.path.abspath(output_path)) or "."
+    os.makedirs(directory, exist_ok=True)
+    ext = os.path.splitext(output_path)[1] or ".tmp"
+    fd, path = tempfile.mkstemp(prefix=".draggy-render-", suffix=ext, dir=directory)
+    os.close(fd)
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+    return path
+
+
+def _cleanup_path(path):
+    if path and os.path.exists(path):
+        try:
+            os.remove(path)
+        except OSError:
+            logger.warning("Could not remove temporary render file: %s", path)
+
+
 def _needs_audio_reencode(settings):
     """Indica si vamos a re-codificar audio (y por tanto tiene sentido medir)."""
     audio = settings.get("audio", "copy")
@@ -96,9 +123,9 @@ def compress_video(ffmpeg_path, input_path, output_path, settings,
     """Comprime un vídeo completo. Audio boost usa two-pass loudnorm.
 
     ``ai_engines`` is an optional mapping ``{"Upscale": "engine_id",
-    "Interpolate": "engine_id", "Colorize": "engine_id"}``. Today we
-    resolve each id against ``src.ai.registry`` and emit a friendly
-    status line; real inference wiring comes in a follow-up milestone.
+    "Interpolate": "engine_id", "Colorize": "engine_id"}``. The GUI
+    resolves the mapping into loaded engines for the AI path; this function
+    keeps the selection in the status/log for non-AI compression callers.
     Pass ``None`` (default) for projects that don't use the AI chain.
 
     ``on_process`` is an optional callable invoked once with the
@@ -145,25 +172,31 @@ def compress_video(ffmpeg_path, input_path, output_path, settings,
     if loudnorm_meas:
         _emit_phase(phase_cb, "start", "audio", label="Audio boost", pct=100)
         _emit_phase(phase_cb, "end", "audio")
-    args = build_args(input_path, output_path, settings, loudnorm_meas=loudnorm_meas)
-    result = run_ffmpeg(
-        ffmpeg_path,
-        args,
-        progress_callback=progress_callback,
-        abort_event=abort_event,
-        on_process=on_process,
-    )
-    if result:
-        _emit_phase(phase_cb, "progress", "compress", pct=100)
-        _emit_phase(phase_cb, "end", "compress")
-    else:
+    temp_output = _make_temp_output_path(output_path)
+    try:
+        args = build_args(input_path, temp_output, settings, loudnorm_meas=loudnorm_meas)
+        result = run_ffmpeg(
+            ffmpeg_path,
+            args,
+            progress_callback=progress_callback,
+            abort_event=abort_event,
+            on_process=on_process,
+        )
+        if result and os.path.exists(temp_output) and os.path.getsize(temp_output) > 0:
+            os.replace(temp_output, output_path)
+            _emit_phase(phase_cb, "progress", "compress", pct=100)
+            _emit_phase(phase_cb, "end", "compress")
+            return True
         _emit_phase(phase_cb, "failed", "compress")
-    return result
+        return False
+    finally:
+        _cleanup_path(temp_output)
 
 
 def generate_preview(ffmpeg_path, input_path, settings, progress_callback=None,
                      status_callback=None, abort_event=None, ai_engines=None,
-                     on_process=None, phase_cb=None):
+                     inference_engines=None, on_process=None, on_processes=None,
+                     phase_cb=None):
     """Genera un preview: codifica un clip corto y extrae un frame aleatorio.
 
     Devuelve una tupla ``(original_bytes, compressed_bytes)`` con los bytes de
@@ -172,8 +205,10 @@ def generate_preview(ffmpeg_path, input_path, settings, progress_callback=None,
     gráficos desde este worker.
 
     ``ai_engines`` carries the same shape as in ``compress_video`` and is
-    surfaced in the status line so the user sees which engines were chosen
-    for this preview. Real inference wiring lands in a follow-up.
+    surfaced in the status line. When ``inference_engines`` is provided,
+    the short clip is rendered through the real AI chain before the frame is
+    extracted; without it the function keeps the lightweight FFmpeg-only
+    preview path.
     """
     settings = dict(settings)
     duration = _get_duration_seconds(ffmpeg_path, input_path)
@@ -237,15 +272,33 @@ def generate_preview(ffmpeg_path, input_path, settings, progress_callback=None,
 
         fmt = settings.get("format", "mp4")
         compressed_path = os.path.join(tmpdir, f"preview_compressed.{fmt}")
-        args = build_args(input_path, compressed_path, preview_settings, loudnorm_meas=loudnorm_meas)
-        logger.info("Preview encode args: %s", args)
-        ok = run_ffmpeg(
-            ffmpeg_path,
-            args,
-            progress_callback=progress_callback,
-            abort_event=abort_event,
-            on_process=on_process,
-        )
+        if inference_engines:
+            # Use the exact frame-by-frame pipeline used by Compress. The
+            # preview settings already disable audio and constrain the input
+            # to the short clip above, so no temporary audio track is needed.
+            ok = compress_video_with_ai(
+                ffmpeg_path,
+                input_path,
+                compressed_path,
+                preview_settings,
+                inference_engines=inference_engines,
+                progress_callback=progress_callback,
+                status_callback=status_callback,
+                abort_event=abort_event,
+                on_process=on_process,
+                on_processes=on_processes,
+                phase_cb=phase_cb,
+            )
+        else:
+            args = build_args(input_path, compressed_path, preview_settings, loudnorm_meas=loudnorm_meas)
+            logger.info("Preview encode args: %s", args)
+            ok = run_ffmpeg(
+                ffmpeg_path,
+                args,
+                progress_callback=progress_callback,
+                abort_event=abort_event,
+                on_process=on_process,
+            )
         if not ok:
             raise RuntimeError(
                 "FFmpeg failed to encode the preview clip. "
@@ -304,6 +357,7 @@ def compress_video_with_ai(
     status_callback=None,
     abort_event=None,
     on_process=None,
+    on_processes=None,
     inference_engines=None,
     phase_cb=None,
 ):
@@ -347,6 +401,12 @@ def compress_video_with_ai(
         )
     if not engines:
         raise ValueError("compress_video_with_ai got an empty engine list")
+
+    # Render into a staging file next to the final destination. This keeps
+    # direct callers safe as well as the GUI worker: only a fully finalized
+    # video is ever published under ``output_path``.
+    final_output_path = output_path
+    output_path = _make_temp_output_path(final_output_path)
 
     info = get_video_info(ffmpeg_path, input_path)
     src_w = int(info.get("width", 0))
@@ -545,24 +605,44 @@ def compress_video_with_ai(
         audio_thread = threading.Thread(target=_audio_job, daemon=True)
         audio_thread.start()
 
-    # --- FFmpeg decoder: rawvideo BGR24 pipe ---
+    # --- FFmpeg decoder: rawvideo BGR24 pipe -----------------------------
+    # ``start_time``/``end_time`` are used by the AI preview to decode only
+    # its short sample. Normal full renders leave them unset.
     dec_cmd = [
         ffmpeg_path,
         "-hide_banner",
         "-loglevel", "warning",
-        "-i", input_path,
+    ]
+    _decode_start = settings.get("start_time")
+    _decode_end = settings.get("end_time")
+    if _decode_start not in (None, ""):
+        dec_cmd.extend(["-ss", str(_decode_start)])
+    dec_cmd.extend(["-i", input_path])
+    try:
+        _decode_start_s = float(_decode_start) if _decode_start not in (None, "") else 0.0
+        _decode_end_s = float(_decode_end) if _decode_end not in (None, "") else None
+    except (TypeError, ValueError):
+        _decode_start_s, _decode_end_s = 0.0, None
+    if _decode_end_s is not None and _decode_end_s > _decode_start_s:
+        dec_cmd.extend(["-t", str(_decode_end_s - _decode_start_s)])
+    dec_cmd.extend([
         "-map", "0:v:0",
         "-f", "rawvideo",
         "-pix_fmt", "bgr24",
         "-v", "error",
         "pipe:1",
-    ]
+    ])
     dec_proc = subprocess.Popen(
         dec_cmd,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         bufsize=src_w * src_h * 3 * 4,  # buffer ~4 frames
     )
+    if on_processes:
+        try:
+            on_processes(dec_proc, "decoder")
+        except Exception:
+            pass
 
     # --- FFmpeg encoder: read rawvideo BGR24 pipe, encode to output ---
     # GPU encoders (NVENC/AMF/QSV) do not accept the generic CPU
@@ -630,7 +710,7 @@ def compress_video_with_ai(
     log_entry = {
         "timestamp": datetime.now().isoformat(),
         "input": input_path,
-        "output": output_path,
+        "output": final_output_path,
         "source_resolution": f"{src_w}x{src_h}",
         "ai_engine": chain_name,
         "ai_engines": engine_ids,
@@ -666,6 +746,11 @@ def compress_video_with_ai(
     )
     if on_process:
         on_process(enc_proc)
+    if on_processes:
+        try:
+            on_processes(enc_proc, "encoder")
+        except Exception:
+            pass
 
     # Drain de stderr en background. Sin drain, el PIPE de stderr se
     # acaba llenando (especialmente con NVENC, que escribe stats) y el
@@ -893,6 +978,7 @@ def compress_video_with_ai(
         log_entry["status"] = "error"
         log_entry["error"] = str(exc)
         _save_render_log(log_file, log_entry)
+        _cleanup_path(output_path)
         raise
     finally:
         # Cerramos stdin del encoder para que reciba EOF y termine por
@@ -945,6 +1031,7 @@ def compress_video_with_ai(
         _save_render_log(log_file, log_entry)
 
     if abort_event and abort_event.is_set():
+        _cleanup_path(output_path)
         return False
 
     # Gate de integridad: para nosotros un render "éxito" DEVUELVE ALGO.
@@ -958,8 +1045,7 @@ def compress_video_with_ai(
         )
         logger.error(msg)
         try:
-            if os.path.exists(output_path):
-                os.remove(output_path)
+            _cleanup_path(output_path)
         except Exception:
             pass
         return False
@@ -992,15 +1078,14 @@ def compress_video_with_ai(
         # sin audio y el usuario pensaría que iba bien).
         if not mux_ok and (not abort_event or not abort_event.is_set()):
             msg = (
-                f"\u26a0 Audio mux failed \u2014 '{os.path.basename(output_path)}' "
-                "has no audio. The video stream is intact."
+                f"\u26a0 Audio mux failed \u2014 '{os.path.basename(final_output_path)}' "
+                "the staged video was discarded."
             )
             if status_callback:
                 status_callback(msg)
-            logger.warning(
-                "Audio mux returned False for %s (output has no audio track)",
-                output_path,
-            )
+            logger.error("Audio mux failed for %s", final_output_path)
+            _cleanup_path(output_path)
+            return False
 
     # Limpieza del audio temporal pre-codificado en paralelo.
     if audio_tmp[0] and os.path.exists(audio_tmp[0]):
@@ -1008,6 +1093,19 @@ def compress_video_with_ai(
             os.remove(audio_tmp[0])
         except Exception:
             pass
+
+    # Final publication happens after video encoding and optional audio mux.
+    # os.replace is atomic because staging lives beside the destination.
+    if not os.path.exists(output_path) or os.path.getsize(output_path) <= 0:
+        logger.error("AI pipeline produced no valid staged output: %s", output_path)
+        _cleanup_path(output_path)
+        return False
+    try:
+        os.replace(output_path, final_output_path)
+    except Exception as exc:
+        logger.error("Could not publish AI output %s: %s", final_output_path, exc)
+        _cleanup_path(output_path)
+        return False
 
     if status_callback:
         elapsed = time.time() - t_start
@@ -1026,8 +1124,8 @@ def compress_video_with_ai(
     # Guardar log final con estado de éxito
     log_entry["status"] = "success"
     log_entry["render_seconds"] = time.time() - t_start
-    if os.path.exists(output_path):
-        log_entry["output_size_bytes"] = os.path.getsize(output_path)
+    if os.path.exists(final_output_path):
+        log_entry["output_size_bytes"] = os.path.getsize(final_output_path)
     _save_render_log(log_file, log_entry)
 
     return True

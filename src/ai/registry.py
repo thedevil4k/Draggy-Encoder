@@ -203,106 +203,12 @@ CATALOG = [
         "lfs_warning": False,
         "similar_models_url": "https://openmodeldb.info/?search=omnisr",
     },
-    # --- FSR (FidelityFX Super Resolution) — no model download needed -------
-    {
-        "engine_id": "upscale-fsr-2x",
-        "display_name": "FSR 1.0 x2 (CPU, no download)",
-        "category": "Upscale",
-        "hf_repo_id": "",
-        "hf_url": "https://gpuopen.com/fsr/",
-        "size_estimate": "0 MB (algorithmic)",
-        "sample_shape": "1x3xHxW -> 1x3x(2H)x(2W)",
-        "license": "MIT",
-        "popularity_score": 85,
-        "quality_score": 70,
-        "is_implemented": True,
-        "sentinel": "",
-        "lfs_warning": False,
-    },
-    {
-        "engine_id": "upscale-fsr-3x",
-        "display_name": "FSR 1.0 x3 (CPU, no download)",
-        "category": "Upscale",
-        "hf_repo_id": "",
-        "hf_url": "https://gpuopen.com/fsr/",
-        "size_estimate": "0 MB (algorithmic)",
-        "sample_shape": "1x3xHxW -> 1x3x(3H)x(3W)",
-        "license": "MIT",
-        "popularity_score": 70,
-        "quality_score": 68,
-        "is_implemented": True,
-        "sentinel": "",
-        "lfs_warning": False,
-    },
-    {
-        "engine_id": "upscale-fsr-4x",
-        "display_name": "FSR 1.0 x4 (CPU, no download)",
-        "category": "Upscale",
-        "hf_repo_id": "",
-        "hf_url": "https://gpuopen.com/fsr/",
-        "size_estimate": "0 MB (algorithmic)",
-        "sample_shape": "1x3xHxW -> 1x3x(4H)x(4W)",
-        "license": "MIT",
-        "popularity_score": 80,
-        "quality_score": 72,
-        "is_implemented": True,
-        "sentinel": "",
-        "lfs_warning": False,
-    },
-
-    # --- FSR 2.0 (via FFmpeg libplacebo) — requires FFmpeg full build -------
-    {
-        "engine_id": "upscale-fsr-2x-v2",
-        "display_name": "FSR 2.0 x2 (GPU via libplacebo)",
-        "category": "Upscale",
-        "hf_repo_id": "",
-        "hf_url": "https://gpuopen.com/fsr/",
-        "size_estimate": "0 MB (FFmpeg filter)",
-        "sample_shape": "1x3xHxW -> 1x3x(2H)x(2W)",
-        "license": "MIT",
-        "popularity_score": 90,
-        "quality_score": 82,
-        "is_implemented": True,
-        "sentinel": "",
-        "lfs_warning": False,
-    },
-    {
-        "engine_id": "upscale-fsr-3x-v2",
-        "display_name": "FSR 2.0 x3 (GPU via libplacebo)",
-        "category": "Upscale",
-        "hf_repo_id": "",
-        "hf_url": "https://gpuopen.com/fsr/",
-        "size_estimate": "0 MB (FFmpeg filter)",
-        "sample_shape": "1x3xHxW -> 1x3x(3H)x(3W)",
-        "license": "MIT",
-        "popularity_score": 80,
-        "quality_score": 80,
-        "is_implemented": True,
-        "sentinel": "",
-        "lfs_warning": False,
-    },
-    {
-        "engine_id": "upscale-fsr-4x-v2",
-        "display_name": "FSR 2.0 x4 (GPU via libplacebo)",
-        "category": "Upscale",
-        "hf_repo_id": "",
-        "hf_url": "https://gpuopen.com/fsr/",
-        "size_estimate": "0 MB (FFmpeg filter)",
-        "sample_shape": "1x3xHxW -> 1x3x(4H)x(4W)",
-        "license": "MIT",
-        "popularity_score": 85,
-        "quality_score": 78,
-        "is_implemented": True,
-        "sentinel": "",
-        "lfs_warning": False,
-    },
-
-# --- FSR 3.1 (FSR 2.0 upscaling + frame interpolation via libplacebo) -------
+    # --- FSR 3.1 (libplacebo upscale + frame interpolation) ---------------
     # FSR 3.1 decouples FSR upscaling from frame generation (like the real
     # FSR 3.1 API), allowing each feature independently.  Frame generation
     # (optical flow) requires DX12/Vulkan swapchain integration and is NOT
     # available in FFmpeg/libplacebo for batch video processing. These
-    # engines provide the closest available approximation: FSR 2.0 temporal
+    # engines provide the closest available approximation: libplacebo temporal
     # upscaling + temporal blending frame rate interpolation.
     {
         "engine_id": "upscale-fsr31-2x",
@@ -652,6 +558,13 @@ def _enrich(entry: dict, state: dict) -> dict:
                 out["arch"] = arch
         except Exception:
             pass
+    # Benchmarks por backend (ms/frame ONNX vs PyTorch) para el selector de
+    # backend de la fila. Lectura barata (cacheada por mtime en engines.json).
+    try:
+        from src.ai.engines_state import get_backend_benchmarks
+        out["benchmarks"] = get_backend_benchmarks(entry["engine_id"])
+    except Exception:
+        out["benchmarks"] = {"onnx": None, "torch": None}
     return out
 
 

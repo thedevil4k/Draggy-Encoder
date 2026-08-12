@@ -96,8 +96,11 @@ def run_selftest() -> int:
             from src.runtimes.manager import get_embed_python_path
             embed = get_embed_python_path()
             if embed is None:
-                raise RuntimeError("embed-python/python.exe no está junto al ejecutable")
-            report(f"  OK   embedded python: {embed}")
+                raise RuntimeError(
+                    "No se encontró el Python privado para instalar runtimes "
+                    "junto al ejecutable"
+                )
+            report(f"  OK   private runtime python: {embed}")
         except Exception:
             ok = False
             report("  FAIL embedded python:\n  " + traceback.format_exc().strip())

@@ -179,10 +179,12 @@ def get_state(engine_id: str) -> dict:
         install_path       = None   (caller computes via registry)
         onnx_converted     = False
         onnx_path          = None
+        inference_backend  = "auto" ("auto" | "torch" | "onnxruntime")
         last_error         = None
 
-    FSR engines (upscale-fsr-*) are always installed+enabled because
-    they are pure-algorithmic (no model download required).
+    FSR 3.1 engines are available when the bundled FFmpeg build exposes
+    the required libplacebo filter; unlike model engines they have no
+    model directory to validate.
     """
     data = _load()
     raw = data.get("engines", {}).get(engine_id) or {}
@@ -193,15 +195,15 @@ def get_state(engine_id: str) -> dict:
         "install_path": raw.get("install_path"),
         "onnx_converted": bool(raw.get("onnx_converted", False)),
         "onnx_path": raw.get("onnx_path"),
+        "inference_backend": str(raw.get("inference_backend") or "auto").strip().lower(),
         "last_error": raw.get("last_error"),
     }
-    # FSR 1.0 engines are always available (no download needed)
-    if engine_id and engine_id.startswith("upscale-fsr") and not engine_id.endswith("-v2") and "fsr31" not in engine_id:
-        state["installed"] = True
-        state["enabled"] = True
-
-    # FSR 2.0 and FSR 3.0 engines require FFmpeg full with libplacebo
-    if engine_id and (engine_id.endswith("-v2") or "fsr31" in engine_id):
+    # Normalizar: valores desconocidos caen a "auto" (ONNX si hay .onnx,
+    # PyTorch si no).
+    if state["inference_backend"] not in ("torch", "onnxruntime"):
+        state["inference_backend"] = "auto"
+    # FSR 3.1 requires FFmpeg full with libplacebo.
+    if engine_id and "fsr31" in engine_id:
         # Check if FFmpeg full is available
         try:
             from src.ffmpeg.manager import has_libplacebo_support, get_local_ffmpeg_full_path
@@ -222,8 +224,8 @@ def get_state(engine_id: str) -> dict:
     # directorio del modelo ya no existe (el usuario borró/trasladó los
     # pesos a mano, o un borrado quedó a medias), reportamos installed=False
     # y corregimos engines.json para que la UI nunca muestre un INSTALLED
-    # fantasma. FSR 1.0/2.0/3.1 se excluyen: no usan directorio de modelos
-    # (2.0/3.1 usan el binario FFmpeg full, que ya se validó arriba).
+    # fantasma. FSR 3.1 se excluye: usa el binario FFmpeg full, validado
+    # arriba, y no tiene directorio de modelos.
     if (
         engine_id
         and state.get("installed")
@@ -404,29 +406,154 @@ def mark_failed(engine_id: str, message: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Benchmarks (ms/frame por engine, cacheado en el mismo engines.json)
+# Benchmarks (ms/frame por engine y por backend, cacheado en engines.json)
 # ---------------------------------------------------------------------------
 #
-# El ETA del render lee estos datos sin re-medir: se escriben tras una
-# instalación (worker en background) o manualmente. La clave top-level
-# ``benchmarks`` no interfiere con ``engines`` (get_state/all_states la
-# ignoran).
+# El ETA del render y el selector de backend leen estos datos sin re-medir:
+# se escriben en background tras una instalación/conversión. La clave
+# top-level ``benchmarks`` no interfiere con ``engines`` (get_state/
+# all_states la ignoran).
+#
+# Estructura actual (por backend):
+#
+#     benchmarks: {
+#       "upscale-realesr-animevideov3": {
+#         "onnx":  {"ms_per_frame": 12.3, ...},
+#         "torch": {"ms_per_frame": 15.1, ...},
+#       }
+#     }
+#
+# Las entradas planas legacy (un único dict de ms/frame sin backend) siguen
+# leyéndose como fallback para no perder el ETA de instalaciones antiguas.
+
+_BENCHMARK_BACKENDS = ("onnx", "torch")
+
+
+def _benchmark_is_current(backend: str, value: dict) -> bool:
+    """Reject measurements tied to a changed runtime, GPU or weight file."""
+    if not isinstance(value, dict):
+        return False
+    stored_env = value.get("environment_signature")
+    if stored_env:
+        try:
+            from src.ai.benchmark import current_environment_signature
+            if stored_env != current_environment_signature(backend):
+                return False
+        except Exception:
+            # Do not make old/partially installed environments unusable just
+            # because the optional diagnostic probe failed.
+            pass
+    stored_file = value.get("model_fingerprint")
+    if stored_file:
+        path = stored_file.get("path") if isinstance(stored_file, dict) else None
+        try:
+            st = os.stat(path)
+            current_file = {
+                "path": os.path.abspath(path),
+                "size": st.st_size,
+                "mtime_ns": st.st_mtime_ns,
+            }
+            if current_file != stored_file:
+                return False
+        except (OSError, TypeError):
+            return False
+    return True
+
+
+def get_backend_benchmarks(engine_id: str) -> dict:
+    """Benchmarks medidos por backend para ``engine_id``.
+
+    Devuelve ``{"onnx": dict|None, "torch": dict|None}``. None cuando ese
+    backend aún no se ha medido (o no tiene .onnx/pesos medibles).
+    """
+    data = _load()
+    raw = data.get("benchmarks", {}).get(engine_id)
+    if isinstance(raw, dict) and any(b in raw for b in _BENCHMARK_BACKENDS):
+        return {
+            backend: (
+                copy.deepcopy(value)
+                if value and _benchmark_is_current(backend, value)
+                else None
+            )
+            for backend, value in (
+                ("onnx", raw.get("onnx")),
+                ("torch", raw.get("torch")),
+            )
+        }
+    return {"onnx": None, "torch": None}
+
+
+def set_backend_benchmark(engine_id: str, backend: str, data: dict) -> bool:
+    """Almacena (o borra con None/{}) el benchmark de UN backend.
+
+    ``backend`` debe ser "onnx" o "torch". Emite ``state_changed`` en el
+    bus para que la UI (selector de backend de la fila) se repinte con los
+    ms/frame recién medidos.
+    """
+    backend = str(backend or "").strip().lower()
+    if backend not in _BENCHMARK_BACKENDS:
+        return False
+    if not engine_id:
+        return False
+    try:
+        _assert_slug(engine_id)
+    except ValueError as exc:
+        print(f"[engines_state] invalid engine_id: {exc}", file=sys.stderr)
+        return False
+    ok = False
+    with _STATE_LOCK:
+        data_all = _load()
+        bucket = data_all.setdefault("benchmarks", {}).setdefault(engine_id, {})
+        if data:
+            bucket[backend] = data
+        else:
+            bucket.pop(backend, None)
+            if not bucket:
+                data_all["benchmarks"].pop(engine_id, None)
+        ok = _save(data_all)
+    if ok:
+        try:
+            from src.ai.bus import bus as _state_bus
+            _state_bus.state_changed.emit(engine_id)
+        except Exception:
+            pass
+    return ok
+
 
 def get_benchmark(engine_id: str) -> Optional[dict]:
     """Benchmark cacheado para ``engine_id``, o None.
+
+    Devuelve la medición del backend ACTIVO del engine (el que usaría el
+    render según ``inference_backend`` + benchmarks: preferencia explícita
+    -> ese backend; "auto" con ambos medidos -> el más rápido; "auto" sin
+    comparación -> ONNX si hay .onnx medido, si no PyTorch). Compat: si
+    solo hay una entrada plana legacy (medida sin distinguir backend), se
+    devuelve esa.
 
     Forma: ``{"ms_per_frame": float, "fps": float, "resolution": [w, h],
     "device": str, "measured_at_iso": str}``.
     """
     data = _load()
-    return copy.deepcopy(data.get("benchmarks", {}).get(engine_id)) or None
+    raw = data.get("benchmarks", {}).get(engine_id)
+    if isinstance(raw, dict) and any(b in raw for b in _BENCHMARK_BACKENDS):
+        current = get_backend_benchmarks(engine_id)
+        backend = resolve_backend(engine_id)
+        if backend == "torch":
+            return copy.deepcopy(current.get("torch")) or None
+        if backend == "onnxruntime":
+            return copy.deepcopy(current.get("onnx")) or None
+        # "auto" sin benchmarks comparables: ONNX si hay .onnx medido.
+        return copy.deepcopy(current.get("onnx")) or copy.deepcopy(current.get("torch")) or None
+    # Legacy: entrada plana de un solo dict.
+    return copy.deepcopy(raw) or None
 
 
 def set_benchmark(engine_id: str, data: dict) -> bool:
     """Almacena (o sobrescribe) el benchmark de ``engine_id``.
 
     ``data`` debe ser un dict JSON-serializable; si es None/{} se elimina
-    la entrada. Misma política de escritura atómica + lock que ``patch``.
+    la entrada completa (ambos backends). Misma política de escritura
+    atómica + lock que ``patch``.
     """
     if not engine_id:
         return False
@@ -444,6 +571,12 @@ def set_benchmark(engine_id: str, data: dict) -> bool:
         else:
             bucket.pop(engine_id, None)
         ok = _save(data_all)
+    if ok:
+        try:
+            from src.ai.bus import bus as _state_bus
+            _state_bus.state_changed.emit(engine_id)
+        except Exception:
+            pass
     return ok
 
 
@@ -460,6 +593,66 @@ def mark_onnx(engine_id: str, onnx_path: Optional[str] = None,
         onnx_path=onnx_path,
         last_error=None if converted else "conversion cancelled",
     )
+
+
+# ---------------------------------------------------------------------------
+# Backend de inferencia por engine (auto / torch / onnxruntime)
+# ---------------------------------------------------------------------------
+
+
+def get_backend(engine_id: str) -> str:
+    """Preferencia de motor de inferencia para un engine.
+
+    Devuelve "auto" (por defecto: ONNX si hay .onnx, PyTorch si no),
+    "torch" (forzar PyTorch, nunca convertir) u "onnxruntime" (forzar
+    ONNX, convirtiendo si hace falta). Normalizado en ``get_state``.
+    """
+    st = get_state(engine_id) or {}
+    backend = str(st.get("inference_backend") or "auto").strip().lower()
+    if backend in ("torch", "onnxruntime"):
+        return backend
+    return "auto"
+
+
+def set_backend(engine_id: str, backend: str) -> bool:
+    """Persiste la preferencia de motor de inferencia de un engine.
+
+    Acepta "auto", "torch", "onnxruntime" (case-insensitive); cualquier
+    otro valor se normaliza a "auto". Emite ``state_changed`` en el bus
+    para que la UI se repinte.
+    """
+    backend = str(backend or "").strip().lower()
+    if backend not in ("torch", "onnxruntime"):
+        backend = "auto"
+    return patch(engine_id, inference_backend=backend)
+
+
+def resolve_backend(engine_id: str) -> str:
+    """Backend CONCRETO que usará el render para ``engine_id``.
+
+    Devuelve "torch" u "onnxruntime" cuando la decisión está clara:
+
+      - Preferencia explícita ("torch"/"onnxruntime") -> se respeta tal
+        cual, pase lo que pase con los benchmarks.
+      - "auto" con benchmarks de AMBOS backends -> el más rápido medido en
+        este equipo (empate -> "onnxruntime", el default histórico cuando
+        hay .onnx). La medición refleja el hardware real, así que gana la
+        que mida menos ms/frame, sin heurísticas de providers.
+
+    Si "auto" y no hay benchmarks comparables devuelve "auto" para que el
+    llamador aplique la heurística clásica (ONNX si hay .onnx, si no
+    PyTorch): nunca inventamos una medición que no existe.
+    """
+    backend = get_backend(engine_id)
+    if backend != "auto":
+        return backend
+    bench = get_backend_benchmarks(engine_id)
+    onnx_ms = (bench.get("onnx") or {}).get("ms_per_frame")
+    torch_ms = (bench.get("torch") or {}).get("ms_per_frame")
+    if onnx_ms is None or torch_ms is None:
+        return "auto"
+    # Empate -> ONNX Runtime (mismo criterio que el selector de la UI).
+    return "onnxruntime" if torch_ms >= onnx_ms else "torch"
 
 
 def reset_all() -> bool:

@@ -191,7 +191,7 @@ def _has_libplacebo_at(ffmpeg_path: str, mtime: float) -> bool:
 
 
 def has_libplacebo_support(ffmpeg_path=None):
-    """Check if FFmpeg has libplacebo support (needed for FSR 2.0).
+    """Check if FFmpeg has libplacebo support (needed for FSR 3.1).
 
     Returns True if libplacebo filter is available, False otherwise.
 
@@ -273,12 +273,12 @@ def get_install_info(ffmpeg_path=None):
 
 
 # ---------------------------------------------------------------------------
-# FFmpeg selection for FSR 2.0
+# FFmpeg selection for FSR 3.1
 # ---------------------------------------------------------------------------
 
 
-def get_ffmpeg_path_for_fsr2():
-    """Get the appropriate FFmpeg path for FSR 2.0 processing.
+def get_ffmpeg_path_for_fsr31():
+    """Get the appropriate FFmpeg path for FSR 3.1 processing.
 
     Returns the path to FFmpeg with libplacebo support if available,
     otherwise falls back to standard FFmpeg.
@@ -292,19 +292,8 @@ def get_ffmpeg_path_for_fsr2():
     return get_local_ffmpeg_path()
 
 
-def get_ffmpeg_path_for_fsr31():
-    """Get the appropriate FFmpeg path for FSR 3.0 processing.
-
-    FSR 3.0 uses the same libplacebo support as FSR 2.0 (for the
-    upscaling + frame_mixer interpolation). Returns the path to FFmpeg
-    with libplacebo support if available, otherwise falls back to
-    standard FFmpeg.
-    """
-    return get_ffmpeg_path_for_fsr2()
-
-
 def ensure_ffmpeg_full(parent=None, progress_callback=None):
-    """Ensure FFmpeg full (with libplacebo) is available for FSR 2.0.
+    """Ensure FFmpeg full (with libplacebo) is available for FSR 3.1.
 
     Tries to download FFmpeg full if not already present.
     Returns True if successful, False otherwise.
@@ -550,7 +539,7 @@ def uninstall(parent=None):
 
 
 def uninstall_full(parent=None):
-    """Borra la instalación de FFmpeg 'full' (libplacebo, FSR 2.0/3.1)."""
+    """Borra la instalación de FFmpeg 'full' (libplacebo, FSR 3.1)."""
     try:
         from src.dependencies import _rmtree_force
     except Exception:

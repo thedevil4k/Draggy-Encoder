@@ -22,7 +22,7 @@ import os
 from src import config
 
 
-_DIR = os.path.join(config.get_base_dir(), "personal")
+_DIR = os.path.join(config.get_data_dir(), "personal")
 _HF_TOKEN_FILE = "hf_token.json"
 
 

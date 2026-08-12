@@ -1,15 +1,19 @@
 # -*- mode: python ; coding: utf-8 -*-
-"""Spec de PyInstaller para Draggy Encoder (Windows, ventana sin consola).
+import os
+
+"""Spec de PyInstaller para Draggy Encoder (Windows/Linux, ventana sin consola).
 
 El bundle es deliberadamente ligero: NO incluye torch/onnxruntime/optimum/
 safetensors/nvidia-* (~3.5 GB si los llevara). La app los instala bajo
 demanda en bin/runtimes/ai_modules con pip --target, usando el Python
-embebido (embed-python/python.exe) que coloca el instalador Inno junto al
-ejecutable (ver src/runtimes/manager.py:_pip_python).
+privado que se coloca junto al ejecutable (embed-python/python.exe en
+Windows o runtime-python/bin/python3.13 en Linux; ver
+src/runtimes/manager.py:_pip_python).
 
 El directorio de salida (dist/DraggyEncoder) se copia completo por el
-instalador. La app escribe sus datos de sesión (bin/, personal/) junto al
-EXE, por eso el instalador usa una ruta de usuario sin UAC.
+instalador o se empaqueta como tar.gz, .deb y AppImage en Linux. Los bundles
+portables escriben sus datos de sesión (bin/, personal/) junto al ejecutable;
+los lanzadores de .deb/AppImage redirigen esos datos al perfil del usuario.
 """
 
 # Los imports de torch/onnxruntime/safetensors en el código son perezosos

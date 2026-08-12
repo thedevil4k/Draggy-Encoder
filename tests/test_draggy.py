@@ -21,6 +21,8 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
+import zipfile
 
 import pytest
 
@@ -48,6 +50,11 @@ def _current_cp_tag():
         sys.version_info.major, sys.version_info.minor,
         sys.version_info.major, sys.version_info.minor,
     )
+
+
+def _foreign_cp_tag():
+    """Stable incompatible tag independent of the Python running pytest."""
+    return "cp999-cp999-win_amd64"
 
 
 # ==--------------------------------------------------------------------==
@@ -156,6 +163,45 @@ def test_engines_state_load_cache_stays_fresh_and_returns_copies(isolated_engine
     assert es._load()["engines"]["x"]["installed"] is True
 
 
+def test_archive_extraction_rejects_path_traversal(tmp_path):
+    """Downloaded archives must not write outside their extraction root."""
+    from src.ffmpeg.downloader import _safe_extract_zip
+
+    archive_path = tmp_path / "malicious.zip"
+    outside = tmp_path / "escaped.txt"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("../escaped.txt", "owned")
+    extract_dir = tmp_path / "extract"
+    extract_dir.mkdir()
+    with zipfile.ZipFile(archive_path, "r") as archive:
+        with pytest.raises(RuntimeError, match="Unsafe archive member"):
+            _safe_extract_zip(archive, str(extract_dir))
+    assert not outside.exists()
+
+
+def test_benchmark_cache_invalidates_when_model_changes(isolated_engines_state, tmp_path):
+    """A cached timing is not reused after its weight file changes."""
+    import src.ai.engines_state as es
+
+    model = tmp_path / "model.pth"
+    model.write_bytes(b"first")
+    stat = model.stat()
+    entry = {
+        "ms_per_frame": 3.0,
+        "model_fingerprint": {
+            "path": os.path.abspath(model),
+            "size": stat.st_size,
+            "mtime_ns": stat.st_mtime_ns,
+        },
+    }
+    assert es.set_backend_benchmark("upscale-realesrgan-x4plus", "torch", entry)
+    assert es.get_backend_benchmarks("upscale-realesrgan-x4plus")["torch"]
+
+    model.write_bytes(b"changed weights")
+    os.utime(model, (model.stat().st_atime, model.stat().st_mtime + 2))
+    assert es.get_backend_benchmarks("upscale-realesrgan-x4plus")["torch"] is None
+
+
 def test_libplacebo_probe_cached_by_binary_mtime(tmp_path, monkeypatch):
     """has_libplacebo_support must probe ffmpeg once per (path, mtime):
     unchanged binaries never re-spawn the subprocess, a freshly
@@ -186,35 +232,21 @@ def test_libplacebo_probe_cached_by_binary_mtime(tmp_path, monkeypatch):
     assert len(calls) == 2
 
 
-def test_fsr1_is_always_available_without_download(isolated_engines_state):
-    from src.ai.engines_state import get_state
+def test_legacy_fsr_engines_are_not_catalogued_or_dispatchable():
+    from src.ai.inference import create_inference_engine
     from src.ai.registry import CATALOG_BY_ID
 
-    eid = "upscale-fsr-2x"
-    assert eid in CATALOG_BY_ID
-    st = get_state(eid)
-    assert st["installed"] is True
-    assert st["enabled"] is True
-
-
-def test_fsr1_engine_processes_frame_correctly():
-    """The dispatch picks FSREngine (pure numpy) and it really upscales."""
-    import numpy as np
-    from src.ai.inference import create_inference_engine, FSREngine
-
-    eng = create_inference_engine("upscale-fsr-2x", "")
-    assert isinstance(eng, FSREngine)
-    assert eng.load() is True
-    assert eng.get_scale_factor() == 2
-
-    # Use a flat field: bilinear upscale + CAS sharpening of a constant
-    # stays constant, so we can assert exact pixel equality.
-    src = np.full((8, 8, 3), (100, 150, 200), dtype=np.uint8)
-    out = eng.process_frame(src)
-    assert out.shape == (16, 16, 3)
-    assert out.dtype == np.uint8
-    assert np.array_equal(out[0, 0].tolist(), [100, 150, 200])
-    assert np.array_equal(out[-1, -1].tolist(), [100, 150, 200])
+    for eid in (
+        "upscale-fsr-2x",
+        "upscale-fsr-3x",
+        "upscale-fsr-4x",
+        "upscale-fsr-2x-v2",
+        "upscale-fsr-3x-v2",
+        "upscale-fsr-4x-v2",
+    ):
+        assert eid not in CATALOG_BY_ID
+        with pytest.raises(RuntimeError):
+            create_inference_engine(eid, "")
 
 
 def test_fsr31_mode_routing_dispatches_correctly(monkeypatch):
@@ -509,7 +541,7 @@ def test_store_incompatible_when_wheel_is_for_other_python(tmp_path, monkeypatch
     di = os.path.join(store, "onnxruntime-1.0.dist-info")
     os.makedirs(di, exist_ok=True)
     with open(os.path.join(di, "WHEEL"), "w") as f:
-        f.write("Tag: cp314-cp314-win_amd64\n")
+        f.write("Tag: %s\n" % _foreign_cp_tag())
     # cp314 wheel must NOT be injected on a 3.11 interpreter.
     assert rm.store_is_compatible_with_python() is False
 
@@ -573,7 +605,7 @@ def test_purge_removes_only_foreign_version_wheels(tmp_path, monkeypatch):
     numpy_di = os.path.join(store, "numpy-2.5.1.dist-info")
     os.makedirs(numpy_di)
     with open(os.path.join(numpy_di, "WHEEL"), "w") as f:
-        f.write("Tag: cp314-cp314-win_amd64\n")
+        f.write("Tag: %s\n" % _foreign_cp_tag())
     with open(os.path.join(numpy_di, "top_level.txt"), "w") as f:
         f.write("numpy\n")
     # numpy.libs sibling must also go.
@@ -627,7 +659,7 @@ def test_purge_keeps_shared_package_dir_when_compatible_sibling_exists(
     foreign_di = os.path.join(store, "numpy-2.5.1.dist-info")
     os.makedirs(foreign_di)
     with open(os.path.join(foreign_di, "WHEEL"), "w") as f:
-        f.write("Tag: cp314-cp314-win_amd64\n")
+        f.write("Tag: %s\n" % _foreign_cp_tag())
 
     purged = rm._purge_foreign_version_wheels()
     assert purged == 1
@@ -652,7 +684,7 @@ def test_install_cleans_foreign_leftovers_and_detects_runtime(tmp_path, monkeypa
     numpy_di = os.path.join(store, "numpy-2.5.1.dist-info")
     os.makedirs(numpy_di)
     with open(os.path.join(numpy_di, "WHEEL"), "w") as f:
-        f.write("Tag: cp314-cp314-win_amd64\n")
+        f.write("Tag: %s\n" % _foreign_cp_tag())
     with open(os.path.join(numpy_di, "top_level.txt"), "w") as f:
         f.write("numpy\n")
 
@@ -1312,6 +1344,9 @@ def test_torch_status_missing_when_only_system_torch(monkeypatch, tmp_path):
     store = str(tmp_path / "empty_store")
     os.makedirs(store, exist_ok=True)
     monkeypatch.setattr(rm, "RUNTIME_MODULES_DIR", store)
+    # The assertion is about the diagnostic branch, not whether this
+    # checkout happens to have torch installed globally.
+    monkeypatch.setattr(rm, "_can_import_system", lambda _name: True)
 
     st = rm.torch_status()
     assert st["installed"] is False
@@ -2174,6 +2209,31 @@ def test_compute_total_scale_chain_product():
     assert _compute_total_scale([]) == 1
 
 
+def test_generate_preview_runs_the_real_ai_chain(nvenc_clip):
+    """AI preview must execute the selected chain, not only FFmpeg encode."""
+    from src.processing.pipeline import generate_preview
+
+    ffmpeg, src, tmp = nvenc_clip
+    engine = _FakeEngine("preview-engine", 1)
+    original, processed = generate_preview(
+        ffmpeg,
+        src,
+        {
+            "audio": "noaudio",
+            "format": "mp4",
+            "codec": "h264_nvenc",
+            "preset": "p5",
+            "bitrate": "800",
+            "pixel_format": "yuv420p",
+            "resolution": "original",
+        },
+        inference_engines=[engine],
+    )
+    assert original.startswith(b"\xff\xd8")
+    assert processed.startswith(b"\xff\xd8")
+    assert engine.order_log, "the preview never called the AI engine"
+
+
 def test_compress_video_with_ai_chain_order_and_scale(nvenc_clip):
     """Chain of two engines must run in order and output the total scale."""
     from src.processing.pipeline import compress_video_with_ai
@@ -2965,7 +3025,7 @@ def test_catalog_arch_lookup_static_and_user(isolated_engines_state):
     assert CATALOG_ARCH["upscale-omnisr-x4"] == "omnisr"
     assert CATALOG_ARCH["facerestore-gfpgan"] == "gfpgan"  # no convertible
     # FSR algorítmicos: sin arquitectura conocida -> None
-    assert get_catalog_arch("upscale-fsr-4x") is None
+    assert get_catalog_arch("upscale-fsr31-2x") is None
     assert get_catalog_arch("") is None
     assert get_catalog_arch("no-existe-123") is None
 
@@ -3047,6 +3107,496 @@ def test_convert_pth_to_onnx_ex_reuses_existing_good_onnx(tmp_path, local_store_
     path, err = convert_pth_to_onnx_ex(str(pth))
     assert path == str(onnx_path)
     assert err == ""
+
+
+def test_pick_weight_file_prefers_engine_matching_weight(tmp_path):
+    """El repo de Real-ESRGAN trae 9 pesos; la selección debe coger el
+    realesr-animevideov3.pth y no un RRDBNet de 67 MB (el bug que hacía
+    fallar/convertir mal el modelo del usuario)."""
+    from src.ai.inference import pick_weight_file
+
+    d = tmp_path / "m"
+    d.mkdir()
+    for f in (
+        "AI-Forever_x2plus.pth", "AI-Forever_x4plus.pth",
+        "RealESRGAN_x2plus.pth", "RealESRGAN_x4plus.pth",
+        "RealESRGAN_x4plus_anime_6B.pth", "RealESRNet_x4plus.pth",
+        "realesr-animevideov3.pth", "realesr-general-wdn-x4v3.pth",
+        "realesr-general-x4v3.pth",
+    ):
+        (d / f).write_bytes(b"x")
+
+    picked = pick_weight_file(str(d), "upscale-realesr-animevideov3")
+    assert picked == str(d / "realesr-animevideov3.pth")
+
+    # Otros engine_ids del mismo repo apuntan a su propio peso.
+    picked_general = pick_weight_file(str(d), "upscale-realesr-general-x4v3")
+    assert picked_general == str(d / "realesr-general-x4v3.pth")
+
+
+def test_pick_weight_file_root_preferred_on_ties(tmp_path):
+    """A igual puntuación gana la raíz (orden estable, no el del walk)."""
+    from src.ai.inference import pick_weight_file
+
+    d = tmp_path / "m"
+    (d / "sub").mkdir(parents=True)
+    (d / "model.safetensors").write_bytes(b"x")
+    (d / "sub" / "model.safetensors").write_bytes(b"x")
+
+    assert pick_weight_file(str(d), "upscale-foo") == str(d / "model.safetensors")
+    assert pick_weight_file(str(d), "upscale-foo", recursive=False) == str(d / "model.safetensors")
+    assert pick_weight_file(str(d / "nonexistent"), "upscale-foo") is None
+
+
+def test_onnx_worker_finds_matching_weight(tmp_path):
+    """OnnxConvertWorker._find_weight_file elige el peso que coincide con el
+    engine_id y no el primer .pth del walk (orden del filesystem)."""
+    from src.ai.fetcher import OnnxConvertWorker
+
+    d = tmp_path / "m"
+    d.mkdir()
+    for f in (
+        "AI-Forever_x2plus.pth", "RealESRGAN_x4plus.pth",
+        "realesr-animevideov3.pth", "realesr-general-x4v3.pth",
+    ):
+        (d / f).write_bytes(b"x")
+
+    w = OnnxConvertWorker("upscale-realesr-animevideov3", str(d), "Upscale")
+    assert w._find_weight_file() == str(d / "realesr-animevideov3.pth")
+
+
+class _FakeORTIn:
+    def __init__(self, shape):
+        self.shape = shape
+
+
+class _FakeORTSess:
+    def __init__(self, shape):
+        self._shape = shape
+
+    def get_inputs(self):
+        return [_FakeORTIn(self._shape)]
+
+
+class _FakeORT:
+    def __init__(self, shape):
+        self._shape = shape
+
+    def InferenceSession(self, path, providers=None):
+        return _FakeORTSess(self._shape)
+
+
+def test_onnx_input_channels_ok_three_state_semantics(monkeypatch):
+    """El probe devuelve True (3ch), False (fijo != 3) o None (no se pudo
+    verificar: onnxruntime ausente). None NO debe borrar archivos."""
+    import sys
+    from src.ai.inference import _onnx_input_channels_ok
+
+    monkeypatch.setitem(sys.modules, "onnxruntime", _FakeORT((1, 3, 64, 64)))
+    assert _onnx_input_channels_ok("x.onnx") is True
+
+    monkeypatch.setitem(sys.modules, "onnxruntime", _FakeORT((1, 12, 64, 64)))
+    assert _onnx_input_channels_ok("x.onnx") is False
+
+    monkeypatch.setitem(sys.modules, "onnxruntime", None)
+    assert _onnx_input_channels_ok("x.onnx") is None
+
+
+def test_convert_pth_to_onnx_ex_keeps_unverifiable_existing_onnx(tmp_path, monkeypatch):
+    """Si el probe no puede verificar el .onnx existente (onnxruntime
+    ausente) NO se borra: se reutiliza (una conversión previa lo creó).
+    Este es el caso del usuario con realesr-animevideov3.onnx en disco."""
+    import sys
+    from src.ai.inference import convert_pth_to_onnx_ex
+
+    pth = tmp_path / "model.pth"
+    pth.write_bytes(b"not-a-real-checkpoint")
+    onnx = tmp_path / "model.onnx"
+    onnx.write_bytes(b"existing-onnx")
+    monkeypatch.setitem(sys.modules, "onnxruntime", None)
+
+    path, err = convert_pth_to_onnx_ex(str(pth))
+    assert path == str(onnx)
+    assert err == ""
+    assert onnx.exists()
+
+
+def test_convert_pth_to_onnx_ex_removes_proven_bad_existing_onnx(tmp_path, monkeypatch):
+    """Solo cuando el probe PRUEBA que el .onnx es de canales != 3 se borra
+    (y si torch no está, la reconversión falla sin dejar archivos)."""
+    import sys
+    from src.ai.inference import convert_pth_to_onnx_ex
+
+    pth = tmp_path / "model.pth"
+    pth.write_bytes(b"x")
+    onnx = tmp_path / "model.onnx"
+    onnx.write_bytes(b"x")
+    monkeypatch.setitem(sys.modules, "onnxruntime", _FakeORT((1, 12, 64, 64)))
+
+    path, err = convert_pth_to_onnx_ex(str(pth))
+    assert path is None
+    assert not onnx.exists()
+
+
+def test_engines_state_backend_auto_default_and_set(isolated_engines_state):
+    """Preferencia de motor por engine: default 'auto', persiste torch /
+    onnxruntime y normaliza valores desconocidos."""
+    import src.ai.engines_state as es
+
+    assert es.get_backend("upscale-realesr-animevideov3") == "auto"
+    assert es.get_state("upscale-realesr-animevideov3")["inference_backend"] == "auto"
+
+    assert es.set_backend("upscale-realesr-animevideov3", "torch") is True
+    assert es.get_backend("upscale-realesr-animevideov3") == "torch"
+
+    assert es.set_backend("upscale-realesr-animevideov3", "ONNXRUNTIME") is True
+    assert es.get_backend("upscale-realesr-animevideov3") == "onnxruntime"
+
+    # Valores desconocidos caen a "auto".
+    assert es.set_backend("upscale-realesr-animevideov3", "banana") is True
+    assert es.get_backend("upscale-realesr-animevideov3") == "auto"
+
+    # El estado en disco lo normaliza al leerlo.
+    assert es.get_state("upscale-realesr-animevideov3")["inference_backend"] in (
+        "auto", "torch", "onnxruntime",
+    )
+
+
+def test_get_model_path_torch_uses_pick_weight_file(tmp_path, monkeypatch):
+    """get_model_path(..., 'torch') elige el peso que coincide con el
+    engine_id usando el mismo scoring que el conversor ONNX."""
+    from src.ai import engines_state as es
+    from src.ai.inference import get_model_path
+
+    d = tmp_path / "m"
+    d.mkdir()
+    for f in ("AI-Forever_x2plus.pth", "realesr-animevideov3.pth",
+              "RealESRGAN_x4plus.pth"):
+        (d / f).write_bytes(b"x")
+
+    monkeypatch.setattr(es, "get_state", lambda eid: {
+        "installed": True,
+        "install_path": str(d),
+        "onnx_converted": False,
+        "onnx_path": None,
+    })
+
+    assert get_model_path("upscale-realesr-animevideov3", "torch") == str(
+        d / "realesr-animevideov3.pth"
+    )
+
+
+# ---------------------------------------------------------------------------
+# 14. ONNX conversion progress on the model row (background, non-blocking)
+# ---------------------------------------------------------------------------
+
+
+def _engine_row_dict(installed=True, converted=False, backend="auto"):
+    return {
+        "engine_id": "upscale-realesr-animevideov3",
+        "display_name": "RealESR AnimeVideo v3 (fast, x2/x3/x4)",
+        "category": "Upscale",
+        "hf_url": "https://huggingface.co/leonelhs/realesrgan",
+        "size_estimate": "~2.4 MB",
+        "sample_shape": "1x3xHxW -> 1x3x(4H)x(4W)",
+        "license": "BSD-3-Clause",
+        "popularity_score": 88,
+        "quality_score": 78,
+        "is_implemented": True,
+        "sentinel": "README.md",
+        "arch": "srvgg",
+        "state": {
+            "installed": installed,
+            "enabled": installed,
+            "onnx_converted": converted,
+            "onnx_path": None,
+            "inference_backend": backend,
+        },
+    }
+
+
+def test_engine_row_convert_progress_strip(qapp):
+    """La franja de conversión ONNX de la fila muestra progreso, bloquea
+    las acciones, emite cancelar y restaura al terminar; el error queda
+    visible en rojo (sin diálogo modal)."""
+    from src.ui.engine_row import EngineRow
+
+    row = EngineRow(_engine_row_dict())
+    assert row.conv_bar.isHidden()  # oculta por defecto
+
+    cancelled = []
+    row.cancel_convert_requested.connect(cancelled.append)
+
+    row.set_converting(True, progress=15, status="Convirtiendo a ONNX...")
+    assert not row.conv_bar.isHidden()
+    assert row.conv_bar.value() == 15
+    assert not row.conv_status.isHidden()
+    assert row.conv_status.text() == "Convirtiendo a ONNX..."
+    assert row.btn_cancel_convert.isEnabled()
+    assert not row.btn_convert.isEnabled()
+    assert not row.btn_remove.isEnabled()
+    assert not row.combo_backend.isEnabled()
+
+    row._on_cancel_convert_clicked()
+    assert cancelled == ["upscale-realesr-animevideov3"]
+
+    row.set_converting(False)
+    assert row.conv_bar.isHidden()
+    assert row.btn_convert.isEnabled()
+    assert row.btn_remove.isEnabled()
+    assert row.combo_backend.isEnabled()
+
+    row.show_convert_error("ONNX conversion failed.\nDetail")
+    assert not row.conv_status.isHidden()
+    assert "#e74c3c" in row.conv_status.styleSheet()
+
+    row.show_convert_cancelled()
+    assert not row.conv_status.isHidden()
+
+
+def _wait_tab_build(qapp, tab, max_iter=300):
+    """Procesa eventos hasta que la construcción progresiva del tab termina.
+
+    La construcción de EnginesTab va por chunks con QTimer (15 ms). En el
+    entorno offscreen, tras decenas de tests, ``QTest.qWait`` puede reventar
+    nativamente procesando la gran cantidad de widgets; un bucle de
+    ``processEvents`` + ``time.sleep`` es más robusto y suficiente para
+    avanzar los timers."""
+    for _ in range(max_iter):
+        qapp.processEvents()
+        if not tab.is_building():
+            return True
+        time.sleep(0.01)
+    return not tab.is_building()
+
+
+def test_engines_tab_conversion_state_survives_repopulate(qapp, isolated_engines_state):
+    """El progreso de conversión en la fila no se pierde al repoblar la
+    pestaña (repintado del catálogo a mitad de conversión)."""
+    import src.ai.engines_state as es
+
+    tmp = isolated_engines_state
+    d = os.path.join(tmp, "models", "Upscale", "realesr-animevideov3")
+    os.makedirs(d, exist_ok=True)
+    with open(os.path.join(d, "realesr-animevideov3.pth"), "w") as f:
+        f.write("x")
+    es.mark_installed("upscale-realesr-animevideov3", install_path=d)
+
+    from src.ui.engines_tab import EnginesTab
+
+    # No se muestra la ventana: en offscreen, mostrar un árbol de ~28 filas
+    # tras decenas de tests previos provoca un access violation nativo al
+    # procesar eventos (la lógica que se prueba no requiere visibilidad).
+    tab = EnginesTab()
+    try:
+        assert _wait_tab_build(qapp, tab)
+        eid = "upscale-realesr-animevideov3"
+        assert eid in tab._rows_by_id
+
+        tab.set_engine_converting(eid, True, progress=10, status="Buscando los pesos...")
+        row = tab._rows_by_id[eid]
+        assert not row.conv_bar.isHidden()
+        assert row.conv_bar.value() == 10
+        assert not row.btn_convert.isEnabled()
+
+        # Un repopulate NO debe perder el estado de conversión.
+        tab.repopulate()
+        assert _wait_tab_build(qapp, tab)
+        new_row = tab._rows_by_id[eid]
+        assert new_row is not row
+        assert not new_row.conv_bar.isHidden()
+        assert new_row.conv_status.text() == "Buscando los pesos..."
+        assert not new_row.btn_convert.isEnabled()
+
+        tab.set_engine_converting(eid, False)
+        assert new_row.conv_bar.isHidden()
+        assert tab._converting_id is None
+        assert new_row.btn_convert.isEnabled()
+
+        # Error inline persistente (sin diálogo modal).
+        tab.set_engine_converting(eid, True)
+        tab.set_engine_converting(eid, False)
+        tab.show_engine_convert_error(eid, "ONNX conversion failed.")
+        assert not tab._rows_by_id[eid].conv_status.isHidden()
+        assert "#e74c3c" in tab._rows_by_id[eid].conv_status.styleSheet()
+    finally:
+        tab.setParent(None)
+        tab.deleteLater()
+        qapp.processEvents()
+
+
+def test_friendly_convert_status_translates_worker_phases():
+    from src.ui.dependencies_dialog import _friendly_convert_status
+
+    assert _friendly_convert_status("Locating model weights...") == "Buscando los pesos del modelo..."
+    assert _friendly_convert_status(
+        "Converting to ONNX with torch.onnx.export..."
+    ) == "Convirtiendo a ONNX (torch.onnx.export)..."
+    assert _friendly_convert_status("export complete") == "Conversión completada."
+    assert _friendly_convert_status("anything else") == "anything else"
+    assert _friendly_convert_status("") == ""
+
+
+# ---------------------------------------------------------------------------
+# 15. Benchmarks por backend (ms/frame ONNX vs PyTorch) en el selector
+# ---------------------------------------------------------------------------
+
+
+def test_backend_benchmark_roundtrip_and_active_selection(isolated_engines_state):
+    """Los benchmarks se guardan por backend; get_benchmark devuelve la
+    medición del backend ACTIVO (torch forzado -> PyTorch, si no -> ONNX)."""
+    import src.ai.engines_state as es
+
+    eid = "upscale-realesr-animevideov3"
+    onnx_b = {"ms_per_frame": 12.3, "fps": 81.3, "device": "cuda"}
+    torch_b = {"ms_per_frame": 15.1, "fps": 66.2, "device": "cuda"}
+
+    assert es.get_backend_benchmarks(eid) == {"onnx": None, "torch": None}
+    assert es.set_backend_benchmark(eid, "onnx", onnx_b) is True
+    assert es.set_backend_benchmark(eid, "torch", torch_b) is True
+
+    got = es.get_backend_benchmarks(eid)
+    assert got["onnx"]["ms_per_frame"] == 12.3
+    assert got["torch"]["ms_per_frame"] == 15.1
+
+    # Backend activo: auto con ambos medidos -> el más rápido (aquí ONNX
+    # 12.3 < torch 15.1); torch/torch; onnxruntime -> onnx.
+    es.set_backend(eid, "auto")
+    assert es.get_benchmark(eid)["ms_per_frame"] == 12.3
+    es.set_backend(eid, "torch")
+    assert es.get_benchmark(eid)["ms_per_frame"] == 15.1
+    es.set_backend(eid, "onnxruntime")
+    assert es.get_benchmark(eid)["ms_per_frame"] == 12.3
+    es.set_backend(eid, "auto")
+
+    # Borrar un backend; el otro sobrevive.
+    assert es.set_backend_benchmark(eid, "torch", None) is True
+    assert es.get_backend_benchmarks(eid) == {"onnx": onnx_b, "torch": None}
+
+    # Borrar el último -> la entrada completa desaparece.
+    assert es.set_backend_benchmark(eid, "onnx", None) is True
+    assert es.get_backend_benchmarks(eid) == {"onnx": None, "torch": None}
+
+
+def test_benchmark_legacy_flat_entry_still_readable(isolated_engines_state):
+    """Entradas planas legacy (un solo dict sin backend) siguen leyéndose."""
+    import src.ai.engines_state as es
+
+    eid = "upscale-realesr-animevideov3"
+    flat = {"ms_per_frame": 20.0, "fps": 50.0, "device": "cpu"}
+    assert es.set_benchmark(eid, flat) is True
+    assert es.get_benchmark(eid)["ms_per_frame"] == 20.0
+    assert es.get_backend_benchmarks(eid) == {"onnx": None, "torch": None}
+    es.clear_benchmark(eid)
+    assert es.get_benchmark(eid) is None
+
+
+def test_benchmark_backend_returns_none_without_weights(tmp_path, monkeypatch):
+    """Sin pesos medibles, benchmark_backend devuelve None sin escribir."""
+    import src.ai.benchmark as bm
+
+    assert bm.benchmark_backend("upscale-realesr-animevideov3", "onnx",
+                                target_dir=str(tmp_path), use_cache=False) is None
+    assert bm.benchmark_backend("upscale-realesr-animevideov3", "torch",
+                                target_dir=str(tmp_path), use_cache=False) is None
+    assert bm.benchmark_backend("upscale-realesr-animevideov3", "banana",
+                                target_dir=str(tmp_path), use_cache=False) is None
+
+
+def test_resolve_backend_auto_picks_fastest_measured(isolated_engines_state):
+    """'auto' elige el backend más rápido medido cuando hay benchmarks de
+    ambos; sin comparación devuelve 'auto' (heurística clásica del render)."""
+    import src.ai.engines_state as es
+
+    eid = "upscale-realesr-animevideov3"
+    onnx_b = {"ms_per_frame": 12.3, "device": "cuda"}
+    torch_b = {"ms_per_frame": 15.1, "device": "cuda"}
+
+    # Sin benchmarks -> "auto": el render conserva la heurística clásica.
+    assert es.resolve_backend(eid) == "auto"
+
+    # Solo un backend medido -> "auto": no hay comparación posible.
+    es.set_backend_benchmark(eid, "onnx", onnx_b)
+    assert es.resolve_backend(eid) == "auto"
+
+    # Ambos medidos: ONNX más rápido -> onnxruntime.
+    es.set_backend_benchmark(eid, "torch", torch_b)
+    assert es.resolve_backend(eid) == "onnxruntime"
+
+    # Torch más rápido -> torch (y get_benchmark sigue al backend resuelto).
+    es.set_backend_benchmark(eid, "torch", {"ms_per_frame": 8.0, "device": "cuda"})
+    assert es.resolve_backend(eid) == "torch"
+    assert es.get_benchmark(eid)["ms_per_frame"] == 8.0
+
+    # Empate -> onnxruntime (criterio del selector: default histórico ONNX).
+    es.set_backend_benchmark(eid, "torch", {"ms_per_frame": 12.3, "device": "cuda"})
+    assert es.resolve_backend(eid) == "onnxruntime"
+
+    # La preferencia explícita manda sobre los benchmarks.
+    es.set_backend(eid, "torch")
+    assert es.resolve_backend(eid) == "torch"
+    es.set_backend(eid, "onnxruntime")
+    assert es.resolve_backend(eid) == "onnxruntime"
+    es.set_backend(eid, "auto")
+    assert es.resolve_backend(eid) == "onnxruntime"  # vuelve a medir el más rápido
+
+
+def test_recommended_backend_logic():
+    from src.ui.engine_row import EngineRow
+
+    assert EngineRow._recommended_backend(None, None) is None
+    assert EngineRow._recommended_backend({"ms_per_frame": 12.3}, None) == "onnx"
+    assert EngineRow._recommended_backend(None, {"ms_per_frame": 15.1}) == "torch"
+    assert EngineRow._recommended_backend(
+        {"ms_per_frame": 12.3}, {"ms_per_frame": 15.1}) == "onnx"
+    assert EngineRow._recommended_backend(
+        {"ms_per_frame": 20.0}, {"ms_per_frame": 11.5}) == "torch"
+    # Empate -> ONNX (backend por defecto con .onnx).
+    assert EngineRow._recommended_backend(
+        {"ms_per_frame": 10.0}, {"ms_per_frame": 10.0}) == "onnx"
+
+
+def test_engine_row_backend_selector_shows_benchmarks(qapp):
+    """El selector muestra ms/frame medidos y la sugerencia del más rápido
+    con botón 'Usar' que emite backend_changed."""
+    from src.ui.engine_row import EngineRow
+
+    eng = _engine_row_dict()
+    eng["benchmarks"] = {
+        "onnx": {"ms_per_frame": 12.3},
+        "torch": {"ms_per_frame": 15.1},
+    }
+    row = EngineRow(eng)
+    labels = [row.combo_backend.itemText(i) for i in range(row.combo_backend.count())]
+    assert "PyTorch — 15.1 ms/f" in labels
+    assert "ONNX Runtime — 12.3 ms/f" in labels
+
+    assert not row.lbl_backend_suggest.isHidden()
+    assert "ONNX Runtime" in row.lbl_backend_suggest.text()
+    assert "12.3 ms/f" in row.lbl_backend_suggest.text()
+    assert not row.btn_use_recommended.isHidden()
+    assert row.btn_use_recommended.isEnabled()
+    assert row._recommended == "onnx"
+
+    got = []
+    row.backend_changed.connect(lambda eid, b: got.append((eid, b)))
+    row._on_use_recommended()
+    assert got == [("upscale-realesr-animevideov3", "onnx")]
+
+    # Sin datos: sin sugerencia y sin ms/f en los items.
+    row3 = EngineRow(_engine_row_dict())
+    assert row3.lbl_backend_suggest.isHidden()
+    labels3 = [row3.combo_backend.itemText(i) for i in range(row3.combo_backend.count())]
+    assert labels3 == ["Auto", "PyTorch", "ONNX Runtime"]
+
+    # Solo un backend medido: sin sugerencia (no comparable), item con ms/f.
+    eng4 = _engine_row_dict()
+    eng4["benchmarks"] = {"onnx": {"ms_per_frame": 9.0}, "torch": None}
+    row4 = EngineRow(eng4)
+    assert row4.lbl_backend_suggest.isHidden()
+    assert "ONNX Runtime — 9.0 ms/f" in [
+        row4.combo_backend.itemText(i) for i in range(row4.combo_backend.count())
+    ]
 
 
 # ==--------------------------------------------------------------------==

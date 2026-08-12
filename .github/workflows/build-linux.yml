@@ -1,0 +1,283 @@
+name: Build Linux Bundle
+
+# Genera bundles para Linux x86_64. El bundle no incluye los runtimes de IA
+# pesados: añade un Python 3.13 relocatable para instalarlos bajo demanda.
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+
+env:
+  PYTHON_VERSION: "3.13"
+
+jobs:
+  build-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.13
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install build dependencies
+        run: |
+          python -m pip install --upgrade pip setuptools wheel
+          python -m pip install -r requirements-build.txt
+
+      - name: Install Linux packaging tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y rpm flatpak flatpak-builder appstream
+
+      - name: Build Linux bundle with PyInstaller
+        run: |
+          python -m PyInstaller draggy_encoder.spec --noconfirm --clean
+          chmod +x dist/DraggyEncoder/DraggyEncoder
+
+      - name: Add relocatable Python 3.13 for runtime installs
+        shell: bash
+        run: |
+          set -euo pipefail
+          api='https://api.github.com/repos/indygreg/python-build-standalone/releases/latest'
+          url="$(curl -fsSL "$api" | jq -r '.assets[].browser_download_url | select(test("cpython-3\\.13\\..*x86_64-unknown-linux-gnu-install_only\\.tar\\.gz$"))' | head -n 1)"
+          test -n "$url"
+          mkdir -p dist/DraggyEncoder/runtime-python
+          curl -fL --retry 3 "$url" -o /tmp/python-standalone.tar.gz
+          tar -xzf /tmp/python-standalone.tar.gz -C dist/DraggyEncoder/runtime-python --strip-components=1
+          chmod +x dist/DraggyEncoder/runtime-python/bin/python3.13
+          dist/DraggyEncoder/runtime-python/bin/python3.13 --version
+          if ! dist/DraggyEncoder/runtime-python/bin/python3.13 -m pip --version >/dev/null 2>&1; then
+            if ! dist/DraggyEncoder/runtime-python/bin/python3.13 -m ensurepip --upgrade; then
+              curl -fL --retry 3 https://bootstrap.pypa.io/get-pip.py -o /tmp/get-pip.py
+              dist/DraggyEncoder/runtime-python/bin/python3.13 /tmp/get-pip.py
+              rm -f /tmp/get-pip.py
+            fi
+          fi
+          dist/DraggyEncoder/runtime-python/bin/python3.13 -m pip --version
+          rm -f /tmp/python-standalone.tar.gz
+
+      - name: Selftest the Linux bundle
+        run: |
+          ./dist/DraggyEncoder/DraggyEncoder --selftest
+          cat dist/DraggyEncoder/bin/logs/selftest.log
+
+      - name: Capture AppStream screenshots
+        env:
+          QT_QPA_PLATFORM: offscreen
+          DRAGGY_DATA_DIR: ${{ runner.temp }}/draggy-screenshot-data
+        run: |
+          python packaging/linux/capture_screenshots.py screenshots
+
+      - name: Remove generated user data before packaging
+        shell: bash
+        run: rm -rf dist/DraggyEncoder/bin dist/DraggyEncoder/personal
+
+      - name: Create portable archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          if [[ "$GITHUB_REF" != refs/tags/v* ]]; then version="0.0.0"; fi
+          tar -czf "DraggyEncoder-Linux-x86_64-${version}.tar.gz" -C dist DraggyEncoder
+
+      - name: Create Debian package
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          if [[ "$GITHUB_REF" != refs/tags/v* ]]; then version="0.0.0"; fi
+          root=debian-root
+          rm -rf "$root"
+          mkdir -p "$root/DEBIAN" "$root/opt/draggy-encoder" "$root/usr/bin" "$root/usr/share/applications" "$root/usr/share/icons/hicolor/256x256/apps"
+          cp -a dist/DraggyEncoder/. "$root/opt/draggy-encoder/"
+          cp packaging/linux/draggy-encoder-wrapper "$root/usr/bin/draggy-encoder"
+          cp packaging/linux/draggy-encoder.desktop "$root/usr/share/applications/com.draggyencoder.DraggyEncoder.desktop"
+          mkdir -p "$root/usr/share/metainfo"
+          cp packaging/linux/flatpak-metainfo.xml "$root/usr/share/metainfo/com.draggyencoder.DraggyEncoder.metainfo.xml"
+          cp assets/Import.png "$root/usr/share/icons/hicolor/256x256/apps/draggy-encoder.png"
+          cp assets/Import.png "$root/usr/share/icons/hicolor/256x256/apps/com.draggyencoder.DraggyEncoder.png"
+          chmod 0755 "$root/usr/bin/draggy-encoder"
+          cat > "$root/DEBIAN/control" <<EOF
+          Package: draggy-encoder
+          Version: $version
+          Section: video
+          Priority: optional
+          Architecture: amd64
+          Maintainer: Draggy Encoder contributors
+          Depends: libc6 (>= 2.31), libglib2.0-0, libgl1, libegl1, libfontconfig1, libx11-6, libx11-xcb1, libxcb1, libxext6, libxrender1, libxrandr2, libxi6, libxkbcommon0, libxkbcommon-x11-0
+          Description: AI-powered video compression and upscaling
+           Draggy Encoder is a PySide6 desktop application for video encoding,
+           AI upscaling, frame interpolation and related workflows.
+          EOF
+          dpkg-deb --build --root-owner-group "$root" "DraggyEncoder-Linux-x86_64-${version}.deb"
+
+      - name: Create RPM package
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          if [[ "$GITHUB_REF" != refs/tags/v* ]]; then version="0.0.0"; fi
+          rpm_top="$PWD/rpm-root"
+          rpm_stage="$PWD/rpm-staging/draggy-encoder-bundle"
+          rm -rf "$rpm_top" "$PWD/rpm-staging"
+          mkdir -p "$rpm_top/SOURCES" "$rpm_top/SPECS" "$rpm_stage/opt/draggy-encoder" "$rpm_stage/usr/bin" "$rpm_stage/usr/share/applications" "$rpm_stage/usr/share/icons/hicolor/256x256/apps"
+          cp -a dist/DraggyEncoder/. "$rpm_stage/opt/draggy-encoder/"
+          cp packaging/linux/draggy-encoder-wrapper "$rpm_stage/usr/bin/draggy-encoder"
+          cp packaging/linux/draggy-encoder.desktop "$rpm_stage/usr/share/applications/com.draggyencoder.DraggyEncoder.desktop"
+          mkdir -p "$rpm_stage/usr/share/metainfo"
+          cp packaging/linux/flatpak-metainfo.xml "$rpm_stage/usr/share/metainfo/com.draggyencoder.DraggyEncoder.metainfo.xml"
+          cp assets/Import.png "$rpm_stage/usr/share/icons/hicolor/256x256/apps/draggy-encoder.png"
+          cp assets/Import.png "$rpm_stage/usr/share/icons/hicolor/256x256/apps/com.draggyencoder.DraggyEncoder.png"
+          chmod 0755 "$rpm_stage/usr/bin/draggy-encoder"
+          tar -czf "$rpm_top/SOURCES/draggy-encoder-bundle.tar.gz" -C "$PWD/rpm-staging" draggy-encoder-bundle
+          sed "s/@VERSION@/$version/g" packaging/linux/draggy-encoder.spec.in > "$rpm_top/SPECS/draggy-encoder.spec"
+          rpmbuild --define "_topdir $rpm_top" -bb "$rpm_top/SPECS/draggy-encoder.spec"
+          rpm_file="$(find "$rpm_top/RPMS" -type f -name '*.rpm' -print -quit)"
+          test -n "$rpm_file"
+          cp "$rpm_file" "DraggyEncoder-Linux-x86_64-${version}.rpm"
+
+      - name: Create AppImage
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          if [[ "$GITHUB_REF" != refs/tags/v* ]]; then version="0.0.0"; fi
+          appdir=AppDir
+          rm -rf "$appdir"
+          mkdir -p "$appdir"
+          cp -a dist/DraggyEncoder "$appdir/DraggyEncoder"
+          cp packaging/linux/AppRun "$appdir/AppRun"
+          cp packaging/linux/appimage.desktop "$appdir/com.draggyencoder.DraggyEncoder.desktop"
+          cp assets/Import.png "$appdir/draggy-encoder.png"
+          cp assets/Import.png "$appdir/com.draggyencoder.DraggyEncoder.png"
+          cp packaging/linux/flatpak-metainfo.xml "$appdir/com.draggyencoder.DraggyEncoder.metainfo.xml"
+          chmod 0755 "$appdir/AppRun" "$appdir/DraggyEncoder/DraggyEncoder"
+          curl -fL --retry 3 https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage -o /tmp/appimagetool.AppImage
+          chmod +x /tmp/appimagetool.AppImage
+          ARCH=x86_64 APPIMAGE_EXTRACT_AND_RUN=1 /tmp/appimagetool.AppImage "$appdir" "DraggyEncoder-Linux-x86_64-${version}.AppImage"
+
+      - name: Create Flatpak bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          if [[ "$GITHUB_REF" != refs/tags/v* ]]; then version="0.0.0"; fi
+          rm -rf flatpak-staging flatpak-build flatpak-repo flatpak-manifest.yml
+          mkdir -p flatpak-staging/DraggyEncoder
+          cp -a dist/DraggyEncoder/. flatpak-staging/DraggyEncoder/
+          cp packaging/linux/flatpak-wrapper flatpak-staging/flatpak-wrapper
+          cp packaging/linux/flatpak.desktop flatpak-staging/flatpak.desktop
+          cp assets/Import.png flatpak-staging/draggy-encoder.png
+          cp packaging/linux/flatpak-metainfo.xml flatpak-staging/com.draggyencoder.DraggyEncoder.metainfo.xml
+          chmod 0755 flatpak-staging/flatpak-wrapper flatpak-staging/DraggyEncoder/DraggyEncoder
+          appstreamcli validate --pedantic flatpak-staging/com.draggyencoder.DraggyEncoder.metainfo.xml
+          cp packaging/linux/com.draggyencoder.DraggyEncoder.yml flatpak-manifest.yml
+          flatpak remote-add --if-not-exists --user flathub https://flathub.org/repo/flathub.flatpakrepo
+          flatpak install --user --noninteractive flathub org.freedesktop.Sdk//24.08 org.freedesktop.Platform//24.08
+          flatpak-builder --user --disable-rofiles-fuse --force-clean --repo=flatpak-repo flatpak-build flatpak-manifest.yml
+          flatpak build-bundle --runtime-repo=https://flathub.org/repo/flathub.flatpakrepo flatpak-repo "DraggyEncoder-Linux-x86_64-${version}.flatpak" com.draggyencoder.DraggyEncoder "$version"
+
+      - name: Prepare Flatpak repository for GitHub Pages
+        shell: bash
+        run: touch flatpak-repo/.nojekyll
+
+      - name: Upload Flatpak repository to Pages
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: flatpak-repo
+
+      - name: Upload Linux packages
+        uses: actions/upload-artifact@v4
+        with:
+          name: DraggyEncoder-Linux-packages
+          path: |
+            DraggyEncoder-Linux-x86_64-*.tar.gz
+            DraggyEncoder-Linux-x86_64-*.deb
+            DraggyEncoder-Linux-x86_64-*.rpm
+            DraggyEncoder-Linux-x86_64-*.AppImage
+            DraggyEncoder-Linux-x86_64-*.flatpak
+            screenshots/*.png
+          if-no-files-found: error
+
+      - name: Attach Linux packages to release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            DraggyEncoder-Linux-x86_64-*.tar.gz
+            DraggyEncoder-Linux-x86_64-*.deb
+            DraggyEncoder-Linux-x86_64-*.rpm
+            DraggyEncoder-Linux-x86_64-*.AppImage
+            DraggyEncoder-Linux-x86_64-*.flatpak
+            screenshots/*.png
+
+  validate-deb:
+    name: Validate Debian package and AppStream integration
+    needs: build-linux
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Download Linux packages artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: DraggyEncoder-Linux-packages
+          path: artifacts
+
+      - name: Install validation tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y appstream desktop-file-utils
+
+      - name: Install generated DEB
+        shell: bash
+        run: |
+          set -euo pipefail
+          deb="$(find artifacts -type f -name '*.deb' -print -quit)"
+          test -n "$deb"
+          sudo apt-get install -y "$deb"
+
+      - name: Validate installed AppStream component
+        shell: bash
+        run: |
+          set -euo pipefail
+          metainfo=/usr/share/metainfo/com.draggyencoder.DraggyEncoder.metainfo.xml
+          desktop=/usr/share/applications/com.draggyencoder.DraggyEncoder.desktop
+          icon=/usr/share/icons/hicolor/256x256/apps/com.draggyencoder.DraggyEncoder.png
+          test -s "$metainfo"
+          test -s "$desktop"
+          test -s "$icon"
+          desktop-file-validate "$desktop"
+          appstreamcli validate --pedantic "$metainfo"
+          sudo appstreamcli refresh --force
+          appstreamcli dump com.draggyencoder.DraggyEncoder > /tmp/draggy-appstream.txt
+          grep -q '<id>com.draggyencoder.DraggyEncoder</id>' /tmp/draggy-appstream.txt
+          grep -q 'com.draggyencoder.DraggyEncoder.desktop' /tmp/draggy-appstream.txt
+          grep -q 'com.draggyencoder.DraggyEncoder' /tmp/draggy-appstream.txt
+
+  publish-flatpak-repository:
+    name: Publish Flatpak repository
+    needs: build-linux
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy Flatpak repository to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
+
+

@@ -1,0 +1,8 @@
+#!/bin/sh
+set -eu
+
+DATA_HOME=${XDG_DATA_HOME:-"$HOME/.local/share"}
+: "${DRAGGY_DATA_DIR:=$DATA_HOME/draggy-encoder}"
+export DRAGGY_DATA_DIR
+
+exec /opt/draggy-encoder/DraggyEncoder "$@"
