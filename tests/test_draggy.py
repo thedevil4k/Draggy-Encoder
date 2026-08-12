@@ -489,6 +489,7 @@ def test_onnx_engine_rejects_12ch_model(tmp_path, local_store_runtime):
             "input": {0: "batch", 2: "height", 3: "width"},
             "output": {0: "batch", 2: "height", 3: "width"},
         },
+        dynamo=False,  # exporter legacy (mismo camino que convert_pth_to_onnx_ex)
     )
 
     eng = ONNXRUNTIMEInferenceEngine(str(onnx_path), "onnxruntime")
@@ -803,6 +804,19 @@ def test_installers_are_separated_in_registry():
     assert fns["torch"] is rm.install_pytorch
     assert fns["onnxruntime"] is rm.install_onnxruntime
     assert fns["torch"] is not fns["onnxruntime"]
+
+
+def test_pytorch_install_command_includes_onnx_package():
+    """torch.onnx.export (torch 2.6+) needs the 'onnx' package; the
+    PyTorch installer must install it alongside torch."""
+    from src.runtimes.manager import _build_pytorch_command
+
+    cmd = _build_pytorch_command("cpu")
+    assert "torch" in cmd
+    assert "onnx" in cmd
+    # Se instala con --target (store local) y desde el índice de PyTorch.
+    assert "--target" in cmd
+    assert any("download.pytorch.org" in part for part in cmd)
 
 
 def test_runtime_pip_failure_surfaces_pip_output(monkeypatch):
@@ -1706,6 +1720,83 @@ def test_hardware_dialog_shows_os_and_python(qapp):
         assert any(r"C:\venv\python.exe" in t for t in texts)
     finally:
         dlg.deleteLater()
+
+
+def test_hardware_dialog_shows_gpu_driver_and_vram(qapp):
+    """The Hardware Info dialog renders driver, VRAM used/total, clock and
+    temperature for each GPU."""
+    from PySide6.QtWidgets import QLabel
+    from src.ui.hardware_dialog import HardwareDialog
+
+    info = {
+        "cpu": {"name": "Test CPU", "cores": 8, "threads": 16},
+        "gpus": [{
+            "name": "NVIDIA GeForce RTX 4090",
+            "memory": "24564 MiB",
+            "vendor": "NVIDIA",
+            "driver": "560.94",
+            "memory_used": "3144 MiB",
+            "core_clock": "2520 MHz",
+            "temperature": "68 °C",
+        }],
+        "recommended_device": "NVIDIA GPU",
+        "os": "Windows 11 (10.0.26100)",
+        "machine": "AMD64",
+        "python": {"version": "3.11.15", "executable": r"C:\venv\python.exe", "bits": 64},
+    }
+    dlg = HardwareDialog(info)
+    try:
+        texts = [lbl.text() for lbl in dlg.findChildren(QLabel)]
+        assert any("NVIDIA GeForce RTX 4090" in t and "NVIDIA" in t for t in texts)
+        assert any("VRAM: 3144 MiB / 24564 MiB" in t for t in texts)
+        assert any("Driver: 560.94" in t for t in texts)
+        assert any("Núcleo (max): 2520 MHz" in t for t in texts)
+        assert any("Temperatura: 68 °C" in t for t in texts)
+    finally:
+        dlg.deleteLater()
+
+
+def test_detect_gpus_windows_parses_nvidia_smi_metrics(monkeypatch):
+    """_detect_gpus_windows must parse driver, VRAM used, clock and
+    temperature from the nvidia-smi CSV."""
+    import src.hardware.detector as hw
+
+    smi_csv = (
+        "NVIDIA GeForce RTX 4090, 560.94, 24564, 3144, 2520, 68\r\n"
+        "NVIDIA GeForce GTX 1080, 560.94, 8192, 1024, 1733, 55\r\n"
+    )
+
+    def fake_run_cmd(cmd):
+        if "nvidia-smi" in cmd:
+            return smi_csv
+        return ""  # PowerShell/wmic no aportan nada
+
+    monkeypatch.setattr(hw, "_run_cmd", fake_run_cmd)
+    gpus = hw._detect_gpus_windows()
+    assert len(gpus) == 2
+    g0 = gpus[0]
+    assert g0["driver"] == "560.94"
+    assert g0["memory"] == "24564 MiB"
+    assert g0["memory_used"] == "3144 MiB"
+    assert g0["core_clock"] == "2520 MHz"
+    assert g0["temperature"] == "68 °C"
+
+
+def test_parse_video_controller_csv_includes_driver(monkeypatch):
+    """The Win32_VideoController fallback keeps the driver version."""
+    import src.hardware.detector as hw
+
+    csv_out = (
+        '"Name","AdapterRAM","VideoProcessor","AdapterCompatibility",'
+        '"DriverVersion","Status"\r\n'
+        '"AMD Radeon RX 6700 XT","12884901888","","Advanced Micro Devices, Inc.",'
+        '"31.0.14033.1010","OK"\r\n'
+    )
+    gpus = hw._parse_video_controller_csv(csv_out)
+    assert len(gpus) == 1
+    assert gpus[0]["driver"] == "31.0.14033.1010"
+    assert gpus[0]["vendor"] == "AMD"
+    assert gpus[0]["memory"] == "12.0 GB"
 
 
 @pytest.fixture()
@@ -3102,6 +3193,7 @@ def test_convert_pth_to_onnx_ex_reuses_existing_good_onnx(tmp_path, local_store_
             "input": {0: "batch", 2: "height", 3: "width"},
             "output": {0: "batch", 2: "height", 3: "width"},
         },
+        dynamo=False,  # exporter legacy (mismo camino que convert_pth_to_onnx_ex)
     )
 
     path, err = convert_pth_to_onnx_ex(str(pth))

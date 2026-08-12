@@ -1186,6 +1186,15 @@ def convert_pth_to_onnx_ex(pth_path: str) -> tuple[Optional[str], str]:
                 else:
                     dummy = torch.randn(1, num_in_ch, 64, 64)
                     try:
+                        try:
+                            import onnx  # noqa: F401
+                        except ImportError:
+                            raise RuntimeError(
+                                "The Python package 'onnx' is missing. PyTorch "
+                                "2.6+ needs it to run torch.onnx.export. Reinstall "
+                                "PyTorch from 'Runtimes & Binaries' (it now "
+                                "installs onnx automatically) and try again."
+                            )
                         torch.onnx.export(
                             model, dummy, onnx_path,
                             opset_version=18,
@@ -1196,10 +1205,37 @@ def convert_pth_to_onnx_ex(pth_path: str) -> tuple[Optional[str], str]:
                             dynamo=False,
                         )
                     except Exception as exc:
-                        error_msg = (
-                            f"torch.onnx.export failed for this model: {exc}. "
-                            "The render will use PyTorch instead."
-                        )
+                        # Si el export con ejes dinámicos falla por el operador
+                        # (p.ej. F.interpolate en algunos RRDBNet), reintentar
+                        # con tamaño fijo: menos flexible pero compatible con
+                        # cualquier build de torch/onnx.
+                        retry = None
+                        try:
+                            torch.onnx.export(
+                                model, dummy, onnx_path,
+                                opset_version=18,
+                                input_names=["input"],
+                                output_names=["output"],
+                                dynamo=False,
+                            )
+                            retry = True
+                        except Exception as retry_exc:
+                            retry = f"{retry_exc}"
+                        if retry is True:
+                            error_msg = ""
+                        elif "onnx" in str(exc).lower() and "not installed" in str(exc).lower():
+                            error_msg = (
+                                "torch.onnx.export needs the 'onnx' package, which "
+                                "is not installed. Reinstall PyTorch from 'Runtimes "
+                                "& Binaries' (it now installs onnx automatically). "
+                                "The render will use PyTorch instead."
+                            )
+                        else:
+                            error_msg = (
+                                f"torch.onnx.export failed for this model: {exc} "
+                                f"(fixed-size retry: {retry}). "
+                                "The render will use PyTorch instead."
+                            )
         finally:
             _devnull.close()
             sys.stdout = _orig_stdout

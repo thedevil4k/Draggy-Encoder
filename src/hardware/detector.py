@@ -63,7 +63,8 @@ def _detect_gpus_windows():
     gpus = []
     existing_names = set()
 
-    def _add_gpu(name, memory="", vendor=None):
+    def _add_gpu(name, memory="", vendor=None, driver="", memory_used="",
+                 core_clock="", temperature=""):
         name_clean = name.strip()
         if not name_clean:
             return
@@ -72,7 +73,15 @@ def _detect_gpus_windows():
             return
         existing_names.add(name_lower)
         vnd = vendor or _guess_vendor(name_clean)
-        gpus.append({"name": name_clean, "memory": memory, "vendor": vnd})
+        gpus.append({
+            "name": name_clean,
+            "memory": memory,
+            "vendor": vnd,
+            "driver": driver,
+            "memory_used": memory_used,
+            "core_clock": core_clock,
+            "temperature": temperature,
+        })
 
     # ── 1. nvidia‑smi con rutas conocidas ──
     smi_paths = [
@@ -84,20 +93,36 @@ def _detect_gpus_windows():
         ),
         "nvidia-smi",  # último intento: PATH del sistema
     ]
+    # Campos extra: driver, memoria usada/total, reloj del núcleo y temperatura.
+    _SMI_QUERY = (
+        "name,driver_version,memory.total,memory.used,"
+        "clocks.max.graphics,temperature.gpu"
+    )
     for smi_path in smi_paths:
         try:
             smi_out = _run_cmd(
-                f'"{smi_path}" --query-gpu=name,memory.total --format=csv,noheader'
+                f'"{smi_path}" --query-gpu={_SMI_QUERY} --format=csv,noheader,nounits'
             )
         except Exception:
             smi_out = ""
 
         if smi_out and "is not recognized" not in smi_out and "," in smi_out:
-            # Salida CSV válida: "Nombre GPU, 12288 MiB"
+            # Salida CSV válida: "Nombre GPU, 560.94, 12288, 3144, 2520, 68"
             for line in smi_out.strip().splitlines():
                 if "," in line:
-                    name, mem = line.split(",", 1)
-                    _add_gpu(name.strip(), mem.strip(), "NVIDIA")
+                    parts = [p.strip() for p in line.split(",")]
+                    name = parts[0]
+                    driver = parts[1] if len(parts) > 1 else ""
+                    memory = parts[2] if len(parts) > 2 else ""
+                    memory_used = parts[3] if len(parts) > 3 else ""
+                    core_clock = parts[4] if len(parts) > 4 else ""
+                    temperature = parts[5] if len(parts) > 5 else ""
+                    _add_gpu(
+                        name, memory + " MiB", "NVIDIA",
+                        driver=driver, memory_used=memory_used + " MiB",
+                        core_clock=core_clock + " MHz",
+                        temperature=temperature + " °C",
+                    )
             break
         elif smi_out and "used" not in smi_out.lower():
             # nvidia-smi contestó pero sin --query-format (versión vieja);
@@ -120,7 +145,8 @@ def _detect_gpus_windows():
     # ── 2. PowerShell con EncodedCommand (evita el infierno de comillas anidadas) ──
     ps_script = (
         "Get-CimInstance Win32_VideoController | "
-        "Select-Object Name, AdapterRAM, VideoProcessor, AdapterCompatibility, Status | "
+        "Select-Object Name, AdapterRAM, VideoProcessor, AdapterCompatibility, "
+        "DriverVersion, Status | "
         "ConvertTo-Csv -NoTypeInformation"
     )
     try:
@@ -138,7 +164,10 @@ def _detect_gpus_windows():
         )
 
     for gpu in _parse_video_controller_csv(output):
-        _add_gpu(gpu["name"], gpu["memory"], gpu["vendor"])
+        _add_gpu(
+            gpu["name"], gpu["memory"], gpu["vendor"],
+            driver=gpu.get("driver", ""),
+        )
 
     # ── 4. Fallback último: Registro de Windows ──
     if not gpus:
@@ -166,20 +195,30 @@ def _detect_gpus_windows():
 
 
 def _parse_video_controller_csv(output):
-    """Parsea la salida CSV de Win32_VideoController."""
+    """Parsea la salida CSV de Win32_VideoController.
+
+    Usa el módulo ``csv`` del stdlib: los campos quoted pueden contener
+    comas (p.ej. ``"Advanced Micro Devices, Inc."``) y el split naive los
+    rompía, desplazando la columna DriverVersion.
+    """
+    import csv as _csv
+    import io as _io
+
     gpus = []
     if not output:
         return gpus
-    lines = output.strip().splitlines()
-    if not lines:
+    try:
+        reader = _csv.reader(_io.StringIO(output))
+        rows = [r for r in reader if r and any(c.strip() for c in r)]
+    except Exception:
+        return gpus
+    if not rows:
         return gpus
 
     # La primera línea son los headers
-    headers = [h.strip().strip('"').lower() for h in lines[0].split(",")]
-    for line in lines[1:]:
-        if not line.strip():
-            continue
-        parts = [p.strip().strip('"') for p in line.split(",")]
+    headers = [h.strip().strip('"').lower() for h in rows[0]]
+    for row in rows[1:]:
+        parts = [p.strip() for p in row]
         if len(parts) < len(headers):
             continue
         data = dict(zip(headers, parts))
@@ -191,7 +230,12 @@ def _parse_video_controller_csv(output):
         vendor = _guess_vendor(name)
         if data.get("adaptercompatibility"):
             vendor = _guess_vendor(data["adaptercompatibility"] + " " + name)
-        gpus.append({"name": name, "memory": memory, "vendor": vendor})
+        gpus.append({
+            "name": name,
+            "memory": memory,
+            "vendor": vendor,
+            "driver": data.get("driverversion", ""),
+        })
     return gpus
 
 
@@ -211,6 +255,32 @@ def _format_ram(ram_value):
 
 def _detect_gpus_linux():
     gpus = []
+
+    # nvidia-smi: driver + VRAM + clocks + temperature (NVIDIA only).
+    try:
+        smi_out = _run_cmd(
+            "nvidia-smi --query-gpu=name,driver_version,memory.total,memory.used,"
+            "clocks.max.graphics,temperature.gpu --format=csv,noheader,nounits"
+        )
+        if smi_out and "," in smi_out and "not recognized" not in smi_out.lower():
+            for line in smi_out.strip().splitlines():
+                parts = [p.strip() for p in line.split(",")]
+                if not parts or not parts[0]:
+                    continue
+                gpus.append({
+                    "name": parts[0],
+                    "memory": (parts[2] + " MiB") if len(parts) > 2 else "",
+                    "vendor": "NVIDIA",
+                    "driver": parts[1] if len(parts) > 1 else "",
+                    "memory_used": (parts[3] + " MiB") if len(parts) > 3 else "",
+                    "core_clock": (parts[4] + " MHz") if len(parts) > 4 else "",
+                    "temperature": (parts[5] + " °C") if len(parts) > 5 else "",
+                })
+            if gpus:
+                return gpus
+    except Exception:
+        pass
+
     output = _run_cmd("lspci -nn | grep -iE 'vga|3d|video'")
     for line in output.splitlines():
         if not line.strip():
@@ -221,7 +291,11 @@ def _detect_gpus_linux():
             name = match.group(1).strip()
         else:
             name = line.split(":", 2)[-1].strip()
-        gpus.append({"name": name, "memory": "", "vendor": _guess_vendor(name)})
+        gpus.append({
+            "name": name, "memory": "", "vendor": _guess_vendor(name),
+            "driver": "", "memory_used": "", "core_clock": "",
+            "temperature": "",
+        })
     return gpus
 
 

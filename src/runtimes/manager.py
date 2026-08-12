@@ -429,7 +429,7 @@ def _build_pytorch_command(variant: str) -> list[str]:
         "--no-warn-script-location",
         "--upgrade",
         "--index-url", index_url,
-        "torch", "torchvision", "torchaudio",
+        "torch", "torchvision", "torchaudio", "onnx", "onnxscript",
     ]
 
 

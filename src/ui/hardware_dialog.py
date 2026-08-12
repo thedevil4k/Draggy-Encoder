@@ -56,10 +56,25 @@ class HardwareDialog(QDialog):
                 name = gpu.get("name", "Unknown")
                 vendor = gpu.get("vendor", "Unknown")
                 memory = gpu.get("memory", "")
+                memory_used = gpu.get("memory_used", "")
+                driver = gpu.get("driver", "")
+                core_clock = gpu.get("core_clock", "")
+                temperature = gpu.get("temperature", "")
                 text = f"• {name} ({vendor})"
                 if memory:
-                    text += f" - {memory}"
-                layout.addWidget(QLabel(text))
+                    if memory_used:
+                        text += f"<br>&nbsp;&nbsp;VRAM: {memory_used} / {memory}"
+                    else:
+                        text += f"<br>&nbsp;&nbsp;VRAM: {memory}"
+                if driver:
+                    text += f"<br>&nbsp;&nbsp;Driver: {driver}"
+                if core_clock:
+                    text += f"<br>&nbsp;&nbsp;Núcleo (max): {core_clock}"
+                if temperature:
+                    text += f"<br>&nbsp;&nbsp;Temperatura: {temperature}"
+                label = QLabel(text)
+                label.setWordWrap(True)
+                layout.addWidget(label)
         else:
             layout.addWidget(QLabel("No GPUs detected."))
 
