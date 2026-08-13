@@ -45,6 +45,37 @@ def isolated_engines_state(tmp_path, monkeypatch):
     es.reset_all()
 
 
+@pytest.fixture(scope="session")
+def capture_screenshots_module():
+    """Carga packaging/linux/capture_screenshots.py como módulo por su ruta.
+
+    Cargar por ruta con importlib evita la colisión con el paquete
+    ``packaging`` de site-packages: ``import packaging.linux...`` podría
+    resolver al paquete instalado (paquete regular gana a namespace) y
+    fallar con ModuleNotFoundError. El módulo expone ``__file__`` (la ruta
+    real del script) y ``main()`` para las pruebas en proceso.
+
+    Es ``session``-scoped y se registra en ``sys.modules``: la carga (que
+    importa PySide6, ~3-5s) ocurre UNA vez por suite, no una por test.
+    """
+    import importlib.util
+
+    name = "capture_screenshots_under_test"
+    if name in sys.modules:
+        return sys.modules[name]
+
+    repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    script_path = os.path.join(
+        repo_root, "packaging", "linux", "capture_screenshots.py"
+    )
+    spec = importlib.util.spec_from_file_location(name, script_path)
+    assert spec is not None and spec.loader is not None
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[name] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
+
 def _current_cp_tag():
     return "cp%d%d-cp%d%d-win_amd64" % (
         sys.version_info.major, sys.version_info.minor,
@@ -3886,6 +3917,248 @@ def test_cleanup_stale_staging_removes_old_temp_files(tmp_path, monkeypatch):
     assert pipeline.cleanup_stale_staging(older_than_seconds=3600) == 1
     assert not old_file.exists()
     assert fresh_file.exists()
+
+
+def test_selftest_reports_qt_platform_failure(tmp_path, monkeypatch):
+    """run_selftest returns 1 and writes the failure to selftest.log when Qt
+    cannot create a QApplication (nonexistent QPA backend).
+
+    With a genuinely nonexistent QT_QPA_PLATFORM, Qt calls qFatal/abort and
+    kills the process before Python can raise, so this test simulates the
+    failure at the exact point Qt would abort - the QApplication constructor
+    - while the environment still points at a nonexistent backend.
+    """
+    import main as main_module
+    import PySide6.QtWidgets as QtWidgets
+
+    monkeypatch.setenv("QT_QPA_PLATFORM", "bogus_platform")
+    # Keep the test hermetic: never touch the real bin/ tree.
+    monkeypatch.setattr("src.config.ensure_runtime_dirs", lambda: None)
+    monkeypatch.setattr("src.config.get_logs_dir", lambda: str(tmp_path))
+
+    class _NoQApp:
+        @staticmethod
+        def instance():
+            return None
+
+        def __init__(self, *args, **kwargs):
+            raise RuntimeError("no Qt platform plugin could be initialized")
+
+    monkeypatch.setattr(QtWidgets, "QApplication", _NoQApp)
+
+    rc = main_module.run_selftest()
+
+    assert rc == 1
+    log = (tmp_path / "selftest.log").read_text(encoding="utf-8")
+    assert "FAIL QApplication offscreen" in log
+    assert "SELFTEST FAIL" in log
+
+
+def test_selftest_passes_with_working_qt(tmp_path, monkeypatch):
+    """run_selftest reports the offscreen QApplication check as OK and
+    returns 0 when Qt can create a real widget (qapp fixture provided).
+    """
+    import main as main_module
+
+    monkeypatch.setattr("src.config.ensure_runtime_dirs", lambda: None)
+    monkeypatch.setattr("src.config.get_logs_dir", lambda: str(tmp_path))
+
+    rc = main_module.run_selftest()
+
+    assert rc == 0
+    log = (tmp_path / "selftest.log").read_text(encoding="utf-8")
+    assert "OK   QApplication offscreen" in log
+    assert "OK   MainWindow offscreen" in log
+    assert "OK   DependenciesDialog offscreen" in log
+    assert "SELFTEST PASS" in log
+
+
+def test_main_window_offscreen_reports_failure(qapp, monkeypatch):
+    """check_main_window_offscreen returns (False, reason) without raising
+    when the MainWindow constructor fails."""
+    import src.qt_check as qt_check
+    import src.ui.main_window as main_window_module
+
+    class _Boom:
+        def __init__(self, *args, **kwargs):
+            raise RuntimeError("widget layout exploded")
+
+    monkeypatch.setattr(main_window_module, "MainWindow", _Boom)
+
+    ok, detail = qt_check.check_main_window_offscreen()
+
+    assert ok is False
+    assert "widget layout exploded" in detail
+
+
+def test_dependencies_dialog_offscreen_reports_failure(qapp, monkeypatch):
+    """check_dependencies_dialog_offscreen returns (False, reason) without
+    raising when the DependenciesDialog constructor fails."""
+    import src.qt_check as qt_check
+    import src.ui.dependencies_dialog as dd_module
+
+    class _Boom:
+        def __init__(self, *args, **kwargs):
+            raise RuntimeError("dialog layout exploded")
+
+    monkeypatch.setattr(dd_module, "DependenciesDialog", _Boom)
+
+    ok, detail = qt_check.check_dependencies_dialog_offscreen()
+
+    assert ok is False
+    assert "dialog layout exploded" in detail
+
+
+def test_run_ui_checks_all_ok(qapp):
+    """run_ui_checks ejecuta las tres validaciones en orden y las reporta
+    todas como 'ok' cuando Qt y las dos pantallas construyen bien."""
+    import src.qt_check as qt_check
+
+    results = qt_check.run_ui_checks()
+
+    assert [name for name, _, _ in results] == [
+        "QApplication offscreen",
+        "MainWindow offscreen",
+        "DependenciesDialog offscreen",
+    ]
+    assert all(status == "ok" for _, status, _ in results), results
+
+
+def test_run_ui_checks_skips_windows_when_qapp_fails(monkeypatch):
+    """Si la QApplication falla, los checks de ventanas se marcan 'skip' y
+    NO se ejecutan: construirlas sin app base no aporta información."""
+    import src.qt_check as qt_check
+
+    def _qapp_boom():
+        return False, "no Qt platform plugin"
+
+    def _never_called():
+        raise AssertionError("no debería ejecutarse sin QApplication")
+
+    monkeypatch.setattr(qt_check, "check_qapplication_offscreen", _qapp_boom)
+    monkeypatch.setattr(qt_check, "check_main_window_offscreen", _never_called)
+    monkeypatch.setattr(qt_check, "check_dependencies_dialog_offscreen", _never_called)
+
+    results = qt_check.run_ui_checks()
+
+    assert results == [
+        ("QApplication offscreen", "fail", "no Qt platform plugin"),
+        ("MainWindow offscreen", "skip", "sin QApplication válida"),
+        ("DependenciesDialog offscreen", "skip", "sin QApplication válida"),
+    ]
+
+
+# Se mantienen AMBAS pruebas de capture_screenshots a propósito, porque
+# cubren dos capas distintas del pre-flight:
+#
+# 1. test_capture_screenshots_main_returns_1_and_no_pngs_on_broken_main_window
+#    (en proceso): valida el CONTRATO de run_ui_checks dentro de main()
+#    parcheando el check directamente. Rápida y determinista, sin entorno.
+# 2. test_capture_screenshots_preflight_rejects_broken_main_window
+#    (subproceso): replica EXACTAMENTE el paso del smoke job de CI (misma
+#    variable DRAGGY_TEST_BROKEN_MAIN_WINDOW, mismo comando, mismo rc). Es
+#    la única que valida que el nombre de la variable del workflow sigue
+#    cableado al hook de src/qt_check.py: si alguien renombra la variable
+#    en un sitio sin el otro, solo esta prueba (o el propio CI) lo detecta.
+#
+# Sustituir 2 por 1 ahorraría ~6s de una suite de ~200s (3%) y perdería la
+# cobertura del cableado env-var -> hook, así que se mantienen ambas. El
+# fixture compartido es session-scoped, así que la carga del módulo solo
+# ocurre una vez.
+def test_capture_screenshots_preflight_rejects_broken_main_window(
+    tmp_path, capture_screenshots_module
+):
+    """capture_screenshots.py con una MainWindow rota (el hook que usa el
+    smoke job de CI) debe fallar con exit 1 y mensaje claro ANTES de
+    generar ningún PNG - el pre-flight sigue siendo el gate de captura.
+    """
+    env = dict(os.environ)
+    env["QT_QPA_PLATFORM"] = "offscreen"
+    env["DRAGGY_TEST_BROKEN_MAIN_WINDOW"] = "1"
+    out_dir = os.path.join(str(tmp_path), "out")
+
+    proc = subprocess.run(
+        [sys.executable, capture_screenshots_module.__file__, out_dir],
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=180,
+    )
+
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    assert (
+        "ERROR: MainWindow offscreen check failed: simulated failure (smoke test)"
+        in proc.stderr
+    )
+    assert os.path.isdir(out_dir)
+    assert not [f for f in os.listdir(out_dir) if f.endswith(".png")]
+
+
+def test_capture_screenshots_main_returns_1_and_no_pngs_on_broken_main_window(
+    tmp_path, monkeypatch, capsys, qapp, capture_screenshots_module
+):
+    """capture_screenshots.main() con una MainWindow rota (el check real de
+    qt_check devuelve fail) debe devolver 1, imprimir el error del pre-flight
+    y NO escribir ningún PNG - cubre el contrato de run_ui_checks dentro del
+    propio script, sin depender del hook de entorno del CI.
+    """
+    mod = capture_screenshots_module
+
+    # La MainWindow está rota: el check que run_ui_checks ejecuta en segundo
+    # lugar falla (igual que el hook del CI, pero parcheando la función real
+    # de qt_check en vez de la variable de entorno).
+    monkeypatch.setattr(
+        "src.qt_check.check_main_window_offscreen",
+        lambda: (False, "widget layout exploded"),
+    )
+    out_dir = str(tmp_path / "out")
+    monkeypatch.setattr(sys, "argv", ["capture_screenshots.py", out_dir])
+
+    rc = mod.main()
+    err = capsys.readouterr().err
+
+    assert rc == 1
+    assert "ERROR: MainWindow offscreen check failed: widget layout exploded" in err
+    assert os.path.isdir(out_dir)
+    assert not [f for f in os.listdir(out_dir) if f.endswith(".png")]
+
+
+def test_capture_screenshots_main_success_writes_expected_pngs(
+    tmp_path, monkeypatch, capsys, qapp, capture_screenshots_module
+):
+    """Caso de éxito de capture_screenshots.main(): con los tres checks OK,
+    devuelve 0 y escribe EXACTAMENTE los dos PNG esperados (workflow y
+    engines), ambos con cabecera PNG real - no vacíos ni basura.
+    """
+    mod = capture_screenshots_module
+
+    out_dir = str(tmp_path / "out")
+    monkeypatch.setattr(sys, "argv", ["capture_screenshots.py", out_dir])
+
+    rc = mod.main()
+    capsys.readouterr()  # descartar posibles avisos de Qt en stderr
+
+    assert rc == 0
+    files = sorted(os.listdir(out_dir))
+    assert files == [
+        "DraggyEncoder-screenshot-engines.png",
+        "DraggyEncoder-screenshot-workflow.png",
+    ]
+    png_magic = b"\x89PNG\r\n\x1a\n"
+    contents = {}
+    for name in files:
+        path = os.path.join(out_dir, name)
+        with open(path, "rb") as fh:
+            contents[name] = fh.read()
+        assert len(contents[name]) > 0
+        assert contents[name][:8] == png_magic
+
+    # Capturan pantallas distintas (workflow vs engines), no solo que ambos
+    # archivos existan: el contenido de los dos PNG debe diferir.
+    assert (
+        contents["DraggyEncoder-screenshot-workflow.png"]
+        != contents["DraggyEncoder-screenshot-engines.png"]
+    )
 
 
 # ==--------------------------------------------------------------------==

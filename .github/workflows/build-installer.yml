@@ -72,7 +72,16 @@ jobs:
           .\dist\DraggyEncoder\DraggyEncoder.exe --selftest
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           $log = ".\dist\DraggyEncoder\bin\logs\selftest.log"
-          if (Test-Path $log) { Get-Content $log } else { Write-Host "INFO: selftest.log no se generó (posiblemente OK)" }
+          if (-not (Test-Path $log)) { Write-Error "selftest.log no se generó"; exit 1 }
+          Get-Content $log
+          # Las tres pantallas principales deben construirse en offscreen:
+          # QApplication, MainWindow y DependenciesDialog. Si falta alguna,
+          # el bundle está roto aunque el import de módulos haya pasado.
+          foreach ($line in @("OK   QApplication offscreen", "OK   MainWindow offscreen", "OK   DependenciesDialog offscreen")) {
+            if (-not (Select-String -Path $log -SimpleMatch -Quiet $line)) {
+              Write-Error "Falta en selftest.log: $line"; exit 1
+            }
+          }
 
       - name: Install Inno Setup
         run: choco install innosetup --yes --no-progress

@@ -81,6 +81,24 @@ def run_selftest() -> int:
             report(f"  FAIL import {mod}:")
             report("  " + traceback.format_exc().strip().replace("\n", "\n  "))
 
+    # Validar Qt offscreen, MainWindow y DependenciesDialog con el mismo
+    # bucle que capture_screenshots.py (run_ui_checks en src/qt_check.py):
+    # es la comprobación más fuerte que el simple import y detecta la falta
+    # de libEGL/libGL/X11, fallos de construcción de la UI y diálogos rotos
+    # antes de empaquetar. Sin QApplication válida, los checks de ventanas
+    # se reportan como SKIP.
+    from src.qt_check import run_ui_checks
+
+    for name, status, detail in run_ui_checks():
+        if status == "ok":
+            report(f"  OK   {name}: {detail}")
+        elif status == "fail":
+            ok = False
+            report(f"  FAIL {name}:")
+            report("  " + detail)
+        else:
+            report(f"  SKIP {name} (sin QApplication válida)")
+
     try:
         from src.config import get_bin_dir
         report(f"  OK   runtime dirs under {get_bin_dir()}")
