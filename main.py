@@ -4,6 +4,132 @@ import os
 # Asegurar que src/ esté en el path para imports
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+# ---------------------------------------------------------------------------
+# Logging centralizado + sys.excepthook (lo antes posible, antes de importar
+# nada más). El ejecutable empaquetado es "windowed" (sin consola):
+# sys.stdout/stderr son None y cualquier traceback se perdería en silencio.
+# Por eso todo el diagnóstico se vuelca a bin/logs/app.log y un crash muestra
+# un diálogo con la ruta del log para que el usuario pueda adjuntarla.
+# ---------------------------------------------------------------------------
+import logging
+
+# get_logs_dir() es frozen-aware (junto al EXE en bundles portables, en el
+# perfil del usuario en paquetes Linux instalados). Importar src.config aquí
+# es seguro: solo usa os/sys/platform y NO dispara torch/PySide6.
+try:
+    from src.config import ensure_runtime_dirs, get_logs_dir
+    ensure_runtime_dirs()
+    _APP_LOG_PATH = os.path.join(get_logs_dir(), "app.log")
+    _FAULTHANDLER_LOG_PATH = os.path.join(get_logs_dir(), "faulthandler.log")
+except Exception:
+    _APP_LOG_PATH = None
+    _FAULTHANDLER_LOG_PATH = None
+
+try:
+    # BackupRotatingFileHandler: además de rotar app.log, archiva el fichero
+    # rotado más antiguo a bin/logs/backup/ antes de borrarlo (y snapshotea
+    # faulthandler.log), manteniendo los últimos 10 respaldos de cada tipo.
+    from src.log_backup import BackupRotatingFileHandler, DEFAULT_KEEP
+
+    _root_logger = logging.getLogger()
+    _root_logger.setLevel(logging.INFO)
+    if _APP_LOG_PATH:
+        _log_handler = BackupRotatingFileHandler(
+            _APP_LOG_PATH,
+            maxBytes=2 * 1024 * 1024,  # 2 MB por archivo
+            backupCount=3,
+            encoding="utf-8",
+            backup_prefix="app",
+            keep=DEFAULT_KEEP,
+            extra_snapshots=[(_FAULTHANDLER_LOG_PATH, "faulthandler")],
+        )
+        _log_handler.setFormatter(
+            logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
+        )
+        _root_logger.addHandler(_log_handler)
+except Exception:
+    # Log inaccesible (permisos, disco lleno): la app arranca igual y el
+    # excepthook de abajo también es tolerante a fallos de E/S.
+    pass
+
+
+def _uncaught_exception(exc_type, exc_value, exc_tb):
+    """sys.excepthook: registra el traceback completo y avisa al usuario.
+
+    - Siempre escribe el traceback en ``bin/logs/app.log`` (y en stderr si
+      existe consola).
+    - En modo GUI muestra un diálogo con la ruta del log. En ``--selftest``
+      (CI headless) solo registra, para no colgar el job esperando un clic.
+    Nunca lanza: un fallo del propio hook no debe enmascarar el error real.
+    """
+    import traceback
+
+    tb_text = "".join(traceback.format_exception(exc_type, exc_value, exc_tb))
+    try:
+        logging.getLogger("crash").error("Unhandled exception:\n%s", tb_text)
+    except Exception:
+        pass
+    try:
+        print(f"Unhandled exception:\n{tb_text}", file=sys.stderr)
+    except Exception:
+        pass
+
+    if "--selftest" in sys.argv:
+        return
+    try:
+        from PySide6.QtWidgets import QApplication, QMessageBox
+
+        app = QApplication.instance()
+        if app is None:
+            app = QApplication(sys.argv)
+        log_path = _APP_LOG_PATH or "(log no disponible)"
+        QMessageBox.critical(
+            None,
+            "DRAGGY ENCODER — Unexpected Error",
+            f"An unexpected error occurred.\n\n"
+            f"Full details were written to:\n{log_path}\n\n"
+            f"Please include this file when reporting the problem.",
+        )
+    except Exception:
+        # Sin GUI disponible (headless, libEGL ausente, ...): solo queda el log.
+        pass
+
+    # Con --crash-report, tras avisar al usuario abrimos un issue de GitHub
+    # pre-rellenado con el traceback y el final de los logs. Solo en modo
+    # GUI (--selftest ya retornó arriba) y tolerante a fallos de red/navegador.
+    if "--crash-report" in sys.argv:
+        try:
+            from src.crash_report import open_crash_report
+            open_crash_report(tb_text)
+        except Exception:
+            pass
+
+
+sys.excepthook = _uncaught_exception
+
+# faulthandler: vuelca tracebacks de TODOS los hilos en segfaults/fatal
+# signals y, además, periódicamente (cada 5 min) para diagnosticar cuelgues
+# que el excepthook no ve (p.ej. un ffmpeg/pip colgado en un worker). Va a un
+# archivo propio (faulthandler.log) para no pelear con la rotación del
+# RotatingFileHandler de app.log. La referencia al fichero se mantiene viva
+# en módulo para que faulthandler no escriba a un handle cerrado.
+try:
+    import faulthandler
+
+    if _FAULTHANDLER_LOG_PATH:
+        _faulthandler_file = open(
+            _FAULTHANDLER_LOG_PATH,
+            "a",
+            encoding="utf-8",
+        )
+        faulthandler.enable(file=_faulthandler_file)
+        faulthandler.dump_traceback_later(300, repeat=True, file=_faulthandler_file)
+    else:
+        _faulthandler_file = None
+        faulthandler.enable()
+except Exception:
+    _faulthandler_file = None
+
 # Completar borrados pendientes (archivos DLL bloqueados por Windows en la
 # sesión anterior) ANTES de que nada importe torch/onnxruntime.
 try:
@@ -136,6 +262,14 @@ def run_selftest() -> int:
 
 
 if __name__ == "__main__":
+    # --crash-report (sin --selftest): modo reporte. Abre un issue de GitHub
+    # pre-rellenado con el final de app.log y faulthandler.log y termina, sin
+    # lanzar la GUI. No requiere que haya habido un crash: sirve para reportar
+    # cualquier problema con los logs actuales.
+    if "--crash-report" in sys.argv and "--selftest" not in sys.argv:
+        from src.crash_report import open_crash_report
+        open_crash_report()
+        sys.exit(0)
     if "--selftest" in sys.argv:
         sys.exit(run_selftest())
     # Import diferido: importar PySide6/QtGUI solo cuando se va a abrir la

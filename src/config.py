@@ -5,6 +5,13 @@ import platform
 APP_NAME = "DRAGGY ENCODER"
 APP_VERSION = "v1"
 
+# Identidad del proyecto para la pestaña About y el flag --crash-report.
+REPO_OWNER = "thedevil4k"
+REPO_NAME = "Draggy-Encoder"
+REPO_URL = f"https://github.com/{REPO_OWNER}/{REPO_NAME}"
+ISSUES_URL = f"{REPO_URL}/issues"
+NEW_ISSUE_URL = f"{ISSUES_URL}/new"
+
 
 def get_base_dir():
     """Devuelve el directorio base de la aplicación."""

@@ -1,5 +1,5 @@
+import logging
 import os
-import sys
 import threading
 import tempfile
 import time
@@ -57,6 +57,8 @@ from src.ui.preferences_dialog import (
 )
 from src.ui.workflow_widget import WorkflowWidget
 
+logger = logging.getLogger(__name__)
+
 
 # ---------------------------------------------------------------------------
 # Workers especializados
@@ -67,6 +69,8 @@ class _FFmpegUpdateWorker(QThread):
 
     Conecta directo al ``MainWindow.progress`` y ``status_label``. En éxito
     emite ``finished_ok``; cualquier error propaga el mensaje por ``failed``.
+    Cancelable vía ``cancel()`` (setea un ``threading.Event`` que la descarga
+    observa).
     """
 
     progress = Signal(int)
@@ -76,6 +80,10 @@ class _FFmpegUpdateWorker(QThread):
 
     def __init__(self, parent=None):
         super().__init__(parent)
+        self.abort_event = threading.Event()
+
+    def cancel(self):
+        self.abort_event.set()
 
     def run(self):
         try:
@@ -92,7 +100,10 @@ class _FFmpegUpdateWorker(QThread):
             def _s(text):
                 self.status.emit(text)
 
-            force_redownload(progress_callback=_p, parent=self.parent())
+            force_redownload(
+                progress_callback=_p, parent=self.parent(),
+                abort_event=self.abort_event,
+            )
             self.finished_ok.emit()
         except Exception as exc:
             self.failed.emit(str(exc))
@@ -339,7 +350,7 @@ class CompressionWorker(QThread):
         except Exception as exc:
             self.success = False
             self.error_message = str(exc)
-            print(f"CompressionWorker exception ({self.mode}): {exc}", file=sys.stderr)
+            logger.error("CompressionWorker exception (%s): %s", self.mode, exc)
 
     def _emit_progress(self, value):
         self.progress.emit(value)
@@ -2694,15 +2705,9 @@ class MainWindow(QMainWindow):
             try:
                 os.remove(path)
             except Exception as exc:
-                print(
-                    f"[Draggy] Could not delete partial {path}: {exc}",
-                    file=sys.stderr,
-                )
+                logger.warning("[Draggy] Could not delete partial %s: %s", path, exc)
         except Exception as exc:
-            print(
-                f"[Draggy] Could not delete partial {path}: {exc}",
-                file=sys.stderr,
-            )
+            logger.warning("[Draggy] Could not delete partial %s: %s", path, exc)
 
     def _cleanup_after_abort(self):
         """Reset UI state after the worker finished (successfully aborted)."""

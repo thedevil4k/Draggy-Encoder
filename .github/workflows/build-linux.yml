@@ -117,7 +117,10 @@ jobs:
           desktop-file-validate packaging/linux/draggy-encoder.desktop
           desktop-file-validate packaging/linux/appimage.desktop
           desktop-file-validate packaging/linux/flatpak.desktop
-          appstreamcli validate --pedantic packaging/linux/flatpak-metainfo.xml
+          # --no-net: los checks de URL (homepage/bugtracker/screenshots) requieren
+          # red y fallan antes de que exista el primer release; el CI no debe depender
+          # de que GitHub responda a HEAD de paths que aún no existen.
+          appstreamcli validate --pedantic --no-net packaging/linux/flatpak-metainfo.xml
           python - <<'PY'
           import yaml
           with open(
@@ -317,7 +320,7 @@ jobs:
           cp assets/Import.png flatpak-staging/draggy-encoder.png
           cp packaging/linux/flatpak-metainfo.xml flatpak-staging/com.draggyencoder.DraggyEncoder.metainfo.xml
           chmod 0755 flatpak-staging/flatpak-wrapper flatpak-staging/DraggyEncoder/DraggyEncoder
-          appstreamcli validate --pedantic flatpak-staging/com.draggyencoder.DraggyEncoder.metainfo.xml
+          appstreamcli validate --pedantic --no-net flatpak-staging/com.draggyencoder.DraggyEncoder.metainfo.xml
           cp packaging/linux/com.draggyencoder.DraggyEncoder.yml flatpak-manifest.yml
           flatpak remote-add --if-not-exists --user flathub https://flathub.org/repo/flathub.flatpakrepo
           flatpak install --user --noninteractive flathub org.freedesktop.Sdk//24.08 org.freedesktop.Platform//24.08
@@ -395,7 +398,7 @@ jobs:
           test -s "$desktop"
           test -s "$icon"
           desktop-file-validate "$desktop"
-          appstreamcli validate --pedantic "$metainfo"
+          appstreamcli validate --pedantic --no-net "$metainfo"
           sudo appstreamcli refresh --force
           appstreamcli dump com.draggyencoder.DraggyEncoder > /tmp/draggy-appstream.txt
           grep -q '<id>com.draggyencoder.DraggyEncoder</id>' /tmp/draggy-appstream.txt

@@ -30,11 +30,14 @@ Patrones usados (alineados con ``src/ui/main_window.py``):
 
 from __future__ import annotations
 
+import logging
 import os
-import sys
+import threading
 import time
 from datetime import datetime
 from typing import Callable, Optional
+
+logger = logging.getLogger(__name__)
 
 from PySide6.QtCore import QObject, QThread, Signal
 
@@ -109,7 +112,7 @@ def notify_log(kind: str, title: str, body: str = "") -> None:
         with open(log_path, "a", encoding="utf-8") as f:
             f.write(line + "\n")
     except Exception as exc:  # pragma: no cover - defensive
-        print(f"notify_log failed: {exc}", file=sys.stderr)
+        logger.warning("notify_log failed: %s", exc)
 
 
 # ---------------------------------------------------------------------------
@@ -138,11 +141,19 @@ class _DependencyUpdateWorker(QThread):
         reinstall_fn: Callable[..., None],
         parent: Optional[QObject] = None,
         on_start: Optional[Callable[[], None]] = None,
+        abort_event: Optional[threading.Event] = None,
     ):
         super().__init__(parent)
         self.dep_id = dep_id
         self.reinstall_fn = reinstall_fn
         self._on_start = on_start  # callable opcional, corre antes del install
+        # ``request_stop`` lo setea; el instalador (pip / descarga de FFmpeg)
+        # lo observa para abortar de verdad, no solo "soft cancel".
+        self.abort_event = abort_event or threading.Event()
+
+    def cancel(self) -> None:
+        """Pide al instalador que pare en cuanto pueda."""
+        self.abort_event.set()
 
     def run(self) -> None:
         try:
@@ -161,7 +172,11 @@ class _DependencyUpdateWorker(QThread):
                 self.status.emit(str(text))
 
             self.status.emit(f"Updating {self.dep_id}...")
-            self.reinstall_fn(progress_callback=_progress, parent=self.parent())
+            self.reinstall_fn(
+                progress_callback=_progress,
+                parent=self.parent(),
+                abort_event=self.abort_event,
+            )
             self.finished_ok.emit()
         except Exception as exc:
             self.failed.emit(str(exc))
@@ -254,6 +269,10 @@ class _UpdateChainController(QObject):
             return
         if not self._worker.isRunning():
             return
+        try:
+            self._worker.cancel()
+        except Exception:
+            pass
         try:
             self._worker.requestInterruption()
         except Exception:

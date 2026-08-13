@@ -1,5 +1,8 @@
+import logging
 import os
 import sys
+
+logger = logging.getLogger(__name__)
 
 # Inyectar runtimes de IA locales lo antes posible para que imports
 # posteriores de torch/onnxruntime encuentren los paquetes descargados
@@ -24,34 +27,87 @@ from src.ui.main_window import MainWindow
 
 
 class StartupWorker(QThread):
-    startup_finished = Signal(object, object, object)  # ffmpeg_path, hardware_info, compatible_codecs
+    # Resultado estructurado (dict) para que el diálogo de arranque pueda
+    # distinguir QUÉ fase falló en vez de traducir cualquier error a
+    # "FFmpeg Error". Campos:
+    #   phase            : "ok" | "ffmpeg" | "hardware" | "codecs" | "startup"
+    #   ffmpeg_path      : str|None
+    #   hardware_info    : dict (mejor esfuerzo; {} si falló la detección)
+    #   compatible_codecs: dict (mejor esfuerzo; {} si falló el test)
+    #   error            : str|None (solo para fases fatales: ffmpeg/startup)
+    #   hardware_error   : str|None (warning NO fatal)
+    #   codecs_error     : str|None (warning NO fatal)
+    startup_finished = Signal(object)
     progress = Signal(int, str)
 
     def run(self):
+        ffmpeg_path = None
+        hardware_info: dict = {}
+        compatible_codecs: dict = {}
+        hardware_error = None
+        codecs_error = None
         try:
-            # 1. Hardware
+            # 1. Hardware — best-effort. Un fallo aquí NO debe bloquear el
+            #    arranque: el panel cae a CPU/lista vacía y avisamos después.
             self.progress.emit(10, "Detecting hardware...")
-            hardware_info = get_hardware_summary()
+            try:
+                hardware_info = get_hardware_summary()
+            except Exception as exc:
+                hardware_error = str(exc)
+                logger.warning("Hardware detection error: %s", exc)
 
             # 2. FFmpeg (descarga si falta; ocupa el rango 30-60% del diálogo)
+            #    Crítico: sin FFmpeg la app no puede comprimir.
             self.progress.emit(30, "Checking FFmpeg...")
             ffmpeg_path = ensure_ffmpeg(progress_callback=self._on_ffmpeg_progress)
             if not ffmpeg_path:
-                self.startup_finished.emit(None, hardware_info, {})
+                self.startup_finished.emit({
+                    "phase": "ffmpeg",
+                    "ffmpeg_path": None,
+                    "hardware_info": hardware_info,
+                    "compatible_codecs": {},
+                    "error": None,
+                    "hardware_error": hardware_error,
+                    "codecs_error": None,
+                })
                 return
 
-            # 3. Test codecs
+            # 3. Test codecs — best-effort. Un fallo aquí deja la lista de
+            #    codecs vacía (el usuario puede Re-detect más tarde) sin
+            #    impedir el arranque.
             self.progress.emit(60, "Testing codecs...")
-            compatible_codecs = test_all_codecs(
-                ffmpeg_path,
-                progress_callback=lambda p: self.progress.emit(60 + p // 3, "Testing codecs..."),
-            )
+            try:
+                compatible_codecs = test_all_codecs(
+                    ffmpeg_path,
+                    progress_callback=lambda p: self.progress.emit(
+                        60 + p // 3, "Testing codecs..."
+                    ),
+                )
+            except Exception as exc:
+                codecs_error = str(exc)
+                logger.warning("Codec test error: %s", exc)
 
             self.progress.emit(100, "Ready")
-            self.startup_finished.emit(ffmpeg_path, hardware_info, compatible_codecs)
+            self.startup_finished.emit({
+                "phase": "ok",
+                "ffmpeg_path": ffmpeg_path,
+                "hardware_info": hardware_info,
+                "compatible_codecs": compatible_codecs,
+                "error": None,
+                "hardware_error": hardware_error,
+                "codecs_error": codecs_error,
+            })
         except Exception as exc:
-            print(f"Startup error: {exc}", file=sys.stderr)
-            self.startup_finished.emit(None, {}, {})
+            logger.exception("Startup error")
+            self.startup_finished.emit({
+                "phase": "startup",
+                "ffmpeg_path": ffmpeg_path,
+                "hardware_info": hardware_info,
+                "compatible_codecs": {},
+                "error": str(exc),
+                "hardware_error": hardware_error,
+                "codecs_error": codecs_error,
+            })
 
     def _on_ffmpeg_progress(self, percent, message=""):
         """Map FFmpeg install/download progress (0-100) to dialog 30-60%.
@@ -96,10 +152,21 @@ class DraggyEncoderApp:
         self.loading.set_progress(value)
         self.loading.set_message(message)
 
-    def _on_finished(self, ffmpeg_path, hardware_info, compatible_codecs):
+    def _on_finished(self, result):
         self.loading.close()
-        if not ffmpeg_path:
-            from PySide6.QtWidgets import QMessageBox
+        result = result or {}
+        phase = result.get("phase") or "startup"
+        ffmpeg_path = result.get("ffmpeg_path")
+        hardware_info = result.get("hardware_info") or {}
+        compatible_codecs = result.get("compatible_codecs") or {}
+        error = result.get("error")
+        hardware_error = result.get("hardware_error")
+        codecs_error = result.get("codecs_error")
+
+        from PySide6.QtWidgets import QMessageBox
+
+        # Fase crítica: sin FFmpeg la app no puede funcionar.
+        if phase == "ffmpeg" or not ffmpeg_path:
             from src.config import get_ffmpeg_dir, get_logs_dir
             target_dir = get_ffmpeg_dir()
             log_path = os.path.join(get_logs_dir(), "ffmpeg_download.log")
@@ -115,6 +182,36 @@ class DraggyEncoderApp:
                 f"Detailed log: {log_path}",
             )
             sys.exit(1)
+
+        # Fallo inesperado no atribuible a una fase concreta.
+        if phase == "startup":
+            QMessageBox.critical(
+                None,
+                "Startup Error",
+                f"DRAGGY ENCODER could not finish starting up.\n\n"
+                f"{error or 'Unknown error.'}\n\n"
+                "If this keeps happening, reinstall the application or "
+                "report the error with the details above.",
+            )
+            sys.exit(1)
+
+        # Avisos NO fatales: la app arranca igual, degradada.
+        if hardware_error:
+            QMessageBox.warning(
+                None,
+                "Hardware Detection Failed",
+                f"Could not detect the hardware. The program will start in a "
+                f"degraded mode (CPU, no codec list) — you can retry later "
+                f"from the 'Re-detect' button.\n\nDetail: {hardware_error}",
+            )
+        if codecs_error:
+            QMessageBox.warning(
+                None,
+                "Codec Test Failed",
+                f"FFmpeg was found, but the codec compatibility test failed. "
+                f"The codec list will be empty until you retry with 'Re-detect'.\n\n"
+                f"Detail: {codecs_error}",
+            )
 
         self.window = MainWindow(ffmpeg_path, hardware_info, compatible_codecs)
         self.window.show()

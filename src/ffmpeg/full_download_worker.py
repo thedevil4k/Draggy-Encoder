@@ -12,6 +12,7 @@ The worker emits progress signals compatible with the 2-arg contract
 from __future__ import annotations
 
 import logging
+import threading
 import traceback
 
 from PySide6.QtCore import QThread, Signal
@@ -41,11 +42,11 @@ class FFmpegFullDownloadWorker(QThread):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self._cancelled = False
+        self._cancelled = threading.Event()
 
     def cancel(self) -> None:
         """Request cancellation. The download loop will exit between chunks."""
-        self._cancelled = True
+        self._cancelled.set()
 
     def _on_progress(self, percent: int, message: str = "") -> None:
         try:
@@ -55,8 +56,11 @@ class FFmpegFullDownloadWorker(QThread):
 
     def run(self) -> None:
         try:
-            path = download_ffmpeg_full(progress_callback=self._on_progress)
-            if self._cancelled:
+            path = download_ffmpeg_full(
+                progress_callback=self._on_progress,
+                abort_event=self._cancelled,
+            )
+            if self._cancelled.is_set():
                 self.failed.emit("cancelled by user")
                 return
             self.finished_ok.emit(path)

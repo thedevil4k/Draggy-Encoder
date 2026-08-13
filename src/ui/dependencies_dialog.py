@@ -11,6 +11,7 @@ import logging
 import os
 import platform
 import subprocess
+import threading
 import traceback
 from datetime import datetime, timezone
 
@@ -130,15 +131,26 @@ def _format_latest_line(info):
 
 
 class _ReinstallWorker(QThread):
-    """Hilo separado para no bloquear la UI durante la descarga."""
+    """Hilo separado para no bloquear la UI durante la descarga.
+
+    Cancelable: ``cancel()`` setea un ``threading.Event`` que el instalador
+    (pip / descarga de FFmpeg) observa y propaga como ``RuntimeError
+    ("cancelled by user")``; el worker distingue ese caso y emite
+    ``cancelled`` en vez de ``failed``.
+    """
 
     progress = Signal(int)
     finished_ok = Signal(str)         # dep_id
     failed = Signal(str, str)         # dep_id, mensaje
+    cancelled = Signal(str)           # dep_id
 
     def __init__(self, dep_id, parent=None):
         super().__init__(parent)
         self.dep_id = dep_id
+        self.abort_event = threading.Event()
+
+    def cancel(self):
+        self.abort_event.set()
 
     def run(self):
         try:
@@ -146,10 +158,14 @@ class _ReinstallWorker(QThread):
                 self.dep_id,
                 progress_callback=lambda v, m: self.progress.emit(v),
                 parent=self.parent(),
+                abort_event=self.abort_event,
             )
             self.finished_ok.emit(self.dep_id)
         except Exception as exc:
-            self.failed.emit(self.dep_id, str(exc))
+            if self.abort_event.is_set():
+                self.cancelled.emit(self.dep_id)
+            else:
+                self.failed.emit(self.dep_id, str(exc))
 
 
 class _UninstallWorker(QThread):
@@ -835,11 +851,12 @@ class DependenciesDialog(QDialog):
         progress = QProgressDialog(
             f"Descargando {display}...\n"
             "Esto puede tardar unos minutos según tu conexión.",
-            None, 0, 100, self,
+            "Cancel", 0, 100, self,
         )
         progress.setWindowModality(Qt.WindowModality.WindowModal)
         progress.setMinimumDuration(0)
         progress.setAutoClose(False)
+        progress.setAutoReset(False)
 
         self._active_worker = _ReinstallWorker(dep_id, parent=self)
         self._active_worker.progress.connect(progress.setValue)
@@ -849,6 +866,10 @@ class DependenciesDialog(QDialog):
         self._active_worker.failed.connect(
             lambda did, msg: self._on_redownload_failed(did, msg, progress)
         )
+        self._active_worker.cancelled.connect(
+            lambda did: self._on_redownload_cancelled(did, progress)
+        )
+        progress.canceled.connect(self._active_worker.cancel)
         self._active_worker.start()
 
     def _on_redownload_finished(self, dep_id, progress):
@@ -868,6 +889,16 @@ class DependenciesDialog(QDialog):
         # Tras reinstalar queremos comparar la nueva build contra el upstream
         # (forzar — el cache fue limpiado, el siguiente check lo repuebla).
         self._schedule_upstream_check(delay_ms=1500, force=True)
+
+    def _on_redownload_cancelled(self, dep_id, progress):
+        progress.close()
+        self._active_worker = None
+        display = self._dep_display_name(dep_id)
+        QMessageBox.information(
+            self, "Cancelado",
+            f"La instalación de '{display}' se canceló.",
+        )
+        self._populate()
 
     def _on_redownload_failed(self, dep_id, msg, progress):
         progress.close()

@@ -42,6 +42,13 @@ _PARALLEL_DEFAULT_WORKERS = 8
 _PARALLEL_MAX_WORKERS = 16
 _PARALLEL_MIN_FILE_SIZE = 16 * 1024 * 1024  # only parallelize files >= 16 MB
 
+# Presupuesto de pared por defecto para una descarga de FFmpeg. El objetivo
+# no es cortar descargas legítimas (los builds de ~130 MB caben de sobra),
+# sino garantizar que una red medio muerta no deje "Install/Update" girando
+# para siempre. La extracción/instalación comparte el mismo deadline para
+# que el presupuesto total sea el declarado.
+_DEFAULT_DOWNLOAD_TIMEOUT_S = 3600
+
 
 # ---------------------------------------------------------------------------
 # Polyfill del callback de progreso
@@ -98,13 +105,29 @@ def _probe_url_metadata(url):
 # Single-stream (fallback)
 # ---------------------------------------------------------------------------
 
-def _download_file(url, dest_path, progress_callback=None):
+def _deadline_check(abort_event, deadline):
+    """Lanza RuntimeError si se pidió cancelar o se agotó el presupuesto.
+
+    Devuelve ``True`` si todo va bien (para lectura directa en el bucle).
+    """
+    if abort_event is not None and abort_event.is_set():
+        raise RuntimeError("cancelled by user")
+    if deadline is not None and time.monotonic() >= deadline:
+        raise RuntimeError(
+            "Download timed out (network stalled or too slow)."
+        )
+    return True
+
+
+def _download_file(url, dest_path, progress_callback=None, abort_event=None,
+                   deadline=None):
     """Descarga single-stream con throttle cada 0.1 s.
 
     Bound de stall: con timeout=(15, 30) y chunks de 256 KB, una red
     totalmente muerta falla en <= 30 s por cada 256 KB (en la práctica
-    cada read toma < 1 s). El caller puede interrumpir la UI con un
-    mensaje claro cuando se cumpla un timeout local.
+    cada read toma < 1 s). ``abort_event`` detiene la descarga entre
+    chunks y ``deadline`` (monotonic) acota el tiempo total; en ambos
+    casos se borra el fichero parcial y se propaga RuntimeError.
     """
     response = requests.get(
         url,
@@ -116,20 +139,29 @@ def _download_file(url, dest_path, progress_callback=None):
     downloaded = 0
     _emit(progress_callback, 0, "Downloading FFmpeg...")
     last_emit_ts = 0.0
-    with open(dest_path, "wb") as f:
-        for chunk in response.iter_content(chunk_size=_DOWNLOAD_CHUNK_SIZE):
-            if not chunk:
-                continue
-            f.write(chunk)
-            downloaded += len(chunk)
-            now = time.time()
-            if total > 0 and (now - last_emit_ts) >= _PROGRESS_EMIT_INTERVAL_S:
-                _emit(
-                    progress_callback,
-                    downloaded * 100 / total,
-                    "Downloading FFmpeg...",
-                )
-                last_emit_ts = now
+    try:
+        with open(dest_path, "wb") as f:
+            for chunk in response.iter_content(chunk_size=_DOWNLOAD_CHUNK_SIZE):
+                _deadline_check(abort_event, deadline)
+                if not chunk:
+                    continue
+                f.write(chunk)
+                downloaded += len(chunk)
+                now = time.time()
+                if total > 0 and (now - last_emit_ts) >= _PROGRESS_EMIT_INTERVAL_S:
+                    _emit(
+                        progress_callback,
+                        downloaded * 100 / total,
+                        "Downloading FFmpeg...",
+                    )
+                    last_emit_ts = now
+    except Exception:
+        try:
+            if os.path.exists(dest_path):
+                os.remove(dest_path)
+        except OSError:
+            pass
+        raise
 
 
 # ---------------------------------------------------------------------------
@@ -142,6 +174,8 @@ def _download_parallel(
     total_size,
     progress_callback=None,
     num_workers=_PARALLEL_DEFAULT_WORKERS,
+    abort_event=None,
+    deadline=None,
 ):
     """Descarga paralela mediante HTTP Range requests.
 
@@ -233,6 +267,7 @@ def _download_parallel(
                 for chunk in response.iter_content(
                     chunk_size=_PARALLEL_CHUNK_SIZE
                 ):
+                    _deadline_check(abort_event, deadline)
                     if not chunk:
                         continue
                     f.write(chunk)
@@ -254,15 +289,16 @@ def _download_parallel(
                 pass
 
     # 4) Spawn workers.
-    with ThreadPoolExecutor(
-        max_workers=num_workers, thread_name_prefix="ffmpegdl"
-    ) as ex:
-        futures = [
-            ex.submit(_fetch_range, range_start, range_end)
-            for range_start, range_end in ranges
-        ]
-        try:
+    try:
+        with ThreadPoolExecutor(
+            max_workers=num_workers, thread_name_prefix="ffmpegdl"
+        ) as ex:
+            futures = [
+                ex.submit(_fetch_range, range_start, range_end)
+                for range_start, range_end in ranges
+            ]
             for fut in as_completed(futures):
+                _deadline_check(abort_event, deadline)
                 exc = fut.exception()
                 if exc is not None:
                     try:
@@ -270,8 +306,13 @@ def _download_parallel(
                     except TypeError:
                         ex.shutdown(wait=False)
                     raise exc
-        except Exception:
-            raise
+    except Exception:
+        try:
+            if os.path.exists(dest_path):
+                os.remove(dest_path)
+        except OSError:
+            pass
+        raise
 
 
 def _safe_archive_member_path(root_dir, member_name):
@@ -335,7 +376,8 @@ def _find_executables(root_dir):
 # Orquestador público
 # ---------------------------------------------------------------------------
 
-def download_ffmpeg(progress_callback=None, parent=None):
+def download_ffmpeg(progress_callback=None, parent=None, abort_event=None,
+                    timeout=None):
     """Descarga FFmpeg para la plataforma actual.
 
     Estrategia:
@@ -351,6 +393,11 @@ def download_ffmpeg(progress_callback=None, parent=None):
          johnvansickle.com (Linux, ~30 MB), siempre acabamos en el camino
          paralelo.
 
+    ``abort_event`` (``threading.Event``) detiene la descarga y lanza
+    ``RuntimeError("cancelled by user")``; ``timeout`` (segundos, default
+    ``_DEFAULT_DOWNLOAD_TIMEOUT_S``) acota el tiempo total de red +
+    extracción + instalación. En ambos casos el fichero parcial se elimina.
+
     Fases de progreso reportadas al callback (percent, message):
       * 0   -> "Connecting to upstream..."
       * 0-90 -> "Downloading FFmpeg..." (single o parallel)
@@ -363,6 +410,9 @@ def download_ffmpeg(progress_callback=None, parent=None):
     la plataforma no tiene URL conocida, si la extracción falla, o si no
     se localiza el binario.
     """
+    deadline = time.monotonic() + (
+        timeout if timeout is not None else _DEFAULT_DOWNLOAD_TIMEOUT_S
+    )
     system = platform.system()
     if system not in FFMPEG_DOWNLOAD_URLS:
         raise RuntimeError("Plataforma no soportada: {}".format(system))
@@ -389,7 +439,8 @@ def download_ffmpeg(progress_callback=None, parent=None):
             # (ReadTimeout, 206 mismatch por Range ignorado, excepción de
             # socket, etc.) caemos automáticamente a single-stream para no
             # mostrar un critical dialog al usuario por un fallo que
-            # single-stream habría capeado sin despeinarse.
+            # single-stream habría capeado sin despeinarse. La cancelación
+            # del usuario y el vencimiento NO caen al fallback: se propagan.
             try:
                 _download_parallel(
                     url,
@@ -397,8 +448,14 @@ def download_ffmpeg(progress_callback=None, parent=None):
                     total_size=size,
                     progress_callback=progress_callback,
                     num_workers=_PARALLEL_DEFAULT_WORKERS,
+                    abort_event=abort_event,
+                    deadline=deadline,
                 )
             except Exception as exc:
+                if abort_event is not None and abort_event.is_set():
+                    raise
+                if time.monotonic() >= deadline:
+                    raise
                 _emit(
                     progress_callback,
                     0,
@@ -414,11 +471,22 @@ def download_ffmpeg(progress_callback=None, parent=None):
                         os.remove(archive_path)
                 except OSError:
                     pass
-                _download_file(url, archive_path, progress_callback=progress_callback)
+                _download_file(
+                    url, archive_path,
+                    progress_callback=progress_callback,
+                    abort_event=abort_event,
+                    deadline=deadline,
+                )
         else:
             # Fallback single-stream (ficheros pequeños o sin soporte Range).
-            _download_file(url, archive_path, progress_callback=progress_callback)
+            _download_file(
+                url, archive_path,
+                progress_callback=progress_callback,
+                abort_event=abort_event,
+                deadline=deadline,
+            )
 
+        _deadline_check(abort_event, deadline)
         _emit(progress_callback, 92, "Extracting {} archive...".format(archive_type))
         extract_dir = os.path.join(tmpdir, "ffmpeg_extracted")
         os.makedirs(extract_dir, exist_ok=True)
@@ -436,6 +504,7 @@ def download_ffmpeg(progress_callback=None, parent=None):
         if not ffmpeg_path:
             raise RuntimeError("No se encontró el ejecutable de FFmpeg tras extraer el archivo.")
 
+        _deadline_check(abort_event, deadline)
         _emit(progress_callback, 98, "Installing binaries...")
         dest_ffmpeg = os.path.join(bin_dir, get_ffmpeg_executable_name())
         dest_ffprobe = os.path.join(bin_dir, get_ffprobe_executable_name())
@@ -458,7 +527,9 @@ def download_ffmpeg(progress_callback=None, parent=None):
     return dest_ffmpeg
 
 
-def _download_and_extract_archive(url, archive_type, tmpdir, archive_name, progress_callback):
+def _download_and_extract_archive(url, archive_type, tmpdir, archive_name,
+                                  progress_callback, abort_event=None,
+                                  deadline=None):
     """Download and extract an archive to a temp directory."""
     archive_path = os.path.join(tmpdir, archive_name)
 
@@ -473,17 +544,33 @@ def _download_and_extract_archive(url, archive_type, tmpdir, archive_name, progr
                 total_size=size,
                 progress_callback=progress_callback,
                 num_workers=_PARALLEL_DEFAULT_WORKERS,
+                abort_event=abort_event,
+                deadline=deadline,
             )
         except Exception as exc:
+            if abort_event is not None and abort_event.is_set():
+                raise
+            if deadline is not None and time.monotonic() >= deadline:
+                raise
             _emit(progress_callback, 0, "Parallel download failed; switching to single-stream...")
             try:
                 if os.path.exists(archive_path):
                     os.remove(archive_path)
             except OSError:
                 pass
-            _download_file(url, archive_path, progress_callback=progress_callback)
+            _download_file(
+                url, archive_path,
+                progress_callback=progress_callback,
+                abort_event=abort_event,
+                deadline=deadline,
+            )
     else:
-        _download_file(url, archive_path, progress_callback=progress_callback)
+        _download_file(
+            url, archive_path,
+            progress_callback=progress_callback,
+            abort_event=abort_event,
+            deadline=deadline,
+        )
 
     _emit(progress_callback, 92, "Extracting {} archive...".format(archive_type))
     extract_dir = os.path.join(tmpdir, "ffmpeg_full_extracted")
@@ -516,14 +603,20 @@ def _download_and_extract_archive(url, archive_type, tmpdir, archive_name, progr
     return extract_dir
 
 
-def download_ffmpeg_full(progress_callback=None, parent=None):
+def download_ffmpeg_full(progress_callback=None, parent=None, abort_event=None,
+                         timeout=None):
     """Download FFmpeg full (with libplacebo) for FSR 3.1 support.
 
     Downloads from BtbN lgpl-shared build (smaller, includes libplacebo).
     Falls back to gpl-shared, then johnvansickle.com static build.
 
-    Returns the path to the FFmpeg executable or raises RuntimeError.
+    ``abort_event`` cancela la descarga; ``timeout`` (segundos) acota el
+    tiempo total. Returns the path to the FFmpeg executable or raises
+    RuntimeError.
     """
+    deadline = time.monotonic() + (
+        timeout if timeout is not None else _DEFAULT_DOWNLOAD_TIMEOUT_S
+    )
     system = platform.system()
     if system not in FFMPEG_FULL_DOWNLOAD_URLS:
         raise RuntimeError("Platform not supported for FFmpeg full: {}".format(system))
@@ -553,14 +646,21 @@ def download_ffmpeg_full(progress_callback=None, parent=None):
 
     with tempfile.TemporaryDirectory() as tmpdir:
         for idx, (url, atype, label) in enumerate(candidates):
+            _deadline_check(abort_event, deadline)
             _emit(progress_callback, 0, "Downloading FFmpeg full ({})...".format(label))
             archive_name = "ffmpeg_full_{}.{}".format(idx, atype)
             try:
                 extract_dir = _download_and_extract_archive(
                     url, atype, tmpdir, archive_name, progress_callback,
+                    abort_event=abort_event, deadline=deadline,
                 )
                 break
             except Exception as exc:
+                # Cancelación y vencimiento no prueban el siguiente mirror.
+                if abort_event is not None and abort_event.is_set():
+                    raise
+                if time.monotonic() >= deadline:
+                    raise
                 last_error = exc
                 _emit(progress_callback, 0, "Failed ({}): {}".format(label, exc))
                 continue

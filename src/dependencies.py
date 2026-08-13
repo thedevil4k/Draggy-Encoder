@@ -597,8 +597,14 @@ def list_all() -> list[dict]:
 
 
 def reinstall(dep_id: str, progress_callback: Optional[Callable[[int], None]] = None,
-              parent=None) -> bool:
-    """Re-descarga / re-instala la dependencia indicada. Lanza excepción si falla."""
+              parent=None, abort_event=None, timeout=None) -> bool:
+    """Re-descarga / re-instala la dependencia indicada. Lanza excepción si falla.
+
+    ``abort_event`` (threading.Event) y ``timeout`` (segundos) se propagan al
+    instalador subyacente para que Instalar/Actualizar se pueda cancelar y
+    nunca cuelgue indefinidamente. Todo ``reinstall_fn`` del REGISTRY debe
+    aceptar estos dos parámetros opcionales.
+    """
     ensure_runtime_dirs()
     for entry in REGISTRY:
         if entry.get("id") != dep_id:
@@ -608,7 +614,10 @@ def reinstall(dep_id: str, progress_callback: Optional[Callable[[int], None]] = 
             raise RuntimeError(
                 f"{dep_id} no tiene instalador automático todavía (coming soon)."
             )
-        fn(progress_callback=progress_callback, parent=parent)
+        fn(
+            progress_callback=progress_callback, parent=parent,
+            abort_event=abort_event, timeout=timeout,
+        )
         return True
     raise KeyError(f"Dependencia desconocida: {dep_id}")
 

@@ -108,6 +108,72 @@ def _ensure_nvidia_dlls_on_path() -> None:
 _ensure_nvidia_dlls_on_path()
 
 
+# ---------------------------------------------------------------------------
+# Carga segura de checkpoints (.pth / .pt)
+# ---------------------------------------------------------------------------
+
+# Preferencia que habilita la deserialización insegura de checkpoints. Por
+# defecto OFF: ``torch.load`` con ``weights_only=False`` ejecuta pickle sobre
+# un fichero de terceros, lo que permite ejecutar código arbitrario embebido
+# en el checkpoint. Solo se degrada a ese camino si el usuario lo activa
+# explícitamente en Preferences > Behavior > Checkpoint security.
+_INSECURE_CHECKPOINT_PREF = "allow_insecure_checkpoint_load"
+
+
+def _is_weights_only_restriction(exc) -> bool:
+    """True si ``exc`` es el error específico de ``weights_only=True``.
+
+    Cuando un checkpoint contiene objetos no-tensor (metadata, wrappers
+    antiguos, optimizer state...), torch lanza un error que sugiere volver
+    a cargar con ``weights_only=False``. Sólo en ese caso tiene sentido
+    plantear la degradación: un fichero corrupto o ilegible debe seguir
+    fallando, sin ofrecer el camino inseguro.
+    """
+    low = str(exc).lower()
+    return (
+        "weights only load failed" in low
+        or "weights_only" in low
+        or "unsupported global" in low
+    )
+
+
+def load_checkpoint_state_dict(path: str):
+    """Carga el state_dict de un checkpoint ``.pth``/``.pt`` de forma segura.
+
+    Intenta SIEMPRE ``torch.load(..., weights_only=True)`` primero (no
+    ejecuta código embebido en el fichero). Sólo si el checkpoint requiere
+    deserialización insegura Y el usuario ha activado explícitamente la
+    preferencia ``allow_insecure_checkpoint_load``, se reintenta con
+    ``weights_only=False`` (con un warning en el log). En cualquier otro
+    caso se lanza ``RuntimeError`` con instrucciones accionables.
+
+    ``.safetensors`` no pasa por aquí: su formato no usa pickle y se carga
+    con ``safetensors.torch.load_file`` en los llamadores.
+    """
+    import torch
+    try:
+        return torch.load(path, map_location="cpu", weights_only=True)
+    except Exception as exc:
+        if not _is_weights_only_restriction(exc):
+            raise
+        if not preferences.get(_INSECURE_CHECKPOINT_PREF, False):
+            raise RuntimeError(
+                "This checkpoint cannot be loaded safely: it contains objects "
+                "that require Python unpickling, which can execute arbitrary "
+                "code embedded in the file. Refusing to load it with "
+                "weights_only=False.\n\n"
+                "To load it anyway, enable 'Allow insecure checkpoint loading' "
+                "in Preferences (Behavior tab), or re-save the model as "
+                ".safetensors.\n\n"
+                f"File: {path}\nUnderlying error: {exc}"
+            ) from exc
+        logger.warning(
+            "Loading checkpoint with weights_only=False (user opted in): %s",
+            path,
+        )
+        return torch.load(path, map_location="cpu", weights_only=False)
+
+
 class AIInferenceEngine:
     """Clase base abstracta para motores de inferencia.
 
@@ -504,7 +570,7 @@ class PyTorchInferenceEngine(AIInferenceEngine):
                 from safetensors.torch import load_file
                 state_dict = load_file(self.model_path, device="cpu")
             else:
-                state_dict = torch.load(self.model_path, map_location="cpu", weights_only=False)
+                state_dict = load_checkpoint_state_dict(self.model_path)
             if not isinstance(state_dict, dict):
                 logger.error("Unexpected checkpoint format: %s", type(state_dict))
                 return False
@@ -1133,7 +1199,7 @@ def convert_pth_to_onnx_ex(pth_path: str) -> tuple[Optional[str], str]:
                 from safetensors.torch import load_file
                 state_dict = load_file(pth_path, device="cpu")
             else:
-                state_dict = torch.load(pth_path, map_location="cpu", weights_only=False)
+                state_dict = load_checkpoint_state_dict(pth_path)
             if not isinstance(state_dict, dict):
                 error_msg = "The weight file does not contain a state dict."
             else:

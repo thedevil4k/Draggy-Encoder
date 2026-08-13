@@ -781,7 +781,8 @@ def test_reinstall_worker_accepts_two_arg_progress_callback(monkeypatch):
 
     calls = []
 
-    def _fake_reinstall(dep_id, progress_callback=None, parent=None):
+    def _fake_reinstall(dep_id, progress_callback=None, parent=None,
+                        abort_event=None, timeout=None):
         progress_callback(33, "Installing ONNX Runtime...")
         progress_callback(100, "ONNX Runtime installed")
 
@@ -802,7 +803,7 @@ def test_update_chain_worker_accepts_two_arg_progress_callback(monkeypatch):
     must accept (percent, message), not just percent."""
     import src.ui.update_chain as uc
 
-    def _fake_install(progress_callback=None, parent=None):
+    def _fake_install(progress_callback=None, parent=None, abort_event=None):
         progress_callback(50, "Installing PyTorch...")
 
     worker = uc._DependencyUpdateWorker("torch", _fake_install)
@@ -976,6 +977,139 @@ def test_run_pip_hides_internals_and_tracks_download(monkeypatch):
     assert any(p >= 95 for p in pcts)
 
 
+def test_run_pip_cancels_when_abort_event_set(monkeypatch):
+    """A set abort_event must kill the pip process and raise
+    'cancelled by user' instead of hanging forever."""
+    import threading
+    import types
+    import src.runtimes.manager as rm
+
+    class _Proc:
+        def __init__(self):
+            self._lines = iter(["Collecting torch\n"])
+            self._terminated = False
+
+        @property
+        def stdout(self):
+            return self._lines
+
+        def wait(self, timeout=None):
+            return 0
+
+        def poll(self):
+            return 0 if self._terminated else None
+
+        def terminate(self):
+            self._terminated = True
+
+        def kill(self):
+            self._terminated = True
+
+    real = rm.subprocess
+    monkeypatch.setattr(rm, "subprocess", types.SimpleNamespace(
+        Popen=lambda *a, **k: _Proc(),
+        run=lambda *a, **k: types.SimpleNamespace(returncode=0, stdout="pip\n", stderr=""),
+        PIPE=real.PIPE,
+        STDOUT=real.STDOUT,
+    ))
+
+    abort = threading.Event()
+    abort.set()
+    with pytest.raises(RuntimeError, match="cancelled by user"):
+        rm._run_pip(
+            ["pip", "install", "torch"], None, 0, 100, "install",
+            abort_event=abort,
+        )
+
+
+def test_run_pip_times_out_with_wall_clock(monkeypatch):
+    """A wall-clock timeout must stop pip and raise a clear error instead
+    of letting 'Install' spin forever on a stalled network."""
+    import types
+    import src.runtimes.manager as rm
+
+    class _Proc:
+        def __init__(self):
+            self._lines = iter(["Collecting torch\n"])
+            self._terminated = False
+
+        @property
+        def stdout(self):
+            return self._lines
+
+        def wait(self, timeout=None):
+            return 0
+
+        def poll(self):
+            return 0 if self._terminated else None
+
+        def terminate(self):
+            self._terminated = True
+
+        def kill(self):
+            self._terminated = True
+
+    real = rm.subprocess
+    monkeypatch.setattr(rm, "subprocess", types.SimpleNamespace(
+        Popen=lambda *a, **k: _Proc(),
+        run=lambda *a, **k: types.SimpleNamespace(returncode=0, stdout="pip\n", stderr=""),
+        PIPE=real.PIPE,
+        STDOUT=real.STDOUT,
+    ))
+
+    with pytest.raises(RuntimeError, match="timed out"):
+        # timeout=0 → el deadline ya está vencido al entrar en el bucle.
+        rm._run_pip(
+            ["pip", "install", "torch"], None, 0, 100, "install",
+            timeout=0,
+        )
+
+
+def test_download_file_aborts_and_removes_partial(tmp_path, monkeypatch):
+    """Single-stream download must honor abort_event and clean up the
+    partial file instead of leaving a corrupt archive behind."""
+    import threading
+    import src.ffmpeg.downloader as dl
+
+    dest = tmp_path / "partial.zip"
+
+    class _Resp:
+        def __init__(self):
+            self._chunks = iter([b"x" * 16])
+
+        def raise_for_status(self):
+            return None
+
+        @property
+        def headers(self):
+            return {"content-length": "32"}
+
+        def iter_content(self, chunk_size=0):
+            for chunk in self._chunks:
+                yield chunk
+
+    def _fake_get(url, **kwargs):
+        return _Resp()
+
+    monkeypatch.setattr(dl.requests, "get", _fake_get)
+
+    abort = threading.Event()
+    abort.set()
+    with pytest.raises(RuntimeError, match="cancelled by user"):
+        dl._download_file("https://example.com/ffmpeg.zip", str(dest), abort_event=abort)
+    assert not dest.exists()
+
+
+def test_deadline_check_raises_on_timeout():
+    """_deadline_check must translate an expired wall-clock budget into a
+    RuntimeError (cancellation is tested via the download tests)."""
+    import time
+    import src.ffmpeg.downloader as dl
+
+    with pytest.raises(RuntimeError, match="timed out"):
+        dl._deadline_check(None, time.monotonic() - 1)
+
+
 # ==--------------------------------------------------------------------==
 # 3. KIND_MODEL rows stay out of the Binaries tab (UI)
 # ==--------------------------------------------------------------------==
@@ -1032,6 +1166,52 @@ def test_dependencies_dialog_responsive(qapp):
         assert dialog.tabs.currentIndex() == 1
         dialog.tabs.setCurrentIndex(0)
         qapp.processEvents()
+    finally:
+        dialog.close()
+
+
+def test_preferences_dialog_diagnostics_tab(qapp, monkeypatch):
+    """La pestaña Diagnostics muestra la ruta de logs y el botón abre la
+    carpeta en el gestor de archivos (QDesktopServices.openUrl)."""
+    from src.ui import preferences_dialog as pd
+
+    opened = []
+    monkeypatch.setattr(
+        pd.QDesktopServices, "openUrl", lambda url: opened.append(url.toString())
+    )
+
+    dialog = pd.PreferencesDialog()
+    try:
+        assert dialog.tabs.count() == 4
+        assert dialog.tabs.tabText(2) == "Diagnostics"
+        assert dialog.lbl_logs_dir.text()
+        assert dialog.lbl_backups.text().startswith("Crash report backups")
+        dialog._open_logs_folder()
+        dialog._open_backups_folder()
+        assert len(opened) == 2
+        assert opened[0].startswith("file:")
+        assert opened[1].startswith("file:") and opened[1].endswith("backup")
+    finally:
+        dialog.close()
+
+
+def test_preferences_dialog_about_tab(qapp):
+    """La pestaña About muestra versión, arquitectura y enlaces al repo/issues."""
+    from src.ui import preferences_dialog as pd
+    from src.config import APP_NAME, APP_VERSION, ISSUES_URL, REPO_URL
+
+    dialog = pd.PreferencesDialog()
+    try:
+        about_widget = dialog.tabs.widget(3)
+        assert dialog.tabs.tabText(3) == "About"
+        # Recorre las QLabel de la pestaña y verifica versión + links.
+        from PySide6.QtWidgets import QLabel
+
+        joined = "\n".join(child.text() for child in about_widget.findChildren(QLabel))
+        assert APP_NAME in joined
+        assert f"Version {APP_VERSION}" in joined
+        assert REPO_URL in joined
+        assert ISSUES_URL in joined
     finally:
         dialog.close()
 
@@ -1711,6 +1891,456 @@ def test_hardware_summary_includes_os_and_python():
         "python.exe",
         "python",
     )
+
+
+def _run_startup_worker(monkeypatch, hardware_fn, ffmpeg_fn, codecs_fn):
+    """Ejecuta StartupWorker.run() con las tres fases parcheadas y devuelve
+    el dict estructurado emitido por startup_finished."""
+    import src.app as appmod
+
+    monkeypatch.setattr(appmod, "get_hardware_summary", hardware_fn)
+    monkeypatch.setattr(appmod, "ensure_ffmpeg", ffmpeg_fn)
+    monkeypatch.setattr(appmod, "test_all_codecs", codecs_fn)
+
+    worker = appmod.StartupWorker()
+    results = []
+    worker.startup_finished.connect(results.append)
+    worker.run()
+    assert len(results) == 1
+    return results[0]
+
+
+def test_startup_worker_hardware_failure_is_non_fatal(qapp, monkeypatch):
+    """Un fallo de detección de hardware NO debe abortar el arranque ni
+    traducirse a 'FFmpeg Error': phase=ok con hardware_error informado."""
+    def _hw():
+        raise RuntimeError("nvidia-smi exploded")
+
+    result = _run_startup_worker(
+        monkeypatch,
+        _hw,
+        lambda progress_callback=None: "/fake/ffmpeg",
+        lambda ffmpeg_path, progress_callback=None: {"CPU": [("libx264", "H.264")]},
+    )
+    assert result["phase"] == "ok"
+    assert result["ffmpeg_path"] == "/fake/ffmpeg"
+    assert result["hardware_info"] == {}
+    assert result["hardware_error"]
+    assert result["compatible_codecs"] == {"CPU": [("libx264", "H.264")]}
+
+
+def test_startup_worker_ffmpeg_failure_is_fatal(qapp, monkeypatch):
+    """Sin FFmpeg el resultado es phase='ffmpeg' y ffmpeg_path=None."""
+    result = _run_startup_worker(
+        monkeypatch,
+        lambda: {"cpu": "x"},
+        lambda progress_callback=None: None,
+        lambda ffmpeg_path, progress_callback=None: {},
+    )
+    assert result["phase"] == "ffmpeg"
+    assert result["ffmpeg_path"] is None
+
+
+def test_startup_worker_codec_failure_is_non_fatal(qapp, monkeypatch):
+    """Un fallo del test de codecs degrada (lista vacía) sin abortar:
+    phase=ok con codecs_error informado."""
+    def _codecs(ffmpeg_path, progress_callback=None):
+        raise RuntimeError("codec probe crashed")
+
+    result = _run_startup_worker(
+        monkeypatch,
+        lambda: {"cpu": "x"},
+        lambda progress_callback=None: "/fake/ffmpeg",
+        _codecs,
+    )
+    assert result["phase"] == "ok"
+    assert result["ffmpeg_path"] == "/fake/ffmpeg"
+    assert result["codecs_error"]
+    assert result["compatible_codecs"] == {}
+
+
+def test_startup_worker_generic_failure_reports_startup_phase(qapp, monkeypatch):
+    """Un fallo no atribuible a hardware/ffmpeg/codecs se marca phase='startup'
+    con el error, no como 'FFmpeg Error'."""
+    def _ff(progress_callback=None):
+        raise RuntimeError("unexpected boom")
+
+    result = _run_startup_worker(
+        monkeypatch,
+        lambda: {"cpu": "x"},
+        _ff,
+        lambda ffmpeg_path, progress_callback=None: {},
+    )
+    assert result["phase"] == "startup"
+    assert result["error"]
+    assert result["ffmpeg_path"] is None
+
+
+def test_on_finished_hardware_warning_not_ffmpeg_error(qapp, monkeypatch):
+    """_on_finished con phase=ok y hardware_error muestra el warning
+    'Hardware Detection Failed' y arranca la MainWindow, sin traducir el
+    fallo a un diálogo crítico 'FFmpeg Error'."""
+    import src.app as appmod
+    from PySide6 import QtWidgets as qtw
+
+    calls = []
+
+    class _Rec:
+        @staticmethod
+        def critical(parent, title, text):
+            calls.append(("critical", title, text))
+
+        @staticmethod
+        def warning(parent, title, text):
+            calls.append(("warning", title, text))
+
+    monkeypatch.setattr(qtw, "QMessageBox", _Rec)
+
+    def _fake_exit(code=0):
+        calls.append(("exit", code))
+        raise SystemExit(code)
+
+    monkeypatch.setattr(appmod.sys, "exit", _fake_exit)
+
+    class _FakeWindow:
+        def show(self):
+            pass
+
+    window_obj = _FakeWindow()
+    captured = {}
+
+    def _fake_main_window(ffmpeg_path, hardware_info, compatible_codecs):
+        captured["ffmpeg_path"] = ffmpeg_path
+        captured["hardware_info"] = hardware_info
+        captured["compatible_codecs"] = compatible_codecs
+        return window_obj
+
+    monkeypatch.setattr(appmod, "MainWindow", _fake_main_window)
+
+    app = object.__new__(appmod.DraggyEncoderApp)
+
+    class _Loading:
+        def close(self):
+            pass
+
+    app.loading = _Loading()
+
+    app._on_finished({
+        "phase": "ok",
+        "ffmpeg_path": "/fake/ffmpeg",
+        "hardware_info": {},
+        "compatible_codecs": {"CPU": [("libx264", "H.264")]},
+        "error": None,
+        "hardware_error": "nvidia-smi exploded",
+        "codecs_error": None,
+    })
+
+    titles = [c[1] for c in calls]
+    assert "FFmpeg Error" not in titles
+    assert ("warning", "Hardware Detection Failed") in [
+        (c[0], c[1]) for c in calls
+    ]
+    assert app.window is window_obj
+    assert captured["ffmpeg_path"] == "/fake/ffmpeg"
+    assert captured["compatible_codecs"] == {"CPU": [("libx264", "H.264")]}
+
+
+def test_on_finished_ffmpeg_failure_still_critical(qapp, monkeypatch):
+    """El caso realmente fatal (sin FFmpeg) SÍ debe mostrar 'FFmpeg Error'
+    y terminar con exit 1."""
+    import src.app as appmod
+    from PySide6 import QtWidgets as qtw
+
+    calls = []
+
+    class _Rec:
+        @staticmethod
+        def critical(parent, title, text):
+            calls.append(("critical", title, text))
+
+    monkeypatch.setattr(qtw, "QMessageBox", _Rec)
+
+    def _fake_exit(code=0):
+        calls.append(("exit", code))
+        raise SystemExit(code)
+
+    monkeypatch.setattr(appmod.sys, "exit", _fake_exit)
+
+    def _fail_main_window(*a, **k):
+        raise AssertionError("MainWindow must not be built")
+
+    monkeypatch.setattr(appmod, "MainWindow", _fail_main_window)
+
+    app = object.__new__(appmod.DraggyEncoderApp)
+
+    class _Loading:
+        def close(self):
+            pass
+
+    app.loading = _Loading()
+
+    with pytest.raises(SystemExit):
+        app._on_finished({
+            "phase": "ffmpeg",
+            "ffmpeg_path": None,
+            "hardware_info": {},
+            "compatible_codecs": {},
+            "error": None,
+            "hardware_error": None,
+            "codecs_error": None,
+        })
+
+    assert ("critical", "FFmpeg Error") in [(c[0], c[1]) for c in calls]
+    assert ("exit", 1) in calls
+
+
+@pytest.fixture()
+def main_module():
+    """Importa main.py (activa logging centralizado + excepthook) y restaura
+    el excepthook original al terminar, para no dejar el hook de GUI activo
+    en el resto de la suite (podría bloquearse esperando un clic)."""
+    original_excepthook = sys.excepthook
+    import main as mainmod
+    try:
+        yield mainmod
+    finally:
+        sys.excepthook = original_excepthook
+
+
+def _make_exc_info(message):
+    try:
+        raise RuntimeError(message)
+    except RuntimeError:
+        return sys.exc_info()
+
+
+def test_main_excepthook_logs_traceback_to_app_log(main_module, monkeypatch):
+    """El excepthook vuelca el traceback completo a bin/logs/app.log."""
+    marker = f"boom-log-{os.getpid()}-{time.monotonic_ns()}"
+    monkeypatch.setattr(sys, "argv", ["main.py", "--selftest"])  # sin diálogo
+    log_path = main_module._APP_LOG_PATH
+    assert log_path, "app.log path should be resolved"
+
+    main_module._uncaught_exception(*_make_exc_info(marker))
+
+    with open(log_path, "r", encoding="utf-8") as fh:
+        content = fh.read()
+    assert marker in content
+    assert "Unhandled exception:" in content
+
+
+def test_main_excepthook_skips_dialog_in_selftest(main_module, monkeypatch):
+    """En --selftest el hook solo registra; nunca muestra un diálogo
+    (evita colgar el CI headless esperando un clic)."""
+    from PySide6 import QtWidgets as qtw
+
+    calls = []
+
+    class _Rec:
+        @staticmethod
+        def critical(parent, title, text):
+            calls.append((title, text))
+
+    monkeypatch.setattr(qtw, "QMessageBox", _Rec)
+    monkeypatch.setattr(sys, "argv", ["main.py", "--selftest"])
+
+    main_module._uncaught_exception(*_make_exc_info("boom-selftest"))
+
+    assert calls == []
+
+
+def test_main_excepthook_shows_dialog_with_log_path(main_module, qapp, monkeypatch):
+    """En modo GUI el hook muestra un diálogo crítico con la ruta del log."""
+    from PySide6 import QtWidgets as qtw
+
+    calls = []
+
+    class _Rec:
+        @staticmethod
+        def critical(parent, title, text):
+            calls.append((title, text))
+
+    monkeypatch.setattr(qtw, "QMessageBox", _Rec)
+    monkeypatch.setattr(sys, "argv", ["draggy"])
+
+    main_module._uncaught_exception(*_make_exc_info("boom-gui"))
+
+    assert len(calls) == 1
+    title, text = calls[0]
+    assert "Unexpected Error" in title
+    assert "app.log" in text
+
+
+def test_main_excepthook_crash_report_flag_opens_issue(main_module, qapp, monkeypatch):
+    """Con --crash-report, tras el diálogo el hook abre el issue pre-rellenado
+    pasándole el traceback completo."""
+    from PySide6 import QtWidgets as qtw
+    import src.crash_report as cr
+
+    class _Rec:
+        @staticmethod
+        def critical(parent, title, text):
+            pass
+
+    monkeypatch.setattr(qtw, "QMessageBox", _Rec)
+    monkeypatch.setattr(sys, "argv", ["draggy", "--crash-report"])
+    reported = []
+    monkeypatch.setattr(
+        cr, "open_crash_report", lambda exc_text="": reported.append(exc_text)
+    )
+
+    main_module._uncaught_exception(*_make_exc_info("boom-crash-report"))
+
+    assert len(reported) == 1
+    assert "boom-crash-report" in reported[0]
+
+
+def test_crash_report_build_issue_url(monkeypatch, tmp_path):
+    """build_issue_url genera un /issues/new pre-rellenado con título, system
+    context y el tail de app.log/faulthandler.log."""
+    import src.crash_report as cr
+    from urllib.parse import parse_qs, urlparse
+
+    monkeypatch.setattr(cr, "get_logs_dir", lambda: str(tmp_path))
+    (tmp_path / "app.log").write_text("hello crash\n" * 100, encoding="utf-8")
+    (tmp_path / "faulthandler.log").write_text(
+        "Fatal Python error: segfault\n", encoding="utf-8"
+    )
+
+    url = cr.build_issue_url("RuntimeError: boom")
+
+    parsed = urlparse(url)
+    assert parsed.path.endswith("/issues/new")
+    qs = parse_qs(parsed.query)
+    assert qs["title"][0] == "Crash report: RuntimeError: boom"
+    body = qs["body"][0]
+    assert "## What happened" in body
+    assert "RuntimeError: boom" in body
+    assert "## System" in body
+    assert "App version:" in body
+    assert "hello crash" in body
+    assert "Fatal Python error: segfault" in body
+
+
+def test_crash_report_read_tail(tmp_path):
+    """_read_tail devuelve los últimos N chars y '' para ficheros ausentes."""
+    import src.crash_report as cr
+
+    p = tmp_path / "tail.txt"
+    content = "abcdefghij" * 100  # 1000 chars
+    p.write_text(content, encoding="utf-8")
+
+    assert cr._read_tail(str(p), 50) == content[-50:]
+    assert cr._read_tail(str(tmp_path / "missing.txt"), 50) == ""
+
+
+def test_crash_report_open_calls_webbrowser(monkeypatch, tmp_path):
+    """open_crash_report abre el navegador con la URL y la devuelve."""
+    import src.crash_report as cr
+
+    opened = []
+    monkeypatch.setattr(cr, "get_logs_dir", lambda: str(tmp_path))
+    monkeypatch.setattr(cr.webbrowser, "open", lambda url: opened.append(url))
+
+    url = cr.open_crash_report("boom")
+
+    assert opened == [url]
+    assert url.startswith(
+        "https://github.com/thedevil4k/Draggy-Encoder/issues/new"
+    )
+
+
+def test_log_backup_archive_file(monkeypatch, tmp_path):
+    """archive_file copia a bin/logs/backup con nombre prefix-timestamp."""
+    import src.log_backup as lb
+
+    monkeypatch.setattr(lb, "get_logs_dir", lambda: str(tmp_path))
+
+    src = tmp_path / "app.log"
+    src.write_text("crash data", encoding="utf-8")
+
+    dest = lb.archive_file(str(src), "app")
+
+    assert dest and os.path.isfile(dest)
+    assert (tmp_path / "backup").exists()
+    assert open(dest, encoding="utf-8").read() == "crash data"
+    assert lb.archive_file(str(tmp_path / "missing.log"), "app") is None
+
+
+def test_log_backup_rotate_keeps_newest(monkeypatch, tmp_path):
+    """rotate deja los últimos N respaldos (orden lexicográfico = cronológico)."""
+    import src.log_backup as lb
+
+    monkeypatch.setattr(lb, "get_logs_dir", lambda: str(tmp_path))
+
+    backup = tmp_path / "backup"
+    backup.mkdir(parents=True, exist_ok=True)
+    for i in range(10):
+        (backup / f"app-20240101-000000-{i:06d}.log").write_text(
+            "x", encoding="utf-8"
+        )
+
+    lb.rotate("app", keep=3)
+
+    remaining = sorted(backup.glob("app-*.log"))
+    assert [p.name for p in remaining] == [
+        "app-20240101-000000-000007.log",
+        "app-20240101-000000-000008.log",
+        "app-20240101-000000-000009.log",
+    ]
+
+
+def test_log_backup_rotating_handler_archives_oldest(monkeypatch, tmp_path):
+    """Al rotar, BackupRotatingFileHandler archiva el app.log.N más antiguo
+    (que la rotación normal borraría) en backup/ antes de perderlo."""
+    import logging
+    import src.log_backup as lb
+
+    monkeypatch.setattr(lb, "get_logs_dir", lambda: str(tmp_path))
+
+    handler = lb.BackupRotatingFileHandler(
+        str(tmp_path / "app.log"),
+        maxBytes=300,
+        backupCount=2,
+        encoding="utf-8",
+        backup_prefix="app",
+        keep=100,  # alto para que el test no rote los archivos a medio camino
+    )
+    logger = logging.getLogger("test_backup_rollover")
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+    logger.addHandler(handler)
+    try:
+        for i in range(80):
+            logger.info("line %04d %s", i, "x" * 60)
+    finally:
+        logger.removeHandler(handler)
+        handler.close()
+
+    backups = sorted((tmp_path / "backup").glob("app-*.log"))
+    assert backups, "el rollover debió archivar el app.log.N más antiguo"
+    content = backups[0].read_text(encoding="utf-8")
+    assert "line 0000" in content
+
+
+def test_log_backup_stats_and_clear(monkeypatch, tmp_path):
+    """backup_stats cuenta ficheros y suma bytes; clear_backups los borra."""
+    import src.log_backup as lb
+
+    monkeypatch.setattr(lb, "get_logs_dir", lambda: str(tmp_path))
+
+    backup = tmp_path / "backup"
+    backup.mkdir(parents=True, exist_ok=True)
+    (backup / "app-1.log").write_bytes(b"x" * 100)
+    (backup / "faulthandler-1.log").write_bytes(b"y" * 50)
+
+    num, total = lb.backup_stats()
+    assert num == 2
+    assert total == 150
+
+    assert lb.clear_backups() == 2
+    assert lb.backup_stats() == (0, 0)
+    assert lb.clear_backups() == 0  # idempotente
 
 
 def test_system_summary_windows_family_by_build():
@@ -3164,6 +3794,99 @@ def test_catalog_arch_lookup_static_and_user(isolated_engines_state):
     entries = list(iter_catalog())
     row = next(e for e in entries if e["engine_id"] == "upscale-realesr-animevideov3")
     assert row.get("arch") == "srvgg"
+
+
+def test_load_checkpoint_prefers_weights_only_true(monkeypatch):
+    """torch.load debe llamarse con weights_only=True por defecto, nunca
+    con weights_only=False de primeras (seguridad contra pickle)."""
+    torch = pytest.importorskip("torch")
+    import src.ai.inference as inf
+
+    calls = []
+
+    def _fake_load(path, **kwargs):
+        calls.append(kwargs.get("weights_only"))
+        return {"fake": "state"}
+
+    monkeypatch.setattr(torch, "load", _fake_load)
+    assert inf.load_checkpoint_state_dict("/tmp/x.pth") == {"fake": "state"}
+    assert calls == [True]
+
+
+def test_load_checkpoint_refuses_unsafe_without_preference(monkeypatch):
+    """Un checkpoint que requiere unpickling se rechaza con un mensaje claro
+    a menos que el usuario active la preferencia explícitamente."""
+    torch = pytest.importorskip("torch")
+    import src.ai.inference as inf
+
+    def _fake_load(path, **kwargs):
+        if kwargs.get("weights_only") is True:
+            raise RuntimeError(
+                "Weights only load failed. Re-running torch.load with "
+                "weights_only=False will likely succeed..."
+            )
+        return {"unsafe": True}
+
+    monkeypatch.setattr(torch, "load", _fake_load)
+    monkeypatch.setattr(inf.preferences, "get", lambda k, d=None: False)
+
+    with pytest.raises(RuntimeError, match="cannot be loaded safely"):
+        inf.load_checkpoint_state_dict("/tmp/x.pth")
+
+
+def test_load_checkpoint_retries_unsafe_when_opted_in(monkeypatch):
+    """Con la preferencia activa se reintenta con weights_only=False."""
+    torch = pytest.importorskip("torch")
+    import src.ai.inference as inf
+
+    calls = []
+
+    def _fake_load(path, **kwargs):
+        wo = kwargs.get("weights_only")
+        calls.append(wo)
+        if wo is True:
+            raise RuntimeError("Weights only load failed ...")
+        return {"unsafe": True}
+
+    monkeypatch.setattr(torch, "load", _fake_load)
+    monkeypatch.setattr(inf.preferences, "get", lambda k, d=None: True)
+
+    assert inf.load_checkpoint_state_dict("/tmp/x.pth") == {"unsafe": True}
+    assert calls == [True, False]
+
+
+def test_weights_only_restriction_detection():
+    """_is_weights_only_restriction distingue el error de weights_only de
+    un fichero corrupto (que no debe ofrecer el camino inseguro)."""
+    from src.ai.inference import _is_weights_only_restriction
+
+    assert _is_weights_only_restriction(
+        RuntimeError("Weights only load failed. Re-running torch.load...")
+    )
+    assert _is_weights_only_restriction(
+        RuntimeError("Unsupported global: GLOBAL foo.bar was not allowed")
+    )
+    assert _is_weights_only_restriction(
+        RuntimeError("please load with weights_only=False")
+    )
+    assert not _is_weights_only_restriction(
+        RuntimeError("invalid load key, 'v'.")
+    )
+    assert not _is_weights_only_restriction(OSError("No such file"))
+
+
+def test_load_checkpoint_propagates_corrupt_file_error(monkeypatch):
+    """Un fichero corrupto (no una restricción de weights_only) se propaga
+    tal cual, sin la oferta de cargar inseguro."""
+    torch = pytest.importorskip("torch")
+    import src.ai.inference as inf
+
+    def _fake_load(path, **kwargs):
+        raise RuntimeError("invalid load key, 'v'.")
+
+    monkeypatch.setattr(torch, "load", _fake_load)
+    with pytest.raises(RuntimeError, match="invalid load key"):
+        inf.load_checkpoint_state_dict("/tmp/x.pth")
 
 
 def test_convert_pth_to_onnx_ex_reports_missing_file():

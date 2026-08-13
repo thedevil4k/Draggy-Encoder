@@ -50,14 +50,16 @@ from __future__ import annotations
 
 import copy
 import json
+import logging
 import os
-import sys
 import threading
 from datetime import datetime, timezone
 from typing import Optional
 
 from src.config import ensure_runtime_dirs, get_session_dir
 from src.ai.registry import _assert_slug  # slug guard for mutation paths
+
+logger = logging.getLogger(__name__)
 
 
 _STATE_VERSION = 1
@@ -353,7 +355,7 @@ def patch(engine_id: str, **fields) -> bool:
     except ValueError as exc:
         # Bad ids are a programming error; log to stderr but do not
         # crash the GUI - rather, the persistence silently fails.
-        print(f"[engines_state] invalid engine_id: {exc}", file=sys.stderr)
+        logger.warning("[engines_state] invalid engine_id: %s", exc)
         return False
     ok = False
     with _STATE_LOCK:
@@ -498,7 +500,7 @@ def set_backend_benchmark(engine_id: str, backend: str, data: dict) -> bool:
     try:
         _assert_slug(engine_id)
     except ValueError as exc:
-        print(f"[engines_state] invalid engine_id: {exc}", file=sys.stderr)
+        logger.warning("[engines_state] invalid engine_id: %s", exc)
         return False
     ok = False
     with _STATE_LOCK:
@@ -560,7 +562,7 @@ def set_benchmark(engine_id: str, data: dict) -> bool:
     try:
         _assert_slug(engine_id)
     except ValueError as exc:
-        print(f"[engines_state] invalid engine_id: {exc}", file=sys.stderr)
+        logger.warning("[engines_state] invalid engine_id: %s", exc)
         return False
     ok = False
     with _STATE_LOCK:

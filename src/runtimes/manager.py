@@ -19,10 +19,13 @@ from __future__ import annotations
 
 import importlib.util
 import os
+import queue
 import re
 import shutil
 import subprocess
 import sys
+import threading
+import time
 
 from src.config import ensure_runtime_dirs, get_bin_dir
 
@@ -486,14 +489,55 @@ def _friendly_phase(line: str) -> str:
     return ""
 
 
+# Presupuesto de pared por defecto para una instalación vía pip.
+# Un torch CUDA completo puede superar los 2 GB en una conexión lenta, así
+# que damos margen; el objetivo no es cortar descargas legítimas, sino
+# garantizar que un pip colgado no deje "Install" girando para siempre.
+_DEFAULT_PIP_TIMEOUT_S = 2 * 3600
+
+
+def _stop_process(proc) -> None:
+    """Termina un subproceso con gracia y escala a kill si no reacciona."""
+    try:
+        proc.terminate()
+    except Exception:
+        pass
+    try:
+        proc.wait(timeout=5)
+        return
+    except Exception:
+        pass
+    try:
+        proc.kill()
+    except Exception:
+        pass
+    try:
+        proc.wait(timeout=2)
+    except Exception:
+        pass
+
+
 def _run_pip(cmd: list[str], progress_callback, start_pct: int, end_pct: int,
-             message: str):
+             message: str, abort_event=None, timeout: float | None = None):
     """Ejecuta un comando pip y emite progreso interpolado.
 
     La UI recibe SOLO fases amigables y porcentajes: la salida cruda de pip
     se queda en la cola de diagnóstico (visible únicamente si la instalación
     falla, en el detalle técnico del diálogo de error).
+
+    ``abort_event`` (``threading.Event`` opcional) detiene la instalación en
+    cuanto se setea: matamos el proceso pip y lanzamos ``RuntimeError
+    ("cancelled by user")`` para que el caller distinga cancelación de fallo.
+    ``timeout`` es el presupuesto total de pared en segundos (default
+    ``_DEFAULT_PIP_TIMEOUT_S``): pasado ese límite matamos pip y lanzamos
+    ``RuntimeError``, de modo que Instalar/Actualizar nunca cuelgue
+    indefinidamente aunque la red esté medio muerta. Se lee en un hilo
+    dedicado para poder observar el abort/vencimiento mientras ``readline``
+    bloquea.
     """
+    deadline = time.monotonic() + (
+        timeout if timeout is not None else _DEFAULT_PIP_TIMEOUT_S
+    )
     if progress_callback:
         progress_callback(start_pct, message)
 
@@ -504,7 +548,7 @@ def _run_pip(cmd: list[str], progress_callback, start_pct: int, end_pct: int,
     try:
         test_proc = subprocess.run(
             [_pip_python(), "-m", "pip", "--version"],
-            capture_output=True, text=True, env=env,
+            capture_output=True, text=True, env=env, timeout=30,
         )
         if test_proc.returncode != 0:
             raise RuntimeError(
@@ -519,46 +563,97 @@ def _run_pip(cmd: list[str], progress_callback, start_pct: int, end_pct: int,
             "Asegúrate de que Python se instaló con pip."
         ) from exc
 
+    proc = None
     last_pct = start_pct
     tail: list[str] = []
+    lines: "queue.Queue[str | None]" = queue.Queue()
+
+    def _reader():
+        try:
+            assert proc is not None and proc.stdout is not None
+            for line in proc.stdout:
+                lines.put(line)
+        except Exception:
+            pass
+        finally:
+            lines.put(None)  # sentinel EOF
+
+    cancelled = False
+    timed_out = False
+    ret = -1
     try:
-        with subprocess.Popen(
+        proc = subprocess.Popen(
             cmd,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
             env=env,
-        ) as proc:
-            for line in proc.stdout:
-                line = line.strip()
-                if not line:
-                    continue
-                # Guardar cola del output para el diagnóstico de errores
-                tail.append(line)
-                if len(tail) > 15:
-                    tail.pop(0)
-                if not progress_callback or last_pct >= end_pct:
-                    continue
-                # Progreso real cuando pip reporta tamaño descargado
-                # (2.4/2.4 GB), para que la barra se mueva de forma honesta
-                # durante descargas largas. Nunca retroceder.
-                frac = _download_fraction(line)
-                if frac is not None:
-                    pct = start_pct + (end_pct - start_pct) * frac
-                else:
-                    pct = last_pct + 1
-                pct = min(end_pct, max(pct, last_pct))
-                last_pct = pct
-                phase = _friendly_phase(line) or message
-                progress_callback(int(pct), phase)
-            ret = proc.wait()
-            if ret != 0:
-                detail = "\n".join(tail) or "(no output)"
-                raise RuntimeError(f"pip exited with code {ret}\n\n{detail}")
+        )
+        threading.Thread(target=_reader, daemon=True).start()
+        while True:
+            if abort_event is not None and abort_event.is_set():
+                cancelled = True
+                _stop_process(proc)
+                break
+            if time.monotonic() >= deadline:
+                timed_out = True
+                _stop_process(proc)
+                break
+            try:
+                line = lines.get(timeout=0.25)
+            except queue.Empty:
+                continue
+            if line is None:
+                break  # EOF
+            line = line.strip()
+            if not line:
+                continue
+            # Guardar cola del output para el diagnóstico de errores
+            tail.append(line)
+            if len(tail) > 15:
+                tail.pop(0)
+            if not progress_callback or last_pct >= end_pct:
+                continue
+            # Progreso real cuando pip reporta tamaño descargado
+            # (2.4/2.4 GB), para que la barra se mueva de forma honesta
+            # durante descargas largas. Nunca retroceder.
+            frac = _download_fraction(line)
+            if frac is not None:
+                pct = start_pct + (end_pct - start_pct) * frac
+            else:
+                pct = last_pct + 1
+            pct = min(end_pct, max(pct, last_pct))
+            last_pct = pct
+            phase = _friendly_phase(line) or message
+            progress_callback(int(pct), phase)
+        ret = proc.wait()
     except FileNotFoundError as exc:
         raise RuntimeError(
             "No se pudo ejecutar pip. Verifica que Python esté en el PATH."
         ) from exc
+    finally:
+        # Red de seguridad: un pip a medio matar no debe quedar huérfano.
+        if proc is not None:
+            try:
+                still_running = proc.poll() is None
+            except Exception:
+                still_running = True
+            if still_running:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+
+    if cancelled:
+        raise RuntimeError("cancelled by user")
+    if timed_out:
+        raise RuntimeError(
+            f"Installation timed out after {int(timeout or _DEFAULT_PIP_TIMEOUT_S)}s "
+            "(the download stalled or the network is too slow)."
+        )
+    if ret != 0:
+        detail = "\n".join(tail) or "(no output)"
+        raise RuntimeError(f"pip exited with code {ret}\n\n{detail}")
 
     if progress_callback:
         progress_callback(end_pct, message)
@@ -577,6 +672,8 @@ def install_pytorch(
     variant: str = "auto",
     progress_callback=None,
     parent=None,
+    abort_event=None,
+    timeout: float | None = None,
 ) -> str:
     """Instala SOLO PyTorch (torch + torchvision + torchaudio) en
     ``bin/runtimes/ai_modules``.
@@ -584,6 +681,8 @@ def install_pytorch(
     Separado de ONNX Runtime: cada fila del panel de dependencias instala
     únicamente su paquete, evitando arrastrar 3 GB de torch cuando el
     usuario solo quiere ONNX (y viceversa).
+
+    ``abort_event`` cancela la descarga; ``timeout`` acota el tiempo total.
     """
     if not _is_python_version_supported():
         _raise_unsupported_python()
@@ -598,6 +697,8 @@ def install_pytorch(
         start_pct=5,
         end_pct=99,
         message="Descargando PyTorch...",
+        abort_event=abort_event,
+        timeout=timeout,
     )
     # Purga posterior: pip --target deja dist-infos huérfanos de la versión
     # previa que mantendrían el store 'incompatible' (guard de versión).
@@ -618,9 +719,14 @@ def install_onnxruntime(
     variant: str = "auto",
     progress_callback=None,
     parent=None,
+    abort_event=None,
+    timeout: float | None = None,
 ) -> str:
     """Instala SOLO ONNX Runtime (onnxruntime / onnxruntime-gpu) en
-    ``bin/runtimes/ai_modules``."""
+    ``bin/runtimes/ai_modules``.
+
+    ``abort_event`` cancela la descarga; ``timeout`` acota el tiempo total.
+    """
     if not _is_python_version_supported():
         _raise_unsupported_python()
     os.makedirs(RUNTIME_MODULES_DIR, exist_ok=True)
@@ -632,6 +738,8 @@ def install_onnxruntime(
         start_pct=5,
         end_pct=99,
         message="Descargando ONNX Runtime...",
+        abort_event=abort_event,
+        timeout=timeout,
     )
     _purge_foreign_version_wheels()
     if progress_callback:
@@ -650,6 +758,8 @@ def install_runtimes(
     variant: str = "auto",
     progress_callback=None,
     parent=None,
+    abort_event=None,
+    timeout: float | None = None,
 ) -> str:
     """Instala PyTorch y ONNX Runtime en ``bin/runtimes/ai_modules``.
 
@@ -676,6 +786,8 @@ def install_runtimes(
         start_pct=5,
         end_pct=85,
         message="Descargando PyTorch...",
+        abort_event=abort_event,
+        timeout=timeout,
     )
 
     # 2. ONNX Runtime
@@ -685,6 +797,8 @@ def install_runtimes(
         start_pct=86,
         end_pct=99,
         message="Descargando ONNX Runtime...",
+        abort_event=abort_event,
+        timeout=timeout,
     )
 
     _purge_foreign_version_wheels()
@@ -782,9 +896,16 @@ def onnx_status() -> dict:
 # ---------------------------------------------------------------------------
 
 
-def install_all(progress_callback=None, parent=None, variant: str = "auto") -> None:
+def install_all(progress_callback=None, parent=None, variant: str = "auto",
+                abort_event=None, timeout: float | None = None) -> None:
     """Instala PyTorch + ONNX en un solo comando."""
-    install_runtimes(variant=variant, progress_callback=progress_callback, parent=parent)
+    install_runtimes(
+        variant=variant,
+        progress_callback=progress_callback,
+        parent=parent,
+        abort_event=abort_event,
+        timeout=timeout,
+    )
 
 
 def uninstall_local_runtimes(parent=None) -> None:

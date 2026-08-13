@@ -5,7 +5,9 @@
   <summary>AI-powered video compression and upscaling</summary>
   <metadata_license>CC0-1.0</metadata_license>
   <project_license>MIT</project_license>
-  <developer_name>Draggy Encoder contributors</developer_name>
+  <developer id="io.github.thedevil4k">
+    <name>Draggy Encoder contributors</name>
+  </developer>
   <description>
     <p>Visual video encoding with AI upscaling, frame interpolation, denoising and colorization workflows.</p>
     <p>Build video pipelines visually, compare previews, preserve audio and choose the fastest measured inference backend.</p>
@@ -25,7 +27,7 @@
   </keywords>
   <url type="homepage">https://github.com/thedevil4k/Draggy-Encoder</url>
   <url type="bugtracker">https://github.com/thedevil4k/Draggy-Encoder/issues</url>
-  <icon type="local">com.draggyencoder.DraggyEncoder</icon>
+  <icon type="stock">com.draggyencoder.DraggyEncoder</icon>
   <launchable type="desktop-id">com.draggyencoder.DraggyEncoder.desktop</launchable>
   <provides>
     <binary>draggy-encoder</binary>
@@ -41,4 +43,11 @@
     </screenshot>
   </screenshots>
   <content_rating type="oars-1.1"/>
+  <releases>
+    <release version="0.1.0" date="2026-08-13">
+      <description>
+        <p>First packaging release with AppStream metadata, Debian/RPM/AppImage/Flatpak bundles and AI engine management.</p>
+      </description>
+    </release>
+  </releases>
 </component>

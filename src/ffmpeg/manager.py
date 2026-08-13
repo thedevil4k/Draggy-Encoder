@@ -1,12 +1,14 @@
 import json
+import logging
 import os
 import platform
 import re
 import shutil
 import subprocess
-import sys
 from datetime import datetime
 from functools import lru_cache
+
+logger = logging.getLogger(__name__)
 
 from src.config import (
     FFMPEG_DOWNLOAD_URLS,
@@ -292,11 +294,13 @@ def get_ffmpeg_path_for_fsr31():
     return get_local_ffmpeg_path()
 
 
-def ensure_ffmpeg_full(parent=None, progress_callback=None):
+def ensure_ffmpeg_full(parent=None, progress_callback=None, abort_event=None,
+                       timeout=None):
     """Ensure FFmpeg full (with libplacebo) is available for FSR 3.1.
 
     Tries to download FFmpeg full if not already present.
     Returns True if successful, False otherwise.
+    ``abort_event`` cancela la descarga; ``timeout`` acota el tiempo total.
     """
     ffmpeg_full = get_local_ffmpeg_full_path()
     if os.path.exists(ffmpeg_full):
@@ -306,11 +310,14 @@ def ensure_ffmpeg_full(parent=None, progress_callback=None):
 
     # Try to download FFmpeg full
     try:
-        path = download_ffmpeg_full(parent=parent, progress_callback=progress_callback)
+        path = download_ffmpeg_full(
+            parent=parent, progress_callback=progress_callback,
+            abort_event=abort_event, timeout=timeout,
+        )
         if path and os.path.exists(path):
             return has_libplacebo_support(path)
     except Exception as exc:
-        print(f"Error downloading FFmpeg full: {exc}", file=sys.stderr)
+        logger.warning("Error downloading FFmpeg full: %s", exc)
         return False
 
     return False
@@ -405,11 +412,12 @@ def _migrate_legacy_layout():
                     pass
         return True
     except Exception as exc:
-        print(f"Legacy FFmpeg migration failed: {exc}", file=sys.stderr)
+        logger.warning("Legacy FFmpeg migration failed: %s", exc)
         return False
 
 
-def ensure_ffmpeg(parent=None, progress_callback=None, prefer_full=True):
+def ensure_ffmpeg(parent=None, progress_callback=None, prefer_full=True,
+                  abort_event=None, timeout=None):
     """Asegura que FFmpeg esté disponible dentro de la carpeta del programa.
 
     Args:
@@ -419,6 +427,8 @@ def ensure_ffmpeg(parent=None, progress_callback=None, prefer_full=True):
             callbacks de 1 argumento vía ``_emit``.
         prefer_full: Si es True, intenta descargar FFmpeg completo (con libplacebo)
             primero. Si falla, cae al FFmpeg estándar.
+        abort_event: threading.Event opcional para cancelar la descarga.
+        timeout: presupuesto total de pared en segundos (opcional).
 
     Reglas (alineadas con el requisito del usuario):
       1. Si existe el binario local -> se usa, sin fallback al sistema.
@@ -452,7 +462,10 @@ def ensure_ffmpeg(parent=None, progress_callback=None, prefer_full=True):
             # Intentar descargar FFmpeg completo primero
             _emit(progress_callback, 0, "Downloading FFmpeg full (with libplacebo)...")
             try:
-                path = download_ffmpeg_full(parent=parent, progress_callback=progress_callback)
+                path = download_ffmpeg_full(
+                    parent=parent, progress_callback=progress_callback,
+                    abort_event=abort_event, timeout=timeout,
+                )
                 if path and os.path.exists(path):
                     # Verify libplacebo support
                     if has_libplacebo_support(path):
@@ -463,10 +476,13 @@ def ensure_ffmpeg(parent=None, progress_callback=None, prefer_full=True):
                         _emit(progress_callback, 0, "FFmpeg full doesn't have libplacebo, trying standard...")
             except Exception as exc:
                 _emit(progress_callback, 0, f"FFmpeg full download failed: {exc}, trying standard...")
-                print(f"FFmpeg full download failed: {exc}", file=sys.stderr)
+                logger.warning("FFmpeg full download failed: %s", exc)
 
         # Fallback to standard FFmpeg
-        path = download_ffmpeg(parent=parent, progress_callback=progress_callback)
+        path = download_ffmpeg(
+            parent=parent, progress_callback=progress_callback,
+            abort_event=abort_event, timeout=timeout,
+        )
     except Exception as exc:
         # Registrar el error en bin/logs/ffmpeg_download.log para diagnóstico.
         try:
@@ -477,7 +493,7 @@ def ensure_ffmpeg(parent=None, progress_callback=None, prefer_full=True):
                 f.write(f"[{ts}] ensure_ffmpeg download failed: {exc}\n")
         except Exception:
             pass
-        print(f"Error descargando FFmpeg: {exc}", file=sys.stderr)
+        logger.error("Error descargando FFmpeg: %s", exc)
         return None
     # Escribir manifest con datos de la descarga + huella upstream
     write_manifest(_build_install_manifest(path, "first-download"))
@@ -485,11 +501,13 @@ def ensure_ffmpeg(parent=None, progress_callback=None, prefer_full=True):
     return path
 
 
-def force_redownload(progress_callback=None, parent=None):
+def force_redownload(progress_callback=None, parent=None, abort_event=None,
+                     timeout=None):
     """Borra la instalación actual y descarga de nuevo.
 
     Lanza ``RuntimeError`` si la descarga falla o si tras la descarga falta el
-    binario (el caller debe traducirlo al UI).
+    binario (el caller debe traducirlo al UI). ``abort_event`` cancela la
+    descarga; ``timeout`` acota el tiempo total.
     """
     ffmpeg_dir = get_ffmpeg_dir()
     # Borrar binarios anteriores (si existen) — conservamos la propia carpeta.
@@ -502,7 +520,10 @@ def force_redownload(progress_callback=None, parent=None):
             pass
 
     ensure_runtime_dirs()
-    path = download_ffmpeg(progress_callback=progress_callback, parent=parent)
+    path = download_ffmpeg(
+        progress_callback=progress_callback, parent=parent,
+        abort_event=abort_event, timeout=timeout,
+    )
     write_manifest(_build_install_manifest(path, "user-reinstall"))
     if not path or not os.path.exists(path):
         raise RuntimeError("Re-download finished but FFmpeg binary is missing.")

@@ -1,4 +1,5 @@
-"""Diálogo modal de Preferencias con pestañas **Behavior** y **History**.
+"""Diálogo modal de Preferencias con pestañas **Behavior**, **History**,
+**Diagnostics** y **About**.
 
 - **Behavior**: contiene el toggle ``auto_update_all_on_close`` (con
   alias legacy ``auto_update_on_close``) que controla si la cadena de
@@ -7,6 +8,13 @@
 - **History**: muestra los últimos ``HISTORY_LIMIT`` updates persistidos
   en ``bin/.session/update_history.json``. Cada fila expone timestamp,
   dependencia, version antes/después, duración y delta de bytes.
+
+- **Diagnostics**: muestra la ruta de ``bin/logs``, botones para abrir la
+  carpeta de logs y la de respaldos, y el nº/tamaño de los respaldos de
+  crash report con opción de borrarlos.
+
+- **About**: versión, arquitectura, SO/Python y enlaces al repositorio y al
+  bugtracker para reportar problemas con contexto.
 
 Construido como ``QTabWidget`` para admitir futuras secciones (paths
 extra, modelos por defecto) sin tocar el layout principal.
@@ -21,9 +29,12 @@ from __future__ import annotations
 
 import json
 import os
+import platform
+import struct
+import sys
 
-from PySide6.QtCore import Qt
-from PySide6.QtGui import QFont
+from PySide6.QtCore import Qt, QUrl
+from PySide6.QtGui import QDesktopServices, QFont
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QCheckBox,
@@ -44,7 +55,16 @@ from PySide6.QtWidgets import (
 
 import src.preferences as preferences
 import src.update_history as update_history
-from src.config import ensure_runtime_dirs, get_session_dir
+from src.config import (
+    APP_NAME,
+    APP_VERSION,
+    ISSUES_URL,
+    REPO_URL,
+    ensure_runtime_dirs,
+    get_logs_dir,
+    get_session_dir,
+)
+from src.log_backup import backup_dir, backup_stats, clear_backups
 from src.personal import get_token as _get_hf_token, set_token as _set_hf_token
 
 
@@ -55,6 +75,7 @@ _AUTO_OPEN_LAST_OUTPUT_KEY = "auto_open_last_output"
 _HEALTH_CHECK_PROMPT_KEY = "ffmpeg_health_check_prompt"
 _REMEMBER_CODEC_KEY = "remember_last_codec_device"
 _EXEC_PROVIDER_KEY = "execution_provider"
+_INSECURE_CHECKPOINT_KEY = "allow_insecure_checkpoint_load"
 
 
 # ---------------------------------------------------------------------------
@@ -189,6 +210,8 @@ class PreferencesDialog(QDialog):
         self.tabs = QTabWidget(self)
         self.tabs.addTab(self._build_behavior_tab(), "Behavior")
         self.tabs.addTab(self._build_history_tab(), "History")
+        self.tabs.addTab(self._build_diagnostics_tab(), "Diagnostics")
+        self.tabs.addTab(self._build_about_tab(), "About")
         if self._initial_tab == "history":
             self.tabs.setCurrentIndex(1)
         else:
@@ -290,6 +313,25 @@ class PreferencesDialog(QDialog):
         self.cmb_exec_provider.setMinimumWidth(180)
         provider_group_layout.addWidget(self.cmb_exec_provider)
         layout.addWidget(provider_group)
+
+        # --------- Section: Checkpoint security ---------
+        security_group = self._build_section(
+            "Checkpoint security",
+            "Los checkpoints de terceros (.pth/.pt) se cargan por defecto en "
+            "modo seguro (weights_only=True), que no ejecuta código embebido "
+            "en el archivo. Algunos modelos antiguos guardan objetos extra "
+            "(metadata, optimizadores) que solo se pueden leer con pickle "
+            "completo, lo cual permite ejecutar código arbitrario. Activa esta "
+            "opción SOLO si confías plenamente en el origen del modelo y "
+            "aceptas ese riesgo; el programa registrará cada carga insegura "
+            "en el log.",
+        )
+        security_group_layout = security_group.layout()
+        self.chk_insecure_checkpoint = QCheckBox(
+            "Allow insecure checkpoint loading (weights_only=False)"
+        )
+        security_group_layout.addWidget(self.chk_insecure_checkpoint)
+        layout.addWidget(security_group)
 
         # --------- Section: HuggingFace API Token ---------
         hf_group = self._build_section(
@@ -482,6 +524,175 @@ class PreferencesDialog(QDialog):
         except Exception:
             pass
 
+    # -------------------- Diagnostics tab --------------------
+
+    def _build_diagnostics_tab(self):
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setSpacing(14)
+        layout.setContentsMargins(18, 16, 18, 16)
+
+        title = QLabel("Diagnostics")
+        title_font = QFont()
+        title_font.setPointSize(15)
+        title_font.setBold(True)
+        title.setFont(title_font)
+        title.setStyleSheet("color: #00d2d3;")
+        layout.addWidget(title)
+
+        body = QLabel(
+            "Los registros de la aplicación (errores, actualizaciones, "
+            "selftest y volcados de faulthandler) se guardan en esta carpeta. "
+            "Adjunta app.log al reportar un problema."
+        )
+        body.setWordWrap(True)
+        body.setStyleSheet("color: #a0a0b0; font-size: 11px;")
+        layout.addWidget(body)
+
+        self._logs_dir = get_logs_dir()
+        self.lbl_logs_dir = QLabel(self._logs_dir)
+        self.lbl_logs_dir.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+        )
+        self.lbl_logs_dir.setWordWrap(True)
+        self.lbl_logs_dir.setStyleSheet(
+            "color: #e0e0e0; font-size: 12px; background-color: #16213e;"
+            "padding: 8px; border-radius: 6px;"
+        )
+        layout.addWidget(self.lbl_logs_dir)
+
+        row = QHBoxLayout()
+        self.btn_open_logs = QPushButton("Open logs folder")
+        self.btn_open_logs.setStyleSheet(
+            "background-color: #2c3e50; color: #e0e0e0;"
+            "padding: 8px 14px; border-radius: 6px;"
+        )
+        self.btn_open_logs.clicked.connect(self._open_logs_folder)
+        row.addWidget(self.btn_open_logs)
+        self.btn_open_backups = QPushButton("Open backups folder")
+        self.btn_open_backups.setStyleSheet(
+            "background-color: #2c3e50; color: #e0e0e0;"
+            "padding: 8px 14px; border-radius: 6px;"
+        )
+        self.btn_open_backups.clicked.connect(self._open_backups_folder)
+        row.addWidget(self.btn_open_backups)
+        row.addStretch()
+        layout.addLayout(row)
+
+        backups_row = QHBoxLayout()
+        self.lbl_backups = QLabel("")
+        self.lbl_backups.setStyleSheet("color: #a0a0b0; font-size: 11px;")
+        backups_row.addWidget(self.lbl_backups, stretch=1)
+        self.btn_clear_backups = QPushButton("Clear backups")
+        self.btn_clear_backups.setStyleSheet(
+            "background-color: #2c3e50; color: #e0e0e0;"
+            "padding: 8px 14px; border-radius: 6px;"
+        )
+        self.btn_clear_backups.clicked.connect(self._on_clear_backups)
+        backups_row.addWidget(self.btn_clear_backups)
+        layout.addLayout(backups_row)
+
+        self._refresh_backup_info()
+        layout.addStretch()
+        return page
+
+    def _refresh_backup_info(self):
+        """Actualiza la etiqueta con nº de respaldos y su tamaño total."""
+        try:
+            num, total = backup_stats()
+            if num == 0:
+                self.lbl_backups.setText("Crash report backups: none")
+            else:
+                self.lbl_backups.setText(
+                    f"Crash report backups: {num} files · {_format_bytes(total)}"
+                )
+        except Exception:
+            self.lbl_backups.setText("Crash report backups: unavailable")
+
+    def _on_clear_backups(self):
+        """Pide confirmación y borra todos los respaldos de crash report."""
+        try:
+            from PySide6.QtWidgets import QMessageBox
+
+            num, total = backup_stats()
+            if num == 0:
+                return
+            confirm = QMessageBox.question(
+                self,
+                "Clear crash report backups",
+                f"¿Borrar {num} respaldo(s) de crash report "
+                f"({_format_bytes(total)})? Esta acción no se puede deshacer.",
+            )
+            if confirm != QMessageBox.StandardButton.Yes:
+                return
+            clear_backups()
+            self._refresh_backup_info()
+        except Exception:
+            pass
+
+    def _open_logs_folder(self):
+        """Abre la carpeta de logs en el gestor de archivos del SO."""
+        try:
+            logs_dir = getattr(self, "_logs_dir", None) or get_logs_dir()
+            os.makedirs(logs_dir, exist_ok=True)
+            QDesktopServices.openUrl(QUrl.fromLocalFile(logs_dir))
+        except Exception:
+            pass
+
+    def _open_backups_folder(self):
+        """Abre la carpeta de respaldos (backup/) en el gestor de archivos."""
+        try:
+            # backup_dir() crea la carpeta si falta antes de abrirla.
+            QDesktopServices.openUrl(QUrl.fromLocalFile(backup_dir()))
+        except Exception:
+            pass
+
+    # -------------------- About tab --------------------
+
+    def _build_about_tab(self):
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setSpacing(14)
+        layout.setContentsMargins(18, 16, 18, 16)
+
+        title = QLabel(APP_NAME)
+        title_font = QFont()
+        title_font.setPointSize(18)
+        title_font.setBold(True)
+        title.setFont(title_font)
+        title.setStyleSheet("color: #00d2d3;")
+        layout.addWidget(title)
+
+        subtitle = QLabel(f"Version {APP_VERSION}")
+        subtitle.setStyleSheet("color: #a0a0b0; font-size: 12px;")
+        layout.addWidget(subtitle)
+
+        bits = struct.calcsize("P") * 8
+        info = QLabel(
+            f"Architecture: {platform.machine()} ({bits}-bit)\n"
+            f"OS: {platform.platform()}\n"
+            f"Python: {sys.version.split()[0]}\n"
+            f"Packaged (PyInstaller): "
+            f"{'yes' if getattr(sys, 'frozen', False) else 'no'}"
+        )
+        info.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        info.setStyleSheet(
+            "color: #e0e0e0; font-size: 12px; background-color: #16213e;"
+            "padding: 8px; border-radius: 6px;"
+        )
+        layout.addWidget(info)
+
+        links = QLabel(
+            f'<a href="{REPO_URL}">Project repository</a><br>'
+            f'<a href="{ISSUES_URL}">Report a problem / issues</a>'
+        )
+        links.setOpenExternalLinks(True)
+        links.setStyleSheet("font-size: 12px;")
+        layout.addWidget(links)
+
+        layout.addStretch()
+        return page
+
     # -------------------- Persistencia (Behavior) --------------------
 
     def _load_values(self):
@@ -509,12 +720,16 @@ class PreferencesDialog(QDialog):
             index = self.cmb_exec_provider.findText(mode)
             if index >= 0:
                 self.cmb_exec_provider.setCurrentIndex(index)
+            self.chk_insecure_checkpoint.setChecked(
+                bool(preferences.get(_INSECURE_CHECKPOINT_KEY, False))
+            )
             self.txt_hf_token.setText(_get_hf_token())
         except Exception:
             self.chk_auto_update.setChecked(False)
             self.chk_auto_open_output.setChecked(True)
             self.chk_health_check.setChecked(True)
             self.chk_remember_codec.setChecked(True)
+            self.chk_insecure_checkpoint.setChecked(False)
             self.txt_hf_token.setText("")
 
     def _on_accept(self):
@@ -543,6 +758,10 @@ class PreferencesDialog(QDialog):
             preferences.set(
                 _EXEC_PROVIDER_KEY,
                 str(self.cmb_exec_provider.currentText()),
+            )
+            preferences.set(
+                _INSECURE_CHECKPOINT_KEY,
+                bool(self.chk_insecure_checkpoint.isChecked()),
             )
             _set_hf_token(str(self.txt_hf_token.text() or ""))
             # Limpiamos la clave legacy si estaba presente para que no
