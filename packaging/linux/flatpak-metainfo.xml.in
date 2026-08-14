@@ -44,7 +44,10 @@
   </screenshots>
   <content_rating type="oars-1.1"/>
   <releases>
-    <release version="0.1.0" date="2026-08-13">
+    <!-- @VERSION@ se sustituye en el CI por la versión real de la tag
+         (v1.2.3 -> 1.2.3; sin tag -> 0.0.0), igual que el .spec del RPM.
+         El archivo flatpak-metainfo.xml generado no se versiona. -->
+    <release version="@VERSION@" date="2026-08-13">
       <description>
         <p>First packaging release with AppStream metadata, Debian/RPM/AppImage/Flatpak bundles and AI engine management.</p>
       </description>

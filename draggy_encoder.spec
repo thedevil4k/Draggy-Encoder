@@ -55,6 +55,20 @@ a = Analysis(
 
 pyz = PYZ(a.pure, a.zipped_data, cipher=None)
 
+# Icono del ejecutable: el logo de la app (assets/Import.png), el mismo que
+# usan la ventana y los lanzadores de escritorio de Linux. En Windows
+# PyInstaller lo convierte a .ico con Pillow (incluida en requirements-build.txt);
+# en Linux usa el PNG directamente.
+#   - PYINSTALLER_ICON=NONE   : omite el paso (builds locales con antivirus
+#                               agresivo que bloquea BeginUpdateResource sobre
+#                               el bootloader sin firmar, WinError 225).
+#   - PYINSTALLER_ICON=<path> : fuerza otro archivo de icono.
+_icon = (os.environ.get("PYINSTALLER_ICON") or "").strip()
+if _icon.upper() == "NONE":
+    _icon = None
+elif not _icon:
+    _icon = os.path.join("assets", "Import.png")
+
 exe = EXE(
     pyz,
     a.scripts,
@@ -67,11 +81,7 @@ exe = EXE(
     upx=False,
     console=False,
     disable_windowed_traceback=False,
-    # Verificación local: Defender bloquea BeginUpdateResource sobre el
-    # bootloader sin firmar (WinError 225). Con PYINSTALLER_ICON=NONE se
-    # omite el paso de incrustar icono para poder compilar/ejecutar el EXE
-    # en máquinas con AV agresivo. Sin la variable usa el icono por defecto.
-    icon=(os.environ.get("PYINSTALLER_ICON") or "").strip() or None,
+    icon=_icon,
 )
 
 coll = COLLECT(

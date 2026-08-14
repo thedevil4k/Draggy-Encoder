@@ -32,6 +32,44 @@ from src.config import ensure_runtime_dirs, get_bin_dir
 
 RUNTIME_MODULES_DIR = os.path.join(get_bin_dir(), "runtimes", "ai_modules")
 
+# Variables que pueden hacer que pip vea otro intérprete, otro entorno
+# virtual o una configuración global del usuario. El proceso de instalación
+# debe ser reproducible y no heredar ninguno de esos atajos.
+_PIP_CONTAMINATION_VARS = (
+    "PYTHONPATH", "PYTHONHOME", "PYTHONUSERBASE", "VIRTUAL_ENV",
+    "CONDA_PREFIX", "CONDA_DEFAULT_ENV", "PIP_TARGET", "PIP_PREFIX",
+    "PIP_USER", "PIP_CONFIG_FILE", "PIP_FIND_LINKS", "PIP_INDEX_URL",
+    "PIP_EXTRA_INDEX_URL", "PIP_TRUSTED_HOST", "PIP_NO_INDEX",
+)
+
+
+def _isolated_pip_env() -> dict[str, str]:
+    """Construye el entorno del pip privado sin heredar instalaciones ajenas.
+
+    El PATH no se elimina: en Windows permite a los wheels encontrar las DLL
+    del driver gráfico del sistema. Lo que se aísla es la resolución de
+    Python/pip: no se acepta PYTHONPATH, site de usuario, virtualenv,
+    configuración de pip, índices adicionales ni caché global.
+    """
+    env = os.environ.copy()
+    for key in _PIP_CONTAMINATION_VARS:
+        env.pop(key, None)
+    env.update({
+        "PYTHONNOUSERSITE": "1",
+        "PIP_DISABLE_PIP_VERSION_CHECK": "1",
+        "PIP_NO_CACHE_DIR": "1",
+        # Impide que pip intente instalar en el perfil del usuario si alguna
+        # dependencia cambia el destino internamente.
+        "PIP_USER": "0",
+    })
+    return env
+
+
+def _pip_command_prefix() -> list[str]:
+    """Invocación absoluta del pip del runtime privado."""
+    return [_pip_python(), "-I", "-m", "pip"]
+
+
 # Tag de versión de CPython en los wheels (ej. "cp314-cp314-win_amd64").
 # Captura el número "majorminor" completo (314, 311, ...).
 _WHEEL_CP_RE = re.compile(r"^cp(\d+)-")
@@ -289,6 +327,19 @@ def _store_abspath() -> str:
     return os.path.normcase(os.path.abspath(RUNTIME_MODULES_DIR))
 
 
+def _is_path_in_store(path: str | None) -> bool:
+    """True solo para una ruta dentro del store, no para un prefijo parecido.
+
+    La frontera debe distinguir ``.../ai_modules_extra`` de
+    ``.../ai_modules``; un ``startswith`` simple permitiría confundir ambos.
+    """
+    if not path:
+        return False
+    normalized = os.path.normcase(os.path.abspath(path))
+    store = _store_abspath()
+    return normalized == store or normalized.startswith(store + os.sep)
+
+
 def _can_import(module_name: str) -> bool:
     """True si el módulo importa de verdad DESDE el store local.
 
@@ -306,12 +357,35 @@ def _can_import(module_name: str) -> bool:
         spec = importlib.util.find_spec(module_name)
         if spec is None or spec.origin is None:
             return False
-        if not os.path.normcase(spec.origin).startswith(_store_abspath()):
+        if not _is_path_in_store(spec.origin):
             return False
         importlib.import_module(module_name)
         return True
     except Exception:
         return False
+
+
+def import_local_runtime(module_name: str):
+    """Importa un runtime únicamente desde ``ai_modules``.
+
+    Es la frontera que deben usar los módulos de IA: ``import torch`` a
+    secas puede resolver un paquete instalado en un venv o en el Python del
+    usuario. Esta función comprueba origen e importación real y rechaza el
+    módulo aunque exista fuera del store.
+    """
+    inject_runtime_paths()
+    if not _can_import(module_name):
+        raise ImportError(
+            f"{module_name} is not installed in the application's private "
+            "AI runtime store"
+        )
+    module = importlib.import_module(module_name)
+    origin = getattr(module, "__file__", None)
+    if not _is_path_in_store(origin):
+        raise ImportError(
+            f"{module_name} resolved outside the application's private store"
+        )
+    return module
 
 
 def _can_import_system(module_name: str) -> bool:
@@ -427,7 +501,9 @@ def _build_pytorch_command(variant: str) -> list[str]:
         index_url = "https://download.pytorch.org/whl/cu121"
 
     return [
-        _pip_python(), "-m", "pip", "install",
+        *_pip_command_prefix(), "install",
+        "--isolated", "--no-cache-dir", "--disable-pip-version-check",
+        "--ignore-installed", "--only-binary=:all:",
         "--target", RUNTIME_MODULES_DIR,
         "--no-warn-script-location",
         "--upgrade",
@@ -441,7 +517,9 @@ def _build_onnx_command(variant: str) -> list[str]:
     variant = _resolve_variant(variant)
     pkg = "onnxruntime-gpu" if variant.startswith("cuda") else "onnxruntime"
     return [
-        _pip_python(), "-m", "pip", "install",
+        *_pip_command_prefix(), "install",
+        "--isolated", "--no-cache-dir", "--disable-pip-version-check",
+        "--ignore-installed", "--only-binary=:all:",
         "--target", RUNTIME_MODULES_DIR,
         "--no-warn-script-location",
         "--upgrade",
@@ -541,13 +619,13 @@ def _run_pip(cmd: list[str], progress_callback, start_pct: int, end_pct: int,
     if progress_callback:
         progress_callback(start_pct, message)
 
-    env = os.environ.copy()
-    env.pop("PYTHONPATH", None)
+    env = _isolated_pip_env()
 
-    # Verificar que pip esté disponible
+    # Verificar que pip esté disponible en el intérprete privado, no en el
+    # Python/venv desde el que se lanzó la aplicación.
     try:
         test_proc = subprocess.run(
-            [_pip_python(), "-m", "pip", "--version"],
+            [*_pip_command_prefix(), "--version"],
             capture_output=True, text=True, env=env, timeout=30,
         )
         if test_proc.returncode != 0:
@@ -829,11 +907,17 @@ def install_runtimes(
 
 
 def _version_of(module_name: str) -> str:
+    """Obtiene la versión exclusivamente desde dist-info del store local."""
     try:
         import importlib.metadata as _meta
-        return _meta.version(module_name) or "—"
+        wanted = module_name.replace("_", "-").lower()
+        for dist in _meta.distributions(path=[RUNTIME_MODULES_DIR]):
+            name = (dist.metadata.get("Name") or "").replace("_", "-").lower()
+            if name == wanted:
+                return dist.version or "—"
     except Exception:
-        return "—"
+        pass
+    return "—"
 
 
 def _import_dir(module_name: str) -> str:
@@ -841,18 +925,23 @@ def _import_dir(module_name: str) -> str:
     try:
         spec = importlib.util.find_spec(module_name)
         if spec is not None and spec.origin:
-            return os.path.dirname(spec.origin)
+            if _is_path_in_store(spec.origin):
+                return os.path.dirname(spec.origin)
     except Exception:
         pass
     return RUNTIME_MODULES_DIR
 
 
 def torch_status() -> dict:
+    # Status is also a public boundary (la UI puede llamarlo sin pasar por
+    # main.py): asegura que solo el store privado participa en la resolución.
+    inject_runtime_paths()
+    ensure_runtime_dlls_on_path()
     installed = _can_import("torch")
     gpu = False
     if installed:
         try:
-            import torch as _torch
+            _torch = import_local_runtime("torch")
             gpu = _torch.cuda.is_available()
         except Exception:
             pass
@@ -871,11 +960,13 @@ def torch_status() -> dict:
 
 
 def onnx_status() -> dict:
+    inject_runtime_paths()
+    ensure_runtime_dlls_on_path()
     installed = _can_import("onnxruntime")
     gpu = False
     if installed:
         try:
-            import onnxruntime as _ort
+            _ort = import_local_runtime("onnxruntime")
             gpu = "CUDAExecutionProvider" in _ort.get_available_providers()
         except Exception:
             pass

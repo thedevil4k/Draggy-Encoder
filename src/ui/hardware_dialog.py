@@ -3,6 +3,8 @@ import sys
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QDialog, QLabel, QVBoxLayout
 
+from src.utils.helpers import is_windows_elevated
+
 
 class HardwareDialog(QDialog):
     def __init__(self, hardware_info, parent=None):
@@ -43,6 +45,22 @@ class HardwareDialog(QDialog):
             exe_lbl.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
             exe_lbl.setStyleSheet("color: #a0a0b0; font-size: 10px;")
             layout.addWidget(exe_lbl)
+
+        # --- Elevación / UIPI (solo relevante en Windows) ---
+        if sys.platform == "win32":
+            if is_windows_elevated():
+                elev_text = (
+                    "<b>Elevation:</b> Administrator — drag &amp; drop from "
+                    "Explorer is blocked (UIPI)"
+                )
+            else:
+                elev_text = (
+                    "<b>Elevation:</b> Standard user (drag &amp; drop from "
+                    "Explorer works)"
+                )
+        else:
+            elev_text = "<b>Elevation:</b> N/A (not Windows)"
+        layout.addWidget(QLabel(elev_text))
 
         cpu = hardware_info.get("cpu", {})
         cpu_text = f"<b>CPU:</b> {cpu.get('name', 'Unknown')}<br>"

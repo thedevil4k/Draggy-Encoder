@@ -94,10 +94,14 @@ preserve permissions (`chmod +x DraggyEncoder/DraggyEncoder`).
 
 ### Flatpak repository and automatic updates
 
-GitHub Actions publishes the Flatpak OSTree repository to GitHub Pages:
+GitHub Actions publishes a GPG-signed Flatpak OSTree repository to GitHub
+Pages. Import the project key once, then add the remote without
+`--no-gpg-verify`:
 
 ```bash
-flatpak remote-add --if-not-exists --no-gpg-verify draggy-encoder \
+curl -fsSL https://thedevil4k.github.io/Draggy-Encoder/draggy-encoder.gpg \
+  -o draggy-encoder.gpg
+flatpak remote-add --if-not-exists --gpg-import=draggy-encoder.gpg draggy-encoder \
   https://thedevil4k.github.io/Draggy-Encoder/
 flatpak install --user draggy-encoder com.draggyencoder.DraggyEncoder
 flatpak update
@@ -107,9 +111,29 @@ After the remote is added, normal `flatpak update` detects new commits from
 releases published by the project; users no longer need to download individual
 `.flatpak` files. The repository is deployed by the Linux workflow, so GitHub
 Pages must be enabled once in the repository settings with **Source: GitHub
-Actions**. The current repository is intentionally unsigned, hence
-`--no-gpg-verify`; before a public production release, configure a persistent
-Flatpak GPG signing key in GitHub Actions and remove that flag.
+Actions**. The standalone `.flatpak` bundle attached to each release is signed
+with the same key, so `flatpak install` verifies it the same way.
+
+#### Setting up the signing key (maintainers)
+
+The repository is signed with a dedicated, passphrase-less GPG key stored in
+GitHub Actions secrets. To (re)create it and store it:
+
+```bash
+gpg --batch --passphrase '' --quick-gen-key \
+  'Draggy Encoder Flatpak <flatpak@draggyencoder.io>' ed25519 sign never
+FINGERPRINT=$(gpg --list-keys --with-colons --fingerprint \
+  'Draggy Encoder Flatpak <flatpak@draggyencoder.io>' | awk -F: '$1=="fpr"{print $10; exit}')
+gpg --armor --export-secret-keys "$FINGERPRINT" > flatpak-signing-key.asc
+gh secret set FLATPAK_GPG_PRIVATE_KEY --repo thedevil4k/Draggy-Encoder \
+  < flatpak-signing-key.asc
+# Opcional: fijar el fingerprint explícitamente (si no, se deriva solo).
+gh secret set FLATPAK_GPG_KEY_ID --repo thedevil4k/Draggy-Encoder --body "$FINGERPRINT"
+```
+
+`FLATPAK_GPG_KEY_ID` (the key fingerprint) is optional — the workflow derives
+it from the imported key. Without `FLATPAK_GPG_PRIVATE_KEY`, the build still
+runs but leaves the repository unsigned (forks and PRs).
 
 For source development on Linux:
 

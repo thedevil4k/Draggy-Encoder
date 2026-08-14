@@ -16,6 +16,7 @@ acoplamientos de ida.
 
 from __future__ import annotations
 
+import os
 from datetime import datetime
 
 from PySide6.QtCore import QSize, Qt
@@ -25,6 +26,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QPlainTextEdit,
+    QProgressBar,
     QPushButton,
     QScrollArea,
     QSizePolicy,
@@ -344,6 +346,25 @@ class TasksPanel(QWidget):
         self._queue_empty.hide()
         queue_lay.addWidget(self._queue_empty)
 
+        # Progreso global de la cola: cuántos jobs van completados del total
+        # (no confundir con la barra del render actual de la ventana principal).
+        self._queue_progress_label = QLabel("No queued jobs")
+        self._queue_progress_label.setStyleSheet(
+            "color: #7f8fa6; font-size: 11px;"
+        )
+        queue_lay.addWidget(self._queue_progress_label)
+        self._queue_progress_bar = QProgressBar()
+        self._queue_progress_bar.setRange(0, 1)
+        self._queue_progress_bar.setValue(0)
+        self._queue_progress_bar.setTextVisible(True)
+        self._queue_progress_bar.setFixedHeight(10)
+        self._queue_progress_bar.setStyleSheet(
+            "QProgressBar { background: #1f2c4c; border: none; border-radius: 3px; }"
+            "QProgressBar::chunk { background: #00d2c3; border-radius: 3px; }"
+        )
+        self._queue_progress_bar.hide()
+        queue_lay.addWidget(self._queue_progress_bar)
+
         btn_row = QHBoxLayout()
         btn_row.setSpacing(6)
         self.btn_start_queue = QPushButton("Start queue")
@@ -454,25 +475,41 @@ class TasksPanel(QWidget):
         for queue_id in list(self._queue_rows):
             self._remove_queue_row(queue_id)
         has_any = False
+        count = 0
         for item in (items or []):
             queue_id = item.get("queue_id", "")
             if not queue_id:
                 continue
-            self._queue_row(queue_id, item.get("name", queue_id))
+            self._queue_row(queue_id, item.get("name", queue_id), item=item)
             self.set_queue_status(queue_id, item.get("status", "queued"))
             has_any = True
+            count += 1
         self._queue_empty.setVisible(not has_any)
+        # El botón Start queue debe habilitarse con jobs en cola (y la UI de
+        # progreso reflejar el conteo). Antes solo se habilitaba al TERMINAR
+        # una cola, así que la primera vez no se podía arrancar nada.
+        self._queue_progress_label.setText(
+            f"{count} job(s) queued" if has_any else "No queued jobs"
+        )
+        self.set_queue_running(self._queue_running, total=count)
 
-    def _queue_row(self, queue_id: str, name: str) -> QueueRow:
+    def _queue_row(self, queue_id: str, name: str, item: dict = None) -> QueueRow:
         row = self._queue_rows.get(queue_id)
         if row is not None:
             if name:
                 row.name_label.setText(name)
+            if item is not None:
+                row.set_details(item)
             return row
         row = QueueRow(queue_id, name)
         row.btn_remove.clicked.connect(
             lambda _checked=False, qid=queue_id: self.remove_queue_item(qid)
         )
+        if item is not None:
+            row.set_details(item)
+        # Auto-expand del primer item en marcha para que se vea sin click.
+        if item is not None and item.get("status") == "running":
+            row.set_expanded(True)
         self._queue_rows[queue_id] = row
         self._queue_layout.insertWidget(self._queue_layout.count() - 1, row)
         self._queue_empty.hide()
@@ -482,6 +519,10 @@ class TasksPanel(QWidget):
         row = self._queue_rows.get(queue_id)
         if row is not None:
             row.set_status(status)
+            # Al pasar a "running", auto-expand para mostrar lo que se está
+            # comprimiendo ahora mismo.
+            if status == "running":
+                row.set_expanded(True)
 
     def _remove_queue_row(self, queue_id: str):
         row = self._queue_rows.pop(queue_id, None)
@@ -499,21 +540,42 @@ class TasksPanel(QWidget):
         self._remove_queue_row(queue_id)
         if not self._queue_rows:
             self._queue_empty.show()
-            self.btn_start_queue.setEnabled(False)
+            self._queue_progress_label.setText("No queued jobs")
+        self.set_queue_running(self._queue_running)
 
     def clear_queue_rows(self):
         """Limpia SOLO la pestaña UI; no toca el archivo persistente."""
         for queue_id in list(self._queue_rows):
             self._remove_queue_row(queue_id)
         self._queue_empty.show()
-        self.btn_start_queue.setEnabled(False)
+        self._queue_progress_label.setText("No queued jobs")
+        self.set_queue_running(self._queue_running)
 
-    def set_queue_running(self, running: bool):
+    def set_queue_running(self, running: bool, total: int = 0):
         """Habilita/deshabilita Start queue según si la cola está en marcha."""
         self._queue_running = running
         self.btn_start_queue.setEnabled(
             not running and bool(self._queue_rows)
         )
+        if running:
+            self._queue_progress_bar.setRange(0, max(int(total), 1))
+            self._queue_progress_bar.setValue(0)
+            self._queue_progress_bar.show()
+            self._queue_progress_label.setText(f"Queue running: 0/{total} done")
+        else:
+            self._queue_progress_bar.hide()
+
+    def set_queue_progress(self, done: int, total: int):
+        """Actualiza la barra global de la cola: jobs completados / total."""
+        done = max(0, int(done))
+        total = max(0, int(total))
+        self._queue_progress_bar.setRange(0, max(total, 1))
+        self._queue_progress_bar.setValue(done)
+        if total and done >= total:
+            self._queue_progress_label.setText("Queue finished")
+        else:
+            self._queue_progress_label.setText(f"Queue: {done}/{total} done")
+        self._queue_progress_bar.show()
 
 
 # ---------------------------------------------------------------------------
@@ -530,7 +592,13 @@ _QUEUE_STATUS_META = {
 
 
 class QueueRow(QFrame):
-    """Fila de la pestaña Queue: nombre + estado + quitar item."""
+    """Fila de la pestaña Queue: nombre + estado + quitar item.
+
+    Colapsada muestra solo ``name|pill|✕``. Expandida (botón toggle ▸) muestra
+    debajo un ``QLabel`` con rich-text y todo el snapshot del item: rutas,
+    pipeline, engines de IA (modelo + escala + modo), ajustes de compresión,
+    audio y timestamps.
+    """
 
     def __init__(self, queue_id, name, parent=None):
         super().__init__(parent)
@@ -540,26 +608,77 @@ class QueueRow(QFrame):
             "#QueueRow { background-color: #141a30; border: 1px solid #243049; "
             "border-radius: 6px; }"
         )
-        lay = QHBoxLayout(self)
-        lay.setContentsMargins(6, 4, 6, 4)
-        lay.setSpacing(6)
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(6, 4, 6, 6)
+        outer.setSpacing(4)
+
+        # Cabecera: chevron + nombre + estado + ✕
+        header = QHBoxLayout()
+        header.setSpacing(6)
+
+        self.toggle_btn = QPushButton("\u25b8")  # ▸
+        self.toggle_btn.setFixedSize(20, 20)
+        self.toggle_btn.setCheckable(True)
+        self.toggle_btn.setToolTip("Show full job details")
+        self.toggle_btn.setStyleSheet(
+            "QPushButton { background: transparent; color: #a0a0b0; "
+            "border: none; font-size: 12px; font-weight: bold; padding: 0px; }"
+            "QPushButton:hover { color: #00d2d3; }"
+            "QPushButton:checked { color: #00d2d3; }"
+        )
+        self.toggle_btn.toggled.connect(self._set_expanded)
+        header.addWidget(self.toggle_btn)
 
         self.name_label = QLabel(name or queue_id)
         self.name_label.setStyleSheet("color: #e8e8f0; font-size: 11px;")
         self.name_label.setWordWrap(True)
-        lay.addWidget(self.name_label, 1)
+        header.addWidget(self.name_label, 1)
 
         self.pill = QLabel("QUEUED")
         self._paint("queued")
-        lay.addWidget(self.pill)
+        header.addWidget(self.pill)
 
-        self.btn_remove = QPushButton("✕")
+        self.btn_remove = QPushButton("\u2715")  # ✕
         self.btn_remove.setFixedWidth(24)
         self.btn_remove.setToolTip("Remove from queue")
         self.btn_remove.setStyleSheet(
             "background: transparent; color: #a0a0b0; border: none; font-size: 12px;"
         )
-        lay.addWidget(self.btn_remove)
+        header.addWidget(self.btn_remove)
+
+        outer.addLayout(header)
+
+        # Detalle (oculto): rich-text con TODO el snapshot del item.
+        self._details = QLabel("")
+        self._details.setWordWrap(True)
+        self._details.setTextFormat(Qt.TextFormat.RichText)
+        self._details.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+        )
+        self._details.setStyleSheet(
+            "QLabel { background-color: #0f1424; color: #c8c8d4; "
+            "padding: 8px; border: 1px solid #243049; border-radius: 4px; "
+            "font-family: Consolas, monospace; font-size: 11px; }"
+        )
+        self._details.hide()
+        outer.addWidget(self._details)
+
+    def _set_expanded(self, expanded: bool):
+        self.toggle_btn.setText("\u25be" if expanded else "\u25b8")  # ▾ / ▸
+        self._details.setVisible(expanded)
+
+    def set_expanded(self, expanded: bool):
+        """API pública: expande/colapsa desde el panel (p.ej. auto-expand running)."""
+        # Si el estado es el mismo, setChecked no emite toggled → no recursión.
+        if self.toggle_btn.isChecked() != expanded:
+            self.toggle_btn.setChecked(expanded)
+
+    def is_expanded(self) -> bool:
+        return self.toggle_btn.isChecked()
+
+    def set_details(self, item: dict):
+        """Pinta el snapshot HTML del item. Llamar cuando cambia el item."""
+        self._details.setText(_format_queue_item_details(item))
 
     def _paint(self, status: str):
         text, color = _QUEUE_STATUS_META.get(
@@ -574,3 +693,172 @@ class QueueRow(QFrame):
     def set_status(self, status: str):
         if status in _QUEUE_STATUS_META:
             self._paint(status)
+
+
+def _format_queue_item_details(item: dict) -> str:
+    """Render del snapshot completo de un item de la cola como HTML.
+
+    Secciones, en este orden:
+        - Encabezado con el nombre.
+        - Input / Output (rutas largas, envueltas).
+        - Pipeline (orden de nodos).
+        - AI engines (categoría → engine_id, model, escala, native).
+        - Compression (codec, bitrate, resolution, format, preset, etc.).
+        - Audio (audio_boost target + audio_codec).
+        - Timestamps + error.
+    """
+
+    def _esc(s) -> str:
+        s = "" if s is None else str(s)
+        return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+    parts = []
+
+    name = _esc(item.get("name") or item.get("queue_id") or "")
+    parts.append(f"<div style='margin-bottom:8px;'><b style='color:#e8e8f0;'>{name}</b></div>")
+
+    input_path = item.get("input_path") or "—"
+    output_path = item.get("output_path") or "—"
+    parts.append(
+        "<b style='color:#00d2d3;'>Input:</b> "
+        f"<span style='color:#c8c8d4;'>{_esc(input_path)}</span>"
+    )
+    parts.append(
+        "<div><b style='color:#00d2d3;'>Output:</b> "
+        f"<span style='color:#c8c8d4;'>{_esc(output_path)}</span></div>"
+    )
+
+    pipeline = item.get("pipeline_order") or []
+    if pipeline:
+        chain = " \u2192 ".join(_esc(s) for s in pipeline)
+        parts.append(
+            f"<div><b style='color:#00d2d3;'>Pipeline:</b> "
+            f"<span style='color:#c8c8d4;'>{chain}</span></div>"
+        )
+
+    ai_engines = item.get("ai_engines") or {}
+    if ai_engines:
+        parts.append("<div><b style='color:#00d2d3;'>AI engines:</b></div>")
+        for cat, info in ai_engines.items():
+            cat_lbl = _esc(cat)
+            if isinstance(info, dict):
+                eid = info.get("engine_id", "") or "auto"
+                scale = info.get("scale")
+                model = info.get("model_path") or ""
+                native = bool(info.get("native"))
+                scale_lbl = ""
+                if scale and not native:
+                    try:
+                        scale_lbl = f" <span style='color:#27ae60;'>(x{int(scale)})</span>"
+                    except (TypeError, ValueError):
+                        scale_lbl = ""
+                elif native:
+                    scale_lbl = " <span style='color:#27ae60;'>(native)</span>"
+                model_lbl = ""
+                if model:
+                    model_lbl = (
+                        "<div style='margin-left:18px;color:#7f8fa6;'>"
+                        f"model: {_esc(os.path.basename(model))}</div>"
+                    )
+                parts.append(
+                    "<div style='margin-left:12px;'>"
+                    f"\u25b8 <b>{cat_lbl}</b>: "
+                    f"<code style='color:#c8c8d4;'>{_esc(eid)}</code>{scale_lbl}"
+                    f"{model_lbl}</div>"
+                )
+            else:
+                parts.append(
+                    "<div style='margin-left:12px;'>"
+                    f"\u25b8 <b>{cat_lbl}</b>: "
+                    f"<code style='color:#c8c8d4;'>{_esc(info)}</code></div>"
+                )
+
+    settings = item.get("settings") or {}
+    if settings:
+        parts.append(
+            "<div style='margin-top:6px;'>"
+            "<b style='color:#00d2d3;'>Compression:</b></div>"
+        )
+        comp_keys = [
+            ("codec", "Codec"),
+            ("encoder", "Encoder"),
+            ("preset", "Preset"),
+            ("bitrate", "Bitrate"),
+            ("crf", "CRF"),
+            ("resolution", "Resolution"),
+            ("width", "Width"),
+            ("height", "Height"),
+            ("fps", "FPS"),
+            ("format", "Format"),
+            ("container", "Container"),
+            ("output_name", "Output name"),
+            ("pixel_format", "Pixel format"),
+            ("extra_ffmpeg", "Extra ffmpeg args"),
+        ]
+        for k, label in comp_keys:
+            v = settings.get(k)
+            if v not in (None, "", []):
+                parts.append(
+                    "<div style='margin-left:12px;color:#c8c8d4;'>"
+                    f"\u25b8 <b>{_esc(label)}</b>: "
+                    f"<code>{_esc(v)}</code></div>"
+                )
+
+    if settings:
+        audio_any = (
+            settings.get("audio_boost")
+            or settings.get("audio_codec")
+            or settings.get("audio_bitrate")
+            or settings.get("normalize_audio")
+        )
+        if audio_any:
+            parts.append(
+                "<div style='margin-top:6px;'>"
+                "<b style='color:#00d2d3;'>Audio:</b></div>"
+            )
+            audio_boost = settings.get("audio_boost")
+            if isinstance(audio_boost, dict):
+                target = (
+                    audio_boost.get("target_lufs")
+                    or audio_boost.get("target")
+                    or "—"
+                )
+                parts.append(
+                    "<div style='margin-left:12px;color:#c8c8d4;'>"
+                    f"\u25b8 Loudness boost: <code>{_esc(target)} LUFS</code></div>"
+                )
+            elif audio_boost:
+                parts.append(
+                    "<div style='margin-left:12px;color:#c8c8d4;'>"
+                    "\u25b8 Loudness boost: <code>enabled</code></div>"
+                )
+            if settings.get("audio_codec"):
+                parts.append(
+                    "<div style='margin-left:12px;color:#c8c8d4;'>"
+                    f"\u25b8 Codec: <code>{_esc(settings['audio_codec'])}</code></div>"
+                )
+            if settings.get("audio_bitrate"):
+                parts.append(
+                    "<div style='margin-left:12px;color:#c8c8d4;'>"
+                    f"\u25b8 Bitrate: <code>{_esc(settings['audio_bitrate'])}</code></div>"
+                )
+
+    if item.get("created_at"):
+        parts.append(
+            "<div style='margin-top:6px;'>"
+            f"<b style='color:#7f8fa6;'>Queued at:</b> "
+            f"<span style='color:#c8c8d4;'>{_esc(item['created_at'])}</span></div>"
+        )
+    if item.get("finished_at"):
+        parts.append(
+            "<div><b style='color:#7f8fa6;'>Finished at:</b> "
+            f"<span style='color:#c8c8d4;'>{_esc(item['finished_at'])}</span></div>"
+        )
+    if item.get("error"):
+        parts.append(
+            "<div><b style='color:#7f8fa6;'>Error:</b> "
+            "<span style='color:#e74c3c;'>"
+            f"{_esc(item['error'])}</span></div>"
+        )
+
+    return "".join(parts)

@@ -21,9 +21,12 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 try:
-    import torch
-    import torch.nn as nn
-    import torch.nn.functional as F
+    # Nunca caer al torch del sistema: la aplicación solo reconoce el
+    # runtime descargado en bin/runtimes/ai_modules.
+    from src.runtimes.manager import import_local_runtime
+    torch = import_local_runtime("torch")
+    nn = torch.nn
+    F = torch.nn.functional
     _TORCH_AVAILABLE = True
 except ImportError:
     _TORCH_AVAILABLE = False
@@ -967,7 +970,8 @@ def detect_arch_and_scale(weight_path: str):
             from safetensors.torch import load_file
             sd = load_file(weight_path)
         else:
-            import torch as _torch
+            from src.runtimes.manager import import_local_runtime
+            _torch = import_local_runtime("torch")
             sd = _torch.load(weight_path, map_location="cpu", weights_only=True)
     except Exception as exc:
         logger.info("detect_arch_and_scale: could not load %s: %s", weight_path, exc)

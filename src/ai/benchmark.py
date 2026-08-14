@@ -35,6 +35,7 @@ from src.ai.engines_state import (
     get_benchmark,
     set_backend_benchmark,
 )  # noqa: E402
+from src.runtimes.manager import import_local_runtime
 
 DEFAULT_RESOLUTION = (512, 288)  # (w, h) — canonical, parecido a 720p recortado
 DEFAULT_FRAMES = 5
@@ -77,7 +78,7 @@ def _find_onnx_file(target_dir: str) -> Optional[str]:
 def _sync_cuda() -> None:
     """Bloquea hasta que la GPU termine todo lo pendiente (si CUDA activo)."""
     try:
-        import torch
+        torch = import_local_runtime("torch")
         if torch.cuda.is_available():
             torch.cuda.synchronize()
     except Exception:
@@ -111,7 +112,7 @@ def current_environment_signature(backend: str) -> dict:
     }
     try:
         if backend == "torch":
-            import torch
+            torch = import_local_runtime("torch")
             signature.update({
                 "runtime": getattr(torch, "__version__", ""),
                 "cuda": bool(torch.cuda.is_available()),
@@ -122,7 +123,7 @@ def current_environment_signature(backend: str) -> dict:
                 ),
             })
         elif backend == "onnx":
-            import onnxruntime as ort
+            ort = import_local_runtime("onnxruntime")
             signature.update({
                 "runtime": getattr(ort, "__version__", ""),
                 "providers": sorted(ort.get_available_providers()),

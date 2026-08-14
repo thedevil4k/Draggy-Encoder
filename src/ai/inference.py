@@ -26,86 +26,26 @@ from typing import Optional
 
 import numpy as np
 
-# Intentar usar runtimes locales descargados por la app antes de los del sistema.
+# Los runtimes de IA se resuelven exclusivamente desde el store privado.
+# La función se importa aquí solo para que los llamadores que necesitan
+# torch/onnxruntime tengan una frontera explícita; no se escanean los
+# site-packages del sistema ni se añaden sus DLLs al PATH.
 try:
-    from src.runtimes.manager import inject_runtime_paths
+    from src.runtimes.manager import (
+        import_local_runtime,
+        inject_runtime_paths,
+        ensure_runtime_dlls_on_path,
+    )
     inject_runtime_paths()
+    ensure_runtime_dlls_on_path()
 except Exception:
-    pass
+    # La UI puede arrancar sin IA instalada; los engines mostrarán un error
+    # accionable al intentar cargarse.
+    import_local_runtime = None
 
 import src.preferences as preferences
 
 logger = logging.getLogger(__name__)
-
-# ---------------------------------------------------------------------------
-# Ensure NVIDIA CUDA/cuDNN DLLs from pip packages are on PATH (Windows)
-# ---------------------------------------------------------------------------
-
-def _ensure_nvidia_dlls_on_path() -> None:
-    """Add nvidia pip package DLL directories to PATH on Windows.
-
-    Busca tanto en el entorno Python como en el runtime local descargado
-    por la app (bin/runtimes/ai_modules), y en site-packages detectado
-    via ``site.getsitepackages()``.
-    """
-    if sys.platform != "win32":
-        return
-
-    candidates = []
-
-    # Runtime local gestionado por la app
-    try:
-        from src.runtimes.manager import get_runtime_modules_dir
-        candidates.append(get_runtime_modules_dir())
-    except Exception:
-        pass
-
-    # Entorno Python actual (sys.path)
-    for p in sys.path:
-        if "site-packages" in p:
-            candidates.append(p)
-
-    # site.getsitepackages() — funciona incluso si sys.path fue manipulado
-    try:
-        import site as _site
-        for p in _site.getsitepackages():
-            if p and os.path.isdir(p):
-                candidates.append(p)
-    except Exception:
-        pass
-
-    # sys.prefix / sys.base_prefix — cubre venvs y entornos normales
-    for prefix in [getattr(sys, "prefix", ""), getattr(sys, "base_prefix", "")]:
-        if prefix:
-            lib = os.path.join(prefix, "Lib", "site-packages")
-            if os.path.isdir(lib):
-                candidates.append(lib)
-
-    added = []
-    seen = set()
-    for site_dir in candidates:
-        if not site_dir or not os.path.isdir(site_dir) or site_dir in seen:
-            continue
-        seen.add(site_dir)
-        nvidia = os.path.join(site_dir, "nvidia")
-        if not os.path.isdir(nvidia):
-            continue
-        for sub in os.listdir(nvidia):
-            for suffix in [("bin",), ("bin", "x86_64")]:
-                d = os.path.join(nvidia, sub, *suffix)
-                if os.path.isdir(d) and d not in os.environ.get("PATH", ""):
-                    os.environ["PATH"] = d + ";" + os.environ.get("PATH", "")
-                    added.append(d)
-
-    if added:
-        logger.info("Added NVIDIA DLL paths: %s", added)
-    else:
-        logger.info(
-            "NVIDIA DLL paths already on PATH or none found (CUDA will be "
-            "used if available). Searched %d candidate directories.", len(candidates)
-        )
-
-_ensure_nvidia_dlls_on_path()
 
 
 # ---------------------------------------------------------------------------
@@ -150,7 +90,7 @@ def load_checkpoint_state_dict(path: str):
     ``.safetensors`` no pasa por aquí: su formato no usa pickle y se carga
     con ``safetensors.torch.load_file`` en los llamadores.
     """
-    import torch
+    torch = import_local_runtime("torch")
     try:
         return torch.load(path, map_location="cpu", weights_only=True)
     except Exception as exc:
@@ -235,7 +175,7 @@ class ONNXRUNTIMEInferenceEngine(AIInferenceEngine):
             return False
 
         try:
-            import onnxruntime as ort
+            ort = import_local_runtime("onnxruntime")
         except ImportError:
             logger.error(
                 "ONNX Runtime is not installed. Open Manage Dependencies → "
@@ -481,7 +421,7 @@ class ONNXRUNTIMEInferenceEngine(AIInferenceEngine):
                     "[%s] CUDA inference failed, falling back to CPU: %s",
                     type(exc).__name__, exc,
                 )
-                import onnxruntime as ort
+                ort = import_local_runtime("onnxruntime")
                 if self._try_cpu_fallback(ort, "runtime"):
                     outputs = self._session.run(
                         [self._output_name],
@@ -543,7 +483,7 @@ class PyTorchInferenceEngine(AIInferenceEngine):
 
     def load(self) -> bool:
         try:
-            import torch
+            torch = import_local_runtime("torch")
         except ImportError:
             logger.error(
                 "PyTorch is not installed. Open Manage Dependencies → "
@@ -628,7 +568,7 @@ class PyTorchInferenceEngine(AIInferenceEngine):
     def process_frame(self, frame: np.ndarray) -> np.ndarray:
         """Procesa un fotograma BGR uint8 (H, W, 3) y devuelve BGR uint8
         con el upscale aplicado."""
-        import torch
+        torch = import_local_runtime("torch")
 
         if not self._loaded or self._model is None:
             raise RuntimeError("Model not loaded")
@@ -1128,7 +1068,8 @@ def _onnx_input_channels_ok(onnx_path: str) -> Optional[bool]:
              perfectamente válido aunque ORT no pueda abrirlo en este entorno.
     """
     try:
-        import onnxruntime as ort
+        ort = import_local_runtime("onnxruntime")
+
         sess = ort.InferenceSession(onnx_path, providers=["CPUExecutionProvider"])
         shape = sess.get_inputs()[0].shape
         if len(shape) >= 2 and isinstance(shape[1], int):
@@ -1178,7 +1119,7 @@ def convert_pth_to_onnx_ex(pth_path: str) -> tuple[Optional[str], str]:
             return None, f"Could not replace the existing ONNX file: {exc}"
 
     try:
-        import torch
+        torch = import_local_runtime("torch")
         from src.ai.architectures import build_model_from_state_dict, detect_model_arch_and_scale
 
         # Redirect stdout/stderr to avoid cp1252 UnicodeEncodeError on Windows

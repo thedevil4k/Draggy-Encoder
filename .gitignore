@@ -36,6 +36,9 @@ dist/
 *.spec
 !draggy_encoder.spec
 
+# Metainfo AppStream generado por el CI desde flatpak-metainfo.xml.in
+packaging/linux/flatpak-metainfo.xml
+
 # GitHub Actions
 !.github/workflows/
 

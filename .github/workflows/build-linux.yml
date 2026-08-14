@@ -120,7 +120,11 @@ jobs:
           # --no-net: los checks de URL (homepage/bugtracker/screenshots) requieren
           # red y fallan antes de que exista el primer release; el CI no debe depender
           # de que GitHub responda a HEAD de paths que aún no existen.
-          appstreamcli validate --pedantic --no-net packaging/linux/flatpak-metainfo.xml
+          # El metainfo es una plantilla con @VERSION@ (como el .spec del RPM):
+          # se valida sustituyendo una versión de ejemplo.
+          sed "s/@VERSION@/0.0.0/g" packaging/linux/flatpak-metainfo.xml.in \
+            > /tmp/flatpak-metainfo-smoke.xml
+          appstreamcli validate --pedantic --no-net /tmp/flatpak-metainfo-smoke.xml
           python - <<'PY'
           import yaml
           with open(
@@ -165,6 +169,20 @@ jobs:
             libgl1 libegl1 libfontconfig1 libxkbcommon0 libxkbcommon-x11-0 \
             libx11-6 libx11-xcb1 libxcb1 libxext6 libxrender1 libxrandr2 \
             libxi6 libdbus-1-3 libglib2.0-0
+
+      # El metainfo AppStream es una plantilla (@VERSION@, como el .spec del
+      # RPM). Se genera UNA vez aquí con la versión real de la tag para que
+      # .deb, .rpm, AppImage y Flatpak reporten la misma versión que el resto
+      # de bundles (antes quedaba fija en 0.1.0 y no coincidía con la tag).
+      - name: Inject release version into AppStream metainfo
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          if [[ "$GITHUB_REF" != refs/tags/v* ]]; then version="0.0.0"; fi
+          sed "s/@VERSION@/$version/g" packaging/linux/flatpak-metainfo.xml.in \
+            > packaging/linux/flatpak-metainfo.xml
+          grep -q "release version=\"$version\"" packaging/linux/flatpak-metainfo.xml
 
       - name: Build Linux bundle with PyInstaller
         run: |
@@ -306,12 +324,56 @@ jobs:
           chmod +x /tmp/appimagetool.AppImage
           ARCH=x86_64 APPIMAGE_EXTRACT_AND_RUN=1 /tmp/appimagetool.AppImage "$appdir" "DraggyEncoder-Linux-x86_64-${version}.AppImage"
 
+      # Firma GPG del repositorio OSTree (opcional). Si FLATPAK_GPG_PRIVATE_KEY
+      # está configurado (clave privada armored, sin passphrase) se importa a
+      # un GNUPGHOME temporal y los pasos de Flatpak firman repo + bundle; la
+      # clave pública se publica junto al repo para que los usuarios puedan
+      # quitar --no-gpg-verify. Sin el secreto (p.ej. en forks) el build
+      # sigue funcionando SIN firmar.
+      - name: Import Flatpak GPG signing key
+        shell: bash
+        env:
+          FLATPAK_GPG_PRIVATE_KEY: ${{ secrets.FLATPAK_GPG_PRIVATE_KEY }}
+          FLATPAK_GPG_KEY_ID: ${{ secrets.FLATPAK_GPG_KEY_ID }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${FLATPAK_GPG_PRIVATE_KEY:-}" ]]; then
+            echo "FLATPAK_GPG_PRIVATE_KEY no configurado: el repositorio quedará SIN firmar."
+            echo "FLATPAK_SIGN=0" >> "$GITHUB_ENV"
+            exit 0
+          fi
+          gnupg_home="$RUNNER_TEMP/gnupg"
+          rm -rf "$gnupg_home"
+          mkdir -p -m 700 "$gnupg_home"
+          printf '%s\n' "$FLATPAK_GPG_PRIVATE_KEY" | gpg --batch --homedir "$gnupg_home" --import
+
+          if [[ -n "${FLATPAK_GPG_KEY_ID:-}" ]]; then
+            keyid="$FLATPAK_GPG_KEY_ID"
+          else
+            keyid="$(gpg --batch --homedir "$gnupg_home" --with-colons --fingerprint --list-secret-keys 2>/dev/null | awk -F: '$1 == "fpr" { print $10; exit }')"
+          fi
+          test -n "$keyid"
+
+          # Confianza última: gpgme/ostree rechazan firmas de claves con
+          # trust "unknown"; así la verificación del bundle en el smoke test
+          # y en `flatpak install` funciona sin prompt.
+          printf '%s:6:\n' "$keyid" | gpg --batch --homedir "$gnupg_home" --import-ownertrust
+
+          echo "FLATPAK_SIGN=1" >> "$GITHUB_ENV"
+          echo "FLATPAK_GPG_KEY_ID=$keyid" >> "$GITHUB_ENV"
+          echo "GNUPGHOME=$gnupg_home" >> "$GITHUB_ENV"
+          echo "Clave de firma Flatpak: $keyid"
+
       - name: Create Flatpak bundle
         shell: bash
         run: |
           set -euo pipefail
           version="${GITHUB_REF_NAME#v}"
           if [[ "$GITHUB_REF" != refs/tags/v* ]]; then version="0.0.0"; fi
+          sign_args=()
+          if [[ "${FLATPAK_SIGN:-0}" == "1" ]]; then
+            sign_args+=(--gpg-sign="$FLATPAK_GPG_KEY_ID")
+          fi
           rm -rf flatpak-staging flatpak-build flatpak-repo flatpak-manifest.yml
           mkdir -p flatpak-staging/DraggyEncoder
           cp -a dist/DraggyEncoder/. flatpak-staging/DraggyEncoder/
@@ -324,8 +386,69 @@ jobs:
           cp packaging/linux/com.draggyencoder.DraggyEncoder.yml flatpak-manifest.yml
           flatpak remote-add --if-not-exists --user flathub https://flathub.org/repo/flathub.flatpakrepo
           flatpak install --user --noninteractive flathub org.freedesktop.Sdk//24.08 org.freedesktop.Platform//24.08
-          flatpak-builder --user --disable-rofiles-fuse --force-clean --repo=flatpak-repo flatpak-build flatpak-manifest.yml
-          flatpak build-bundle --runtime-repo=https://flathub.org/repo/flathub.flatpakrepo flatpak-repo "DraggyEncoder-Linux-x86_64-${version}.flatpak" com.draggyencoder.DraggyEncoder "$version"
+          # Exportamos a una rama estable ("stable") para que `flatpak update`
+          # detecte nuevas builds. ``build-bundle`` debe pedir la MISMA rama
+          # que exportó ``flatpak-builder`` (por defecto es "master", y pedir
+          # "$version" daba: Refspec 'app/.../x86_64/<version>' not found).
+          # El número de versión vive en el metainfo (<releases>) y en el
+          # nombre del .flatpak, no en la rama OSTree.
+          flatpak-builder --user --disable-rofiles-fuse --force-clean --default-branch=stable "${sign_args[@]}" --repo=flatpak-repo flatpak-build flatpak-manifest.yml
+          if [[ "${FLATPAK_SIGN:-0}" == "1" ]]; then
+            # Firma el summary del repo para que `flatpak remote-add` sin
+            # --no-gpg-verify pueda verificar descargas y updates.
+            flatpak build-update-repo --gpg-sign="$FLATPAK_GPG_KEY_ID" flatpak-repo
+          fi
+          flatpak build-bundle "${sign_args[@]}" --runtime-repo=https://flathub.org/repo/flathub.flatpakrepo flatpak-repo "DraggyEncoder-Linux-x86_64-${version}.flatpak" com.draggyencoder.DraggyEncoder stable
+          if [[ "${FLATPAK_SIGN:-0}" == "1" ]]; then
+            # Publicar la clave pública junto al repo (Pages) para que los
+            # usuarios puedan importarla; también se adjunta al release.
+            gpg --batch --homedir "$GNUPGHOME" --armor --export "$FLATPAK_GPG_KEY_ID" > flatpak-repo/draggy-encoder.gpg
+            cp flatpak-repo/draggy-encoder.gpg draggy-encoder.gpg
+            test -s flatpak-repo/summary.sig
+          fi
+
+      # Instala el .flatpak recién construido y ejecuta el selftest DENTRO
+      # del sandbox. El selftest del bundle directo (paso anterior) corre en
+      # el runner con las Qt libs del sistema; este detecta regresiones de
+      # empaquetado que solo se ven en el entorno Flatpak (runtime sin GL,
+      # imports rotos, wrapper roto, data dir no escribible, etc.).
+      - name: Smoke test the Flatpak bundle (install + --selftest)
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          if [[ "$GITHUB_REF" != refs/tags/v* ]]; then version="0.0.0"; fi
+          bundle="DraggyEncoder-Linux-x86_64-${version}.flatpak"
+          test -s "$bundle"
+
+          flatpak install --user --noninteractive "$bundle"
+
+          # Qt offscreen necesita libEGL/libGL; el rasterizador software
+          # (llvmpipe) vive en la extensión GL del runtime, no en la base.
+          flatpak install --user --noninteractive flathub org.freedesktop.Platform.GL.default//24.08
+
+          # Forzamos un data dir legible desde el host (el flatpak-wrapper
+          # respeta DRAGGY_DATA_DIR) para poder revisar selftest.log después.
+          datadir="$RUNNER_TEMP/flatpak-selftest-data"
+          rm -rf "$datadir"
+          mkdir -p "$datadir"
+          flatpak run \
+            --env=QT_QPA_PLATFORM=offscreen \
+            --env=LIBGL_ALWAYS_SOFTWARE=1 \
+            --env=DRAGGY_DATA_DIR="$datadir" \
+            com.draggyencoder.DraggyEncoder --selftest
+
+          log="$datadir/bin/logs/selftest.log"
+          test -s "$log"
+          cat "$log"
+          grep -Fq "SELFTEST PASS" "$log"
+          for line in \
+            "OK   QApplication offscreen" \
+            "OK   MainWindow offscreen" \
+            "OK   DependenciesDialog offscreen"; do
+            grep -Fq "$line" "$log" \
+              || { echo "Falta en selftest.log: $line" >&2; exit 1; }
+          done
 
       - name: Prepare Flatpak repository for GitHub Pages
         shell: bash
@@ -360,6 +483,14 @@ jobs:
             DraggyEncoder-Linux-x86_64-*.AppImage
             DraggyEncoder-Linux-x86_64-*.flatpak
             screenshots/*.png
+
+      # La clave pública se publica también junto al .flatpak en el release,
+      # además de en el repo OSTree de Pages.
+      - name: Attach Flatpak GPG signing key to release
+        if: startsWith(github.ref, 'refs/tags/v') && env.FLATPAK_SIGN == '1'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: draggy-encoder.gpg
 
   validate-deb:
     name: Validate Debian package and AppStream integration

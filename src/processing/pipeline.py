@@ -312,6 +312,21 @@ def compress_video(ffmpeg_path, input_path, output_path, settings,
         except Exception as exc:
             logger.warning("ai_engines plumbing failed: %s", exc)
 
+    # El audio boost en la ruta estándar es two-pass loudnorm: primero se
+    # mide (fase "Audio boost") y después el filtro se aplica DENTRO del
+    # mismo encode que comprime el vídeo. Antes la fase de audio se emitía
+    # como un flash 0→100 al terminar la medición y el status_label se
+    # quedaba pegado en "Analyzing audio levels..." durante TODO el encode,
+    # así que el usuario veía la barra "en audio" hasta el final.
+    audio_boost_active = (
+        bool(settings.get("audio_boost")) and _needs_audio_reencode(settings)
+    )
+    if audio_boost_active:
+        _emit_phase(phase_cb, "start", "audio", label="Audio boost", pct=0)
+        # "start" deja la fase en PENDING; un progress inicial la marca
+        # RUNNING mientras se mide y se aplica el boost.
+        _emit_phase(phase_cb, "progress", "audio", pct=0)
+
     _emit_phase(phase_cb, "start", "compress", label="Compress / Encode", pct=0)
     loudnorm_meas = _measure_if_needed(
         ffmpeg_path, input_path, settings, status_callback=status_callback,
@@ -320,16 +335,33 @@ def compress_video(ffmpeg_path, input_path, output_path, settings,
         abort_event=abort_event,
         supervisor=supervisor,
     )
-    if loudnorm_meas:
-        _emit_phase(phase_cb, "start", "audio", label="Audio boost", pct=100)
-        _emit_phase(phase_cb, "end", "audio")
+
     temp_output = _make_temp_output_path(output_path)
     try:
         args = build_args(input_path, temp_output, settings, loudnorm_meas=loudnorm_meas)
+
+        # Progreso real del encode: avanza a la vez la barra principal y las
+        # filas del panel de tareas. Con audio boost, el filtro loudnorm se
+        # aplica en este mismo pase, así que "Audio boost" y "Compress"
+        # avanzan juntos (es exactamente lo que hace ffmpeg: comprimir
+        # vídeo + boostear audio a la vez).
+        def _encode_progress(pct):
+            if progress_callback:
+                progress_callback(pct)
+            _emit_phase(phase_cb, "progress", "compress", pct=pct)
+            if audio_boost_active:
+                _emit_phase(phase_cb, "progress", "audio", pct=pct)
+
+        if status_callback:
+            if audio_boost_active:
+                status_callback("Compressing video + boosting audio...")
+            else:
+                status_callback("Compressing video...")
+
         result = run_ffmpeg(
             ffmpeg_path,
             args,
-            progress_callback=progress_callback,
+            progress_callback=_encode_progress,
             abort_event=abort_event,
             on_process=on_process,
             supervisor=supervisor,
@@ -343,9 +375,14 @@ def compress_video(ffmpeg_path, input_path, output_path, settings,
             os.replace(temp_output, output_path)
             _emit_phase(phase_cb, "progress", "compress", pct=100)
             _emit_phase(phase_cb, "end", "compress")
+            if audio_boost_active:
+                _emit_phase(phase_cb, "progress", "audio", pct=100)
+                _emit_phase(phase_cb, "end", "audio")
             return True
         logger.error("Standard render validation failed: %s", detail)
         _emit_phase(phase_cb, "failed", "compress", msg=detail)
+        if audio_boost_active:
+            _emit_phase(phase_cb, "failed", "audio", msg="Video encode failed")
         return False
     finally:
         _cleanup_path(temp_output)

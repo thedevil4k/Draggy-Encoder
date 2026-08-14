@@ -227,6 +227,15 @@ class ImportStep(WorkflowStep):
         else:
             event.ignore()
 
+    def dragMoveEvent(self, event):
+        # Acepta el arrastre mientras el cursor se mueve sobre la casilla;
+        # sin esto algunos gestores de ventana/plataformas no entregan el
+        # dropEvent (el QWidget base ignora el movimiento por defecto).
+        if video_paths_from_mime(event.mimeData()):
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
     def dragLeaveEvent(self, event):
         self.update_state()
         self.info_label.setStyleSheet("color: #a0a0b0; font-size: 8px;")

@@ -67,6 +67,27 @@ jobs:
           # src/runtimes/manager.py:_run_pip).
           .\dist\DraggyEncoder\embed-python\python.exe -m pip --version
 
+      - name: Verify embedded Python isolation
+        run: |
+          # Guard against a future workflow change re-enabling imports from
+          # the runner/user Python. The application must install AI wheels
+          # with this interpreter and only into its own runtime store.
+          $probe = @'
+          import os, sys
+          root = os.path.abspath(os.path.dirname(sys.executable))
+          external = [
+              os.path.abspath(p) for p in sys.path if p and
+              "site-packages" in p.lower() and
+              not os.path.abspath(p).lower().startswith(root.lower())
+          ]
+          if external:
+              raise SystemExit("external site-packages in embedded Python: " + repr(external))
+          print("embedded Python isolated:", sys.executable)
+          print("sys.path:", sys.path)
+          '@
+          $probe | .\dist\DraggyEncoder\embed-python\python.exe -I -
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
       - name: Selftest the built EXE
         run: |
           .\dist\DraggyEncoder\DraggyEncoder.exe --selftest

@@ -26,6 +26,26 @@ from src.ui.loading_dialog import LoadingDialog
 from src.ui.main_window import MainWindow
 
 
+def _set_windows_app_user_model_id():
+    """Da a la ventana una identidad propia en la taskbar de Windows.
+
+    Sin esto, Windows agrupa la ventana bajo el icono genérico del
+    intérprete (``python.exe`` en la versión suelta) o del bootloader, y
+    la taskbar muestra ESE icono aunque ``setWindowIcon`` esté bien
+    puesto. Con un AppUserModelID explícito, la taskbar usa el icono de
+    la ventana (el logo de la app).
+    """
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+            "com.draggyencoder.DraggyEncoder"
+        )
+    except Exception:
+        pass
+
+
 class StartupWorker(QThread):
     # Resultado estructurado (dict) para que el diálogo de arranque pueda
     # distinguir QUÉ fase falló en vez de traducir cualquier error a
@@ -128,6 +148,9 @@ class StartupWorker(QThread):
 
 class DraggyEncoderApp:
     def __init__(self):
+        # Debe ir ANTES de crear la QApplication para que Windows asocie
+        # el botón de la taskbar al icono correcto desde el primer frame.
+        _set_windows_app_user_model_id()
         self.app = QApplication(sys.argv)
         self.app.setApplicationName(APP_NAME)
         self.app.setStyle("Fusion")

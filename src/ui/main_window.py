@@ -55,7 +55,8 @@ from src.ui.preferences_dialog import (
     _format_bytes as _fmt_bytes,
     _format_duration as _fmt_dur,
 )
-from src.ui.workflow_widget import WorkflowWidget
+from src.ui.workflow_widget import WorkflowWidget, video_paths_from_mime
+from src.utils.helpers import is_windows_elevated, detect_linux_container
 
 logger = logging.getLogger(__name__)
 
@@ -795,7 +796,18 @@ class MainWindow(QMainWindow):
     def _setup_ui(self):
         self.setWindowTitle(f"{APP_NAME} v1")
         self.setMinimumSize(1100, 800)
+        # Icono de ventana explícito: la taskbar de Windows usa el icono de
+        # la ventana (no el del exe). QApplication.setWindowIcon ya lo cubre
+        # en la mayoría de casos, pero ser explícito evita el icono genérico
+        # en WMs que no propagan el default.
+        _logo = get_asset_path("Import.png")
+        if _logo and os.path.exists(_logo):
+            self.setWindowIcon(QIcon(_logo))
         self.setStyleSheet(self._stylesheet())
+        # Drag & drop de videos en CUALQUIER punto de la ventana (no solo
+        # sobre la casilla Import): el evento sube desde los widgets hijo
+        # que no aceptan el drop y se resuelve aquí, igual que la casilla.
+        self.setAcceptDrops(True)
 
         central = QWidget()
         self.setCentralWidget(central)
@@ -861,6 +873,16 @@ class MainWindow(QMainWindow):
         # AI runtime availability banner (below GPU badge).
         self.ai_runtime_banner = self._build_ai_runtime_banner()
         layout.addWidget(self.ai_runtime_banner)
+
+        # Aviso de elevación en Windows (drag & drop bloqueado por UIPI).
+        self.elevation_banner = self._build_elevation_warning_banner()
+        if self.elevation_banner is not None:
+            layout.addWidget(self.elevation_banner)
+
+        # Aviso de sandbox Flatpak (drag & drop del host limitado).
+        self.sandbox_banner = self._build_sandbox_warning_banner()
+        if self.sandbox_banner is not None:
+            layout.addWidget(self.sandbox_banner)
 
         # Workflow
         self.workflow = WorkflowWidget()
@@ -939,6 +961,28 @@ class MainWindow(QMainWindow):
         self.splitter.setSizes([980, 320])
         root_layout.addWidget(self.splitter)
 
+        # Overlay a pantalla completa que se muestra mientras se arrastra un
+        # video sobre la ventana: indica que se acepta el drop en cualquier
+        # punto. Es transparente a eventos de ratón/drag para no interceptar
+        # el hit-testing del drop (el evento sigue llegando al widget real
+        # que hay debajo, p.ej. la casilla Import).
+        self._drop_overlay = QLabel("Drop videos to import", central)
+        self._drop_overlay.setObjectName("dropOverlay")
+        self._drop_overlay.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._drop_overlay.setAttribute(
+            Qt.WidgetAttribute.WA_TransparentForMouseEvents, True
+        )
+        self._drop_overlay.setStyleSheet(
+            "#dropOverlay {"
+            " background-color: rgba(15, 15, 26, 215);"
+            " color: #00d2d3;"
+            " font-size: 26px;"
+            " font-weight: bold;"
+            " border: 3px dashed #00d2d3;"
+            "}"
+        )
+        self._drop_overlay.hide()
+
         # Cargar el histórico persistente de tareas al arrancar.
         self._load_task_history()
         self._load_task_queue()
@@ -998,6 +1042,53 @@ class MainWindow(QMainWindow):
                 "QLabel { background-color: #16213e; color: #00d2d3; "
                 "padding: 6px 12px; border-radius: 6px; font-size: 11px; }"
             )
+        return banner
+
+    @staticmethod
+    def _build_elevation_warning_banner():
+        """Advierte si la app corre elevada (admin) en Windows.
+
+        Devuelve un ``QLabel`` de aviso, o ``None`` si el proceso no está
+        elevado. Windows bloquea (UIPI) el drag & drop desde el Explorador
+        hacia procesos elevados, así que el usuario debe relanzar la app
+        desde una terminal normal para habilitar la importación por drop.
+        """
+        if not is_windows_elevated():
+            return None
+        banner = QLabel(
+            "Running as administrator — Windows blocks drag & drop from "
+            "Explorer into elevated apps (UIPI). Launch from a normal "
+            "(non-admin) terminal to enable it."
+        )
+        banner.setWordWrap(True)
+        banner.setStyleSheet(
+            "QLabel { background-color: #5f3a00; color: #ffffff; "
+            "padding: 6px 12px; border-radius: 6px; font-size: 11px; font-weight: bold; }"
+        )
+        return banner
+
+    @staticmethod
+    def _build_sandbox_warning_banner():
+        """Advierte cuando la app corre en el sandbox de Flatpak.
+
+        Devuelve un ``QLabel`` de aviso, o ``None`` si no hay limitación.
+        En Flatpak el drag & drop de archivos desde el gestor del host no
+        cruza la frontera del sandbox, así que la importación debe hacerse
+        con el diálogo "Select Videos". AppImage no está aislado, por lo
+        que no muestra aviso.
+        """
+        if detect_linux_container() != "flatpak":
+            return None
+        banner = QLabel(
+            "Running in a Flatpak sandbox — dragging files from the host "
+            "file manager into the app is not supported. Use the "
+            "'Select Videos' button to import videos."
+        )
+        banner.setWordWrap(True)
+        banner.setStyleSheet(
+            "QLabel { background-color: #5f3a00; color: #ffffff; "
+            "padding: 6px 12px; border-radius: 6px; font-size: 11px; font-weight: bold; }"
+        )
         return banner
 
     def _stylesheet(self):
@@ -1104,6 +1195,51 @@ class MainWindow(QMainWindow):
     def _on_video_dropped(self, paths):
         """Drag & drop de videos sobre la casilla Import."""
         self._accept_video_paths(paths)
+
+    # -- drag & drop sobre toda la ventana -----------------------------
+
+    def _show_drop_overlay(self):
+        overlay = getattr(self, "_drop_overlay", None)
+        if overlay is None:
+            return
+        central = self.centralWidget()
+        if central is not None:
+            overlay.setGeometry(central.rect())
+        overlay.raise_()
+        overlay.show()
+
+    def _hide_drop_overlay(self):
+        overlay = getattr(self, "_drop_overlay", None)
+        if overlay is not None:
+            overlay.hide()
+
+    def dragEnterEvent(self, event):
+        if video_paths_from_mime(event.mimeData()):
+            event.acceptProposedAction()
+            self._show_drop_overlay()
+        else:
+            event.ignore()
+
+    def dragMoveEvent(self, event):
+        if video_paths_from_mime(event.mimeData()):
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dragLeaveEvent(self, event):
+        # El arrastre salió del área de la ventana (o pasó a un hijo que
+        # acepta el drop, p.ej. la casilla Import): retiramos el overlay.
+        self._hide_drop_overlay()
+        event.ignore()
+
+    def dropEvent(self, event):
+        paths = video_paths_from_mime(event.mimeData())
+        self._hide_drop_overlay()
+        if paths:
+            self._accept_video_paths(paths)
+            event.acceptProposedAction()
+        else:
+            event.ignore()
 
     def _update_original_bitrate(self, path):
         info = get_video_info(self.ffmpeg_path, path)
@@ -2333,11 +2469,21 @@ class MainWindow(QMainWindow):
             if task_queue.first_pending() is None:
                 self._on_status_message("Queue is already empty.")
                 return
+            # Total de jobs que va a ejecutar ESTA pasada (solo los "queued";
+            # los ya terminados/failed no se vuelven a tocar).
+            self._queue_total = sum(
+                1 for it in task_queue.list_items()
+                if it.get("status") == "queued"
+            )
         except Exception:
             self._on_status_message("Could not read the queue.")
             return
+        self._queue_done = 0
         self._queue_active = True
-        self.tasks_panel.set_queue_running(True)
+        self.tasks_panel.set_queue_running(True, total=self._queue_total)
+        self._on_status_message(
+            f"Queue started: {self._queue_total} render(s) pending."
+        )
         self._start_next_queue_item()
 
     def _start_next_queue_item(self):
@@ -2351,14 +2497,25 @@ class MainWindow(QMainWindow):
             item = None
         if item is None:
             self._queue_active = False
+            total = getattr(self, "_queue_total", 0)
+            done = getattr(self, "_queue_done", 0)
+            self.tasks_panel.set_queue_progress(done, total)
             self.tasks_panel.set_queue_running(False)
-            self._on_status_message("Queue finished.")
+            self._on_status_message(
+                f"Queue finished: {done}/{total} render(s) processed."
+            )
             self.tasks_panel.append_log("Queue finished: all jobs processed.")
             return
 
         queue_id = item.get("queue_id", "")
         task_queue.set_status(queue_id, "running")
         self.tasks_panel.set_queue_status(queue_id, "running")
+
+        done = getattr(self, "_queue_done", 0)
+        total = getattr(self, "_queue_total", 0)
+        self._on_status_message(
+            f"Queue [{done + 1}/{total}]: {item.get('name') or queue_id} — running..."
+        )
 
         input_path = item.get("input_path", "")
         if not input_path or not os.path.exists(input_path):
@@ -2368,6 +2525,10 @@ class MainWindow(QMainWindow):
             self.tasks_panel.set_queue_status(queue_id, "failed")
             self.tasks_panel.append_log(
                 f"Queue item failed (missing input): {item.get('name')}"
+            )
+            self._queue_done = done + 1
+            self.tasks_panel.set_queue_progress(
+                self._queue_done, getattr(self, "_queue_total", 0)
             )
             self._start_next_queue_item()
             return
@@ -2403,6 +2564,10 @@ class MainWindow(QMainWindow):
             self.tasks_panel.append_log(
                 f"Queue item {status}: {name}"
                 + (f" ({error})" if error else "")
+            )
+            self._queue_done = getattr(self, "_queue_done", 0) + 1
+            self.tasks_panel.set_queue_progress(
+                self._queue_done, getattr(self, "_queue_total", 0)
             )
         self._start_next_queue_item()
 

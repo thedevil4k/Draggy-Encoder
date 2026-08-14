@@ -61,17 +61,17 @@ def _check_onnxruntime() -> dict:
         "detail": "",
     }
     try:
-        import onnxruntime as ort
-        info["installed"] = True
-        info["version"] = ort.__version__
-        providers = ort.get_available_providers()
-        info["gpu"] = "CUDAExecutionProvider" in providers
-        if info["gpu"]:
+        from src.runtimes.manager import onnx_status
+        status = onnx_status()
+        info["installed"] = bool(status.get("installed"))
+        info["version"] = status.get("version")
+        info["gpu"] = bool(status.get("gpu"))
+        if info["installed"] and info["gpu"]:
             info["detail"] = "GPU (CUDA) disponible"
+        elif info["installed"]:
+            info["detail"] = "CPU only (instala ONNX Runtime GPU desde Manage Dependencies)"
         else:
-            info["detail"] = "CPU only (instala onnxruntime-gpu para aceleración GPU)"
-    except ImportError:
-        info["detail"] = "No instalado. Instálalo desde 'Manage Dependencies'."
+            info["detail"] = "No instalado en el runtime privado de la aplicación."
     except Exception as exc:
         info["detail"] = f"Error de detección: {exc}"
     return info
@@ -88,17 +88,17 @@ def _check_torch() -> dict:
         "detail": "",
     }
     try:
-        import torch
-        info["installed"] = True
-        info["version"] = torch.__version__
-        info["gpu"] = torch.cuda.is_available()
-        if info["gpu"]:
-            gpu_name = torch.cuda.get_device_name(0)
-            info["detail"] = f"GPU disponible: {gpu_name}"
+        from src.runtimes.manager import torch_status
+        status = torch_status()
+        info["installed"] = bool(status.get("installed"))
+        info["version"] = status.get("version")
+        info["gpu"] = bool(status.get("gpu"))
+        if info["installed"] and info["gpu"]:
+            info["detail"] = "GPU disponible en el runtime privado"
+        elif info["installed"]:
+            info["detail"] = "CPU only (instala PyTorch con soporte CUDA desde Manage Dependencies)"
         else:
-            info["detail"] = "CPU only (instala PyTorch con soporte CUDA)"
-    except ImportError:
-        info["detail"] = "No instalado. Instálalo desde 'Manage Dependencies'."
+            info["detail"] = "No instalado en el runtime privado de la aplicación."
     except Exception as exc:
         info["detail"] = f"Error de detección: {exc}"
     return info

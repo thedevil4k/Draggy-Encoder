@@ -838,6 +838,62 @@ def test_installers_are_separated_in_registry():
     assert fns["torch"] is not fns["onnxruntime"]
 
 
+def test_pip_install_commands_are_private_and_do_not_use_user_cache():
+    """Los instaladores deben invocar el pip privado y bloquear la
+    configuración/caché del Python del usuario."""
+    import src.runtimes.manager as rm
+
+    torch_cmd = rm._build_pytorch_command("cpu")
+    onnx_cmd = rm._build_onnx_command("cpu")
+    for cmd in (torch_cmd, onnx_cmd):
+        assert cmd[0] == sys.executable
+        assert cmd[1:4] == ["-I", "-m", "pip"]
+        assert "--isolated" in cmd
+        assert "--no-cache-dir" in cmd
+        assert "--ignore-installed" in cmd
+        assert "--only-binary=:all:" in cmd
+        assert "--target" in cmd
+        assert rm.get_runtime_modules_dir() in cmd
+
+    old = {
+        key: os.environ.get(key)
+        for key in ("PYTHONPATH", "VIRTUAL_ENV", "PIP_CONFIG_FILE", "PIP_INDEX_URL")
+    }
+    os.environ.update({
+        "PYTHONPATH": "C:/foreign/site-packages",
+        "VIRTUAL_ENV": "C:/foreign/venv",
+        "PIP_CONFIG_FILE": "C:/foreign/pip.ini",
+        "PIP_INDEX_URL": "https://foreign.example/simple",
+    })
+    try:
+        env = rm._isolated_pip_env()
+        assert "PYTHONPATH" not in env
+        assert "VIRTUAL_ENV" not in env
+        assert "PIP_CONFIG_FILE" not in env
+        assert "PIP_INDEX_URL" not in env
+        assert env["PYTHONNOUSERSITE"] == "1"
+        assert env["PIP_NO_CACHE_DIR"] == "1"
+    finally:
+        for key, value in old.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+
+def test_runtime_version_is_read_only_from_private_store(tmp_path, monkeypatch):
+    """El estado no debe enseñar la versión de torch/onnx del sistema."""
+    import src.runtimes.manager as rm
+
+    store = str(tmp_path)
+    monkeypatch.setattr(rm, "RUNTIME_MODULES_DIR", store)
+    dist = os.path.join(store, "torch-9.9.9.dist-info")
+    os.makedirs(dist)
+    with open(os.path.join(dist, "METADATA"), "w", encoding="utf-8") as fh:
+        fh.write("Metadata-Version: 2.1\\nName: torch\\nVersion: 9.9.9\\n")
+    assert rm._version_of("torch") == "9.9.9"
+
+
 def test_pytorch_install_command_includes_onnx_package():
     """torch.onnx.export (torch 2.6+) needs the 'onnx' package; the
     PyTorch installer must install it alongside torch."""
@@ -849,6 +905,18 @@ def test_pytorch_install_command_includes_onnx_package():
     # Se instala con --target (store local) y desde el índice de PyTorch.
     assert "--target" in cmd
     assert any("download.pytorch.org" in part for part in cmd)
+
+
+def test_hf_engine_detection_ignores_system_runtime(monkeypatch):
+    """La detección de motores de IA usa el store privado, aunque exista
+    torch/onnxruntime en el Python que ejecuta los tests."""
+    import src.ai.hf_search as hf
+    import src.runtimes.manager as rm
+
+    monkeypatch.setattr(rm, "torch_status", lambda: {"installed": False, "gpu": False, "version": "—"})
+    monkeypatch.setattr(rm, "onnx_status", lambda: {"installed": False, "gpu": False, "version": "—"})
+    assert hf._check_torch()["installed"] is False
+    assert hf._check_onnxruntime()["installed"] is False
 
 
 def test_runtime_pip_failure_surfaces_pip_output(monkeypatch):
@@ -1847,6 +1915,299 @@ def test_main_window_accepts_dropped_video_paths(tmp_path, monkeypatch):
     assert updates == [str(vid)]
 
 
+def test_main_window_window_level_drop_imports_videos(tmp_path):
+    """Soltar un video en cualquier punto de la ventana principal (no solo
+    sobre la casilla Import) lo importa igual que el drop de la casilla."""
+    from PySide6.QtCore import QMimeData, QPointF, Qt, QUrl
+    from PySide6.QtGui import QDropEvent
+    from src.ui.main_window import MainWindow
+
+    vid = tmp_path / "window.mov"
+    vid.write_bytes(b"x")
+
+    mw = MainWindow.__new__(MainWindow)
+    mw.input_path = None
+    mw.input_paths = []
+    statuses = []
+    mw.status_label = type("L", (), {"setText": lambda self, t: statuses.append(t)})()
+    updates = []
+    mw._update_original_bitrate = lambda p: updates.append(p)
+
+    mime = QMimeData()
+    mime.setUrls([QUrl.fromLocalFile(str(vid))])
+    event = QDropEvent(
+        QPointF(10, 10),
+        Qt.DropAction.CopyAction,
+        mime,
+        Qt.MouseButton.LeftButton,
+        Qt.KeyboardModifier.NoModifier,
+    )
+    mw.dropEvent(event)
+    assert [os.path.normpath(p) for p in mw.input_paths] == [str(vid)]
+    assert os.path.normpath(mw.input_path) == str(vid)
+    assert statuses == ["Selected: window.mov"]
+    assert [os.path.normpath(p) for p in updates] == [str(vid)]
+
+    # Un drop sin videos (p.ej. un .txt) se ignora en la ventana.
+    txt = tmp_path / "x.txt"
+    txt.write_bytes(b"x")
+    bad = QMimeData()
+    bad.setUrls([QUrl.fromLocalFile(str(txt))])
+    event_bad = QDropEvent(
+        QPointF(10, 10),
+        Qt.DropAction.CopyAction,
+        bad,
+        Qt.MouseButton.LeftButton,
+        Qt.KeyboardModifier.NoModifier,
+    )
+    mw.dropEvent(event_bad)
+    assert len(mw.input_paths) == 1  # el drop no-video no cambia la selección
+
+
+def test_main_window_drag_overlay_toggles(tmp_path):
+    """El overlay de drop a ventana completa se muestra al entrar un video
+    y se oculta al salir o al soltar (cableado de los handlers)."""
+    from PySide6.QtCore import QMimeData, QPoint, QPointF, Qt, QUrl
+    from PySide6.QtGui import QDragEnterEvent, QDragLeaveEvent, QDropEvent
+    from src.ui.main_window import MainWindow
+
+    vid = tmp_path / "a.mp4"
+    vid.write_bytes(b"x")
+    mime = QMimeData()
+    mime.setUrls([QUrl.fromLocalFile(str(vid))])
+
+    mw = MainWindow.__new__(MainWindow)
+    calls = []
+    mw._show_drop_overlay = lambda: calls.append("show")
+    mw._hide_drop_overlay = lambda: calls.append("hide")
+    mw._accept_video_paths = lambda paths: calls.append("accept")
+
+    enter = QDragEnterEvent(
+        QPoint(10, 10),
+        Qt.DropAction.CopyAction,
+        mime,
+        Qt.MouseButton.LeftButton,
+        Qt.KeyboardModifier.NoModifier,
+    )
+    mw.dragEnterEvent(enter)
+    assert enter.isAccepted()
+    assert calls == ["show"]
+
+    mw.dragLeaveEvent(QDragLeaveEvent())
+    assert calls == ["show", "hide"]
+
+    drop = QDropEvent(
+        QPointF(10, 10),
+        Qt.DropAction.CopyAction,
+        mime,
+        Qt.MouseButton.LeftButton,
+        Qt.KeyboardModifier.NoModifier,
+    )
+    mw.dropEvent(drop)
+    assert drop.isAccepted()
+    assert calls == ["show", "hide", "hide", "accept"]
+
+
+def test_is_windows_elevated_returns_bool():
+    """El detector de elevación devuelve un bool y nunca lanza; en
+    plataformas no-Windows siempre es False."""
+    from src.utils.helpers import is_windows_elevated
+
+    assert is_windows_elevated() in (True, False)
+    if sys.platform != "win32":
+        assert is_windows_elevated() is False
+
+
+def test_main_window_elevation_banner(monkeypatch):
+    """El banner de elevación solo se crea cuando la app corre como admin."""
+    from PySide6.QtWidgets import QLabel
+    from src.ui.main_window import MainWindow
+
+    # No elevado -> sin banner.
+    monkeypatch.setattr("src.ui.main_window.is_windows_elevated", lambda: False)
+    assert MainWindow._build_elevation_warning_banner() is None
+
+    # Elevado -> banner QLabel con el aviso UIPI.
+    monkeypatch.setattr("src.ui.main_window.is_windows_elevated", lambda: True)
+    banner = MainWindow._build_elevation_warning_banner()
+    assert isinstance(banner, QLabel)
+    assert "UIPI" in banner.text()
+
+
+def test_detect_linux_container(monkeypatch):
+    """El detector distingue Flatpak (sandbox) de AppImage (no aislado)."""
+    from src.utils.helpers import detect_linux_container
+
+    for var in ("FLATPAK_ID", "FLATPAK_SANDBOX_DIR", "APPIMAGE", "APPDIR"):
+        monkeypatch.delenv(var, raising=False)
+    assert detect_linux_container() is None
+
+    monkeypatch.setenv("FLATPAK_ID", "com.draggyencoder.DraggyEncoder")
+    assert detect_linux_container() == "flatpak"
+    monkeypatch.delenv("FLATPAK_ID")
+
+    monkeypatch.setenv("APPIMAGE", "/tmp/DraggyEncoder.AppImage")
+    assert detect_linux_container() == "appimage"
+
+
+def test_main_window_sandbox_banner(monkeypatch):
+    """El aviso de sandbox solo aparece en Flatpak; AppImage no está aislado."""
+    from PySide6.QtWidgets import QLabel
+    from src.ui.main_window import MainWindow
+
+    monkeypatch.setattr("src.ui.main_window.detect_linux_container", lambda: None)
+    assert MainWindow._build_sandbox_warning_banner() is None
+
+    monkeypatch.setattr("src.ui.main_window.detect_linux_container", lambda: "appimage")
+    assert MainWindow._build_sandbox_warning_banner() is None
+
+    monkeypatch.setattr("src.ui.main_window.detect_linux_container", lambda: "flatpak")
+    banner = MainWindow._build_sandbox_warning_banner()
+    assert isinstance(banner, QLabel)
+    assert "Flatpak" in banner.text()
+
+
+def test_windows_app_user_model_id_calls_native_api(monkeypatch):
+    """El AppUserModelID se registra en Windows para que la taskbar use el
+    icono de la app en vez del genérico de python.exe/bootloader."""
+    import types
+    import src.app as appmod
+
+    calls = []
+
+    class _Shell32:
+        @staticmethod
+        def SetCurrentProcessExplicitAppUserModelID(app_id):
+            calls.append(app_id)
+
+    fake_ctypes = types.SimpleNamespace(
+        windll=types.SimpleNamespace(shell32=_Shell32()),
+    )
+    monkeypatch.setitem(sys.modules, "ctypes", fake_ctypes)
+    monkeypatch.setattr(appmod.sys, "platform", "win32")
+    appmod._set_windows_app_user_model_id()
+    assert calls == ["com.draggyencoder.DraggyEncoder"]
+
+
+def test_windows_app_user_model_id_swallows_native_errors(monkeypatch):
+    """Un fallo de la API nativa no debe romper el arranque."""
+    import types
+    import src.app as appmod
+
+    class _Shell32:
+        @staticmethod
+        def SetCurrentProcessExplicitAppUserModelID(app_id):
+            raise OSError("no shell32")
+
+    fake_ctypes = types.SimpleNamespace(
+        windll=types.SimpleNamespace(shell32=_Shell32()),
+    )
+    monkeypatch.setitem(sys.modules, "ctypes", fake_ctypes)
+    monkeypatch.setattr(appmod.sys, "platform", "win32")
+    assert appmod._set_windows_app_user_model_id() is None
+
+
+def test_compress_video_audio_boost_reports_real_phases(monkeypatch, tmp_path):
+    """Con audio boost, la ruta estándar debe marcar 'Audio boost' activa
+    desde la medición y avanzar 'Compress' (y 'Audio') durante el encode,
+    en vez de quedarse pegada en 'Analyzing audio levels...' hasta el final."""
+    import src.processing.pipeline as pl
+
+    events = []
+    statuses = []
+    progress = []
+
+    staged = tmp_path / "staged.mp4"
+    staged.write_bytes(b"x")
+
+    monkeypatch.setattr(pl, "validate_render_preflight", lambda *a, **k: [])
+    monkeypatch.setattr(pl, "_get_duration_seconds", lambda *a, **k: 10.0)
+    monkeypatch.setattr(
+        pl, "_measure_if_needed",
+        lambda *a, **k: {
+            "input_i": "-24", "input_tp": "-1.5", "input_lra": "11",
+            "input_thresh": "-40", "target_offset": "0",
+        },
+    )
+    monkeypatch.setattr(pl, "_make_temp_output_path", lambda p: str(staged))
+    monkeypatch.setattr(pl, "build_args", lambda *a, **k: ["-y", "in", "out"])
+
+    def _fake_run(ffmpeg_path, args, progress_callback=None, abort_event=None,
+                  on_process=None, supervisor=None):
+        progress_callback(50)
+        progress_callback(100)
+        return True
+
+    monkeypatch.setattr(pl, "run_ffmpeg", _fake_run)
+    monkeypatch.setattr(pl, "validate_render_output", lambda *a, **k: (True, ""))
+
+    settings = {
+        "audio": "copy", "audio_boost": True, "codec": "libx264",
+        "format": "mp4", "bitrate": 1500, "resolution": "original",
+    }
+    ok = pl.compress_video(
+        "ffmpeg", str(tmp_path / "in.mp4"), str(tmp_path / "out.mp4"),
+        settings,
+        progress_callback=lambda p: progress.append(p),
+        status_callback=lambda m: statuses.append(m),
+        phase_cb=lambda ev: events.append((ev["id"], ev["ev"], ev.get("pct"))),
+    )
+    assert ok is True
+
+    audio = [e for e in events if e[0] == "audio"]
+    compress = [e for e in events if e[0] == "compress"]
+
+    # La fase de audio ya no es un flash start(100)+end: arranca en 0.
+    assert audio[0] == ("audio", "start", 0)
+    # El encode avanza ambas fases (boost + compresión van a la vez).
+    assert ("compress", "progress", 50) in compress
+    assert ("audio", "progress", 50) in audio
+    # Ambas fases terminan.
+    assert compress[-1][1] == "end"
+    assert audio[-1][1] == "end"
+    # El status ya no se queda en "Analyzing audio levels...".
+    assert statuses[-1] == "Compressing video + boosting audio..."
+    assert progress == [50, 100]
+
+
+def test_compress_video_without_boost_has_no_audio_phase(monkeypatch, tmp_path):
+    """Sin audio boost no debe emitirse ninguna fase de audio."""
+    import src.processing.pipeline as pl
+
+    events = []
+    statuses = []
+
+    staged = tmp_path / "staged.mp4"
+    staged.write_bytes(b"x")
+
+    monkeypatch.setattr(pl, "validate_render_preflight", lambda *a, **k: [])
+    monkeypatch.setattr(pl, "_get_duration_seconds", lambda *a, **k: 10.0)
+    monkeypatch.setattr(pl, "_make_temp_output_path", lambda p: str(staged))
+    monkeypatch.setattr(pl, "build_args", lambda *a, **k: ["-y", "in", "out"])
+
+    def _fake_run(*a, **k):
+        if k.get("progress_callback"):
+            k["progress_callback"](70)
+        return True
+
+    monkeypatch.setattr(pl, "run_ffmpeg", _fake_run)
+    monkeypatch.setattr(pl, "validate_render_output", lambda *a, **k: (True, ""))
+
+    settings = {
+        "audio": "copy", "audio_boost": False, "codec": "libx264",
+        "format": "mp4", "bitrate": 1500, "resolution": "original",
+    }
+    ok = pl.compress_video(
+        "ffmpeg", str(tmp_path / "in.mp4"), str(tmp_path / "out.mp4"),
+        settings,
+        status_callback=lambda m: statuses.append(m),
+        phase_cb=lambda ev: events.append((ev["id"], ev["ev"], ev.get("pct"))),
+    )
+    assert ok is True
+    assert all(e[0] != "audio" for e in events)
+    assert statuses[-1] == "Compressing video..."
+
+
 def test_list_all_has_face_restore_slot(isolated_engines_state):
     """The Dependencies REGISTRY exposes a FaceRestore model slot that
     reports honestly against the empty models dir."""
@@ -2381,6 +2742,49 @@ def test_hardware_dialog_shows_os_and_python(qapp):
         assert any(r"C:\venv\python.exe" in t for t in texts)
     finally:
         dlg.deleteLater()
+
+
+def test_hardware_dialog_shows_elevation(qapp, monkeypatch):
+    """The Hardware Info dialog renders the Elevation/UIPI status line."""
+    from PySide6.QtWidgets import QLabel
+    import src.ui.hardware_dialog as hd
+
+    info = {
+        "cpu": {"name": "Test CPU", "cores": 4, "threads": 8},
+        "gpus": [],
+        "recommended_device": "CPU",
+        "os": "Windows 11 (10.0.26100)",
+        "machine": "AMD64",
+        "python": {"version": "3.11.15", "executable": r"C:\venv\python.exe", "bits": 64},
+    }
+
+    # No Windows -> N/A.
+    monkeypatch.setattr(hd.sys, "platform", "linux")
+    dlg = hd.HardwareDialog(info)
+    try:
+        texts = [lbl.text() for lbl in dlg.findChildren(QLabel)]
+        assert any("Elevation" in t and "not Windows" in t for t in texts)
+    finally:
+        dlg.deleteLater()
+
+    # Windows elevado -> drag & drop bloqueado (UIPI).
+    monkeypatch.setattr(hd.sys, "platform", "win32")
+    monkeypatch.setattr(hd, "is_windows_elevated", lambda: True)
+    dlg2 = hd.HardwareDialog(info)
+    try:
+        texts = [lbl.text() for lbl in dlg2.findChildren(QLabel)]
+        assert any("Elevation" in t and "UIPI" in t for t in texts)
+    finally:
+        dlg2.deleteLater()
+
+    # Windows sin elevación -> drag & drop disponible.
+    monkeypatch.setattr(hd, "is_windows_elevated", lambda: False)
+    dlg3 = hd.HardwareDialog(info)
+    try:
+        texts = [lbl.text() for lbl in dlg3.findChildren(QLabel)]
+        assert any("Elevation" in t and "works" in t for t in texts)
+    finally:
+        dlg3.deleteLater()
 
 
 def test_hardware_dialog_shows_gpu_driver_and_vram(qapp):
@@ -3652,15 +4056,61 @@ def test_tasks_panel_queue_tab_smoke(qapp):
     from src.ui.tasks_panel import TasksPanel
 
     panel = TasksPanel()
+    # Con jobs en cola, Start queue DEBE estar habilitado (antes quedaba
+    # deshabilitado para siempre hasta que una cola terminara).
     panel.rebuild_queue([
-        {"queue_id": "q1", "name": "movie1.mp4", "status": "queued"},
+        {"queue_id": "q1", "name": "movie1.mp4", "status": "queued",
+         "input_path": "/in/movie1.mp4", "output_path": "/out/movie1.mp4",
+         "pipeline_order": ["Import", "Upscale", "Compress"],
+         "ai_engines": {"Upscale": {"engine_id": "upscale-realesrgan-x4plus",
+                                    "model_path": "/models/realesrgan-x4plus.pth",
+                                    "scale": 2}},
+         "settings": {"codec": "h264_nvenc", "bitrate": "5000",
+                      "resolution": "1920x1080", "format": "mp4",
+                      "audio_boost": True, "audio_codec": "aac"}},
         {"queue_id": "q2", "name": "movie2.mp4", "status": "queued"},
     ])
     assert "q1" in panel._queue_rows and "q2" in panel._queue_rows
+    assert panel.btn_start_queue.isEnabled() is True
+    assert panel._queue_progress_label.text() == "2 job(s) queued"
+    # El snapshot completo está disponible para el tooltip desplegable.
+    details_html = panel._queue_rows["q1"]._details.text()
+    assert "movie1.mp4" in details_html
+    assert "realesrgan-x4plus" in details_html
+    assert "h264_nvenc" in details_html
+    assert "Audio" in details_html
+    assert "Pipeline" in details_html
+
     panel.set_queue_status("q1", "running")
     assert panel._queue_rows["q1"].pill.text() == "RUNNING"
+    # Auto-expand al pasar a "running" para que el usuario vea qué se comprime.
+    assert panel._queue_rows["q1"].is_expanded() is True
     panel.set_queue_status("q1", "done")
-    assert panel._queue_rows["q1"].pill.text() == "DONE ✓"
+    assert panel._queue_rows["q1"].pill.text() == "DONE \u2713"
+
+    # En marcha: botón deshabilitado + barra visible con el total. El panel
+    # se muestra y se selecciona la pestaña Queue para que isVisible() sea
+    # fiable (la barra vive dentro de un QTabWidget).
+    panel.show()
+    panel.tabs.setCurrentIndex(2)  # pestaña Queue
+    from PySide6.QtWidgets import QApplication
+    QApplication.processEvents()
+    panel.set_queue_running(True, total=2)
+    assert panel.btn_start_queue.isEnabled() is False
+    assert panel._queue_progress_bar.isVisible()
+    assert panel._queue_progress_label.text() == "Queue running: 0/2 done"
+    panel.set_queue_progress(1, 2)
+    assert panel._queue_progress_label.text() == "Queue: 1/2 done"
+    panel.set_queue_progress(2, 2)
+    assert panel._queue_progress_label.text() == "Queue finished"
+    panel.set_queue_running(False)
+    assert panel.btn_start_queue.isEnabled() is True
+
+    # Toggle colapsable: set_expanded apaga y enciende el panel de detalle.
+    panel._queue_rows["q1"].set_expanded(False)
+    assert panel._queue_rows["q1"]._details.isHidden() is True
+    panel._queue_rows["q1"].set_expanded(True)
+    assert panel._queue_rows["q1"]._details.isHidden() is False
 
     # Quitar un item vía la API pública (UI + persistencia no-crash).
     panel.remove_queue_item("q2")
@@ -3670,6 +4120,7 @@ def test_tasks_panel_queue_tab_smoke(qapp):
     panel.clear_queue_rows()
     assert panel._queue_rows == {}
     assert panel.btn_start_queue.isEnabled() is False
+    assert panel._queue_progress_label.text() == "No queued jobs"
 
 
 # ---------------------------------------------------------------------------
