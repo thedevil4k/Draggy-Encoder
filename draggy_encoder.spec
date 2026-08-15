@@ -55,10 +55,10 @@ a = Analysis(
 
 pyz = PYZ(a.pure, a.zipped_data, cipher=None)
 
-# Icono del ejecutable: el logo de la app (assets/Import.png), el mismo que
-# usan la ventana y los lanzadores de escritorio de Linux. En Windows
-# PyInstaller lo convierte a .ico con Pillow (incluida en requirements-build.txt);
-# en Linux usa el PNG directamente.
+# Icono del ejecutable: assets/app.ico (multi-resolución, generado por
+# packaging/windows/make_icon.py desde assets/Import.png) en Windows; en Linux
+# el PNG. Un .ico con 16/24/32/48/64/128/256 hace que el logo se vea nítido en
+# Explorer, Settings > Apps (entrada de desinstalación) y el instalador.
 #   - PYINSTALLER_ICON=NONE   : omite el paso (builds locales con antivirus
 #                               agresivo que bloquea BeginUpdateResource sobre
 #                               el bootloader sin firmar, WinError 225).
@@ -67,7 +67,9 @@ _icon = (os.environ.get("PYINSTALLER_ICON") or "").strip()
 if _icon.upper() == "NONE":
     _icon = None
 elif not _icon:
-    _icon = os.path.join("assets", "Import.png")
+    ico = os.path.join("assets", "app.ico")
+    png = os.path.join("assets", "Import.png")
+    _icon = ico if os.path.exists(ico) else png
 
 exe = EXE(
     pyz,

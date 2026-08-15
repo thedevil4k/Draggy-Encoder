@@ -1416,18 +1416,7 @@ class MainWindow(QMainWindow):
         The button that triggers this is labelled "AI Engines", so the
         user expects to land on that tab without an extra click.
         """
-        try:
-            dialog = DependenciesDialog(self, initial_tab="ai_engines")
-            dialog.exec()
-        except Exception as exc:
-            import traceback
-            traceback.print_exc()
-            QMessageBox.critical(
-                self,
-                "AI Engines Manager error",
-                f"Could not open the AI Engines Manager:\n\n{exc}\n\n"
-                "See bin/logs for details."
-            )
+        self._open_dependencies(initial_tab="ai_engines")
 
     def _on_manage_engines_requested(self, category):
         """Bridge for ``AIWorkflowStep.clicked_for_manage``.
@@ -1438,8 +1427,18 @@ class MainWindow(QMainWindow):
         iteration could pre-filter the catalog by category) but today
         we just default to the engines tab.
         """
+        self._open_dependencies(initial_tab="ai_engines")
+
+    def _open_dependencies(self, initial_tab=None, install_engine_id=None):
+        """Abre el gestor de dependencias y, si el usuario cambió el binario
+        FFmpeg activo, aplica el cambio re-detectando codecs al cerrar."""
+        from src.ffmpeg.manager import get_active_ffmpeg_choice
+        before = get_active_ffmpeg_choice()
         try:
-            dialog = DependenciesDialog(self, initial_tab="ai_engines")
+            dialog = DependenciesDialog(self, initial_tab=initial_tab)
+            if install_engine_id:
+                # Disparar la instalación del motor seleccionado en el buscador.
+                dialog._on_engine_install(install_engine_id)
             dialog.exec()
         except Exception as exc:
             import traceback
@@ -1450,6 +1449,17 @@ class MainWindow(QMainWindow):
                 f"Could not open the AI Engines Manager:\n\n{exc}\n\n"
                 "See bin/logs for details."
             )
+            return
+        if get_active_ffmpeg_choice() != before:
+            self._apply_ffmpeg_binary_choice()
+
+    def _apply_ffmpeg_binary_choice(self):
+        """Aplica la elección del binario FFmpeg activo y re-detecta codecs."""
+        from src.ffmpeg.manager import get_active_ffmpeg_path
+        active = get_active_ffmpeg_path()
+        if active and active != self.ffmpeg_path:
+            self.ffmpeg_path = active
+            self._on_redetect_clicked()
 
     def _on_model_selected_from_search(self, model: dict):
         """Handle model selection from the HuggingFace search dialog.
@@ -1469,10 +1479,7 @@ class MainWindow(QMainWindow):
             return
         if model.get("is_user"):
             self._register_user_model(model)
-        dialog = DependenciesDialog(self, initial_tab="ai_engines")
-        # Trigger installation after the dialog is shown.
-        dialog._on_engine_install(engine_id)
-        dialog.exec()
+        self._open_dependencies(initial_tab="ai_engines", install_engine_id=engine_id)
 
     def _register_user_model(self, model: dict):
         """Persiste el registro de un motor de usuario (buscador del Hub)."""

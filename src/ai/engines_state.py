@@ -204,23 +204,24 @@ def get_state(engine_id: str) -> dict:
     # PyTorch si no).
     if state["inference_backend"] not in ("torch", "onnxruntime"):
         state["inference_backend"] = "auto"
-    # FSR 3.1 requires FFmpeg full with libplacebo.
+    # FSR 3.1 requires libplacebo. El build por defecto (gyan release-full /
+    # johnvansickle static) ya lo trae; el binario BtbN "full" es solo un extra
+    # bleeding-edge opcional.
     if engine_id and "fsr31" in engine_id:
-        # Check if FFmpeg full is available
         try:
-            from src.ffmpeg.manager import has_libplacebo_support, get_local_ffmpeg_full_path
-            ffmpeg_full = get_local_ffmpeg_full_path()
-            if os.path.exists(ffmpeg_full) and has_libplacebo_support(ffmpeg_full):
+            from src.ffmpeg.manager import get_ffmpeg_path_for_fsr31, has_libplacebo_support
+            ffmpeg_path = get_ffmpeg_path_for_fsr31()
+            if ffmpeg_path and os.path.exists(ffmpeg_path) and has_libplacebo_support(ffmpeg_path):
                 state["installed"] = True
                 state["enabled"] = True
             else:
                 state["installed"] = False
                 state["enabled"] = False
-                state["last_error"] = "Requires FFmpeg full with libplacebo support"
+                state["last_error"] = "Requires an FFmpeg build with libplacebo support"
         except Exception:
             state["installed"] = False
             state["enabled"] = False
-            state["last_error"] = "Cannot check FFmpeg full availability"
+            state["last_error"] = "Cannot check libplacebo availability"
 
     # Sensor veraz contra disco: si el estado dice "instalado" pero el
     # directorio del modelo ya no existe (el usuario borró/trasladó los

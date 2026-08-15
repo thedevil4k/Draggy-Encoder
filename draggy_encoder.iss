@@ -5,7 +5,7 @@
 ; bootstrapado que la app usa para instalar torch/onnxruntime a demanda).
 
 #ifndef MyAppVersion
-  #define MyAppVersion "0.0.0"
+  #define MyAppVersion "1"
 #endif
 
 ; Instalación por usuario en {localappdata}\Programs: la app escribe datos
@@ -15,8 +15,15 @@
 AppId={{9D2A6F4B-8E11-4C5F-A3D6-1B2C4E5F6071}}
 AppName=Draggy Encoder
 AppVersion={#MyAppVersion}
-AppVerName=Draggy Encoder {#MyAppVersion}
+AppVerName=Draggy Encoder v{#MyAppVersion}
 AppPublisher=thedevil4k
+; Icono del instalador y del desinstalador (multi-resolución, ver
+; packaging/windows/make_icon.py). Sin SetupIconFile usan el icono genérico.
+SetupIconFile=assets\app.ico
+; Icono de la entrada en Settings > Apps / Agregar o quitar programas.
+; Sin esta directiva Windows elige un icono por su cuenta (suele ser el
+; genérico del desinstalador). Apuntamos al EXE, que ya lleva el .ico embebido.
+UninstallDisplayIcon={app}\DraggyEncoder.exe
 DefaultDirName={localappdata}\Programs\DraggyEncoder
 DefaultGroupName=Draggy Encoder
 DisableProgramGroupPage=yes

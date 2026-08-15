@@ -856,9 +856,16 @@ def _format_queue_item_details(item: dict) -> str:
             stream_index = settings.get("audio_stream_index")
             if stream_index is not None and audio_codec != "noaudio":
                 try:
-                    track_label = settings.get("audio_stream_label") or f"Track {int(stream_index) + 1}"
+                    is_all = int(stream_index) == -1
                 except (TypeError, ValueError):
-                    track_label = settings.get("audio_stream_label") or str(stream_index)
+                    is_all = False
+                if is_all:
+                    track_label = "All tracks"
+                else:
+                    try:
+                        track_label = settings.get("audio_stream_label") or f"Track {int(stream_index) + 1}"
+                    except (TypeError, ValueError):
+                        track_label = settings.get("audio_stream_label") or str(stream_index)
                 parts.append(
                     "<div style='margin-left:12px;color:#c8c8d4;'>"
                     f"\u25b8 Selected track: <code>{_esc(track_label)}</code></div>"

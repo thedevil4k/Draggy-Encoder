@@ -429,7 +429,8 @@ def _ffmpeg_full_status():
         status = STATUS_INSTALLED
         detail = (
             "FFmpeg full (libplacebo) installed in the program folder. "
-            "Required for FSR 3.1."
+            "Optional bleeding-edge build for FSR 3.1 (the default FFmpeg "
+            "already includes libplacebo)."
         )
     elif exists:
         status = STATUS_ERROR
@@ -437,8 +438,8 @@ def _ffmpeg_full_status():
     else:
         status = STATUS_MISSING
         detail = (
-            "Not installed. Download it from the 'AI Engines' tab "
-            "(FSR 3.1 rows)."
+            "Not installed. Optional bleeding-edge build; the default FFmpeg "
+            "already includes libplacebo for FSR 3.1."
         )
     return {
         "id": "ffmpeg_full",

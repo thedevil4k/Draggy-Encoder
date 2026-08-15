@@ -527,6 +527,28 @@ def extract_frame(ffmpeg_path, video_path, time_sec, output_path,
                 pass
 
 
+# Sentinela de ``audio_stream_index``: -1 significa conservar TODAS las pistas
+# de audio del contenedor (MP4/MKV/MOV soportan varias pistas de audio).
+KEEP_ALL_AUDIO = -1
+
+
+def parse_audio_stream_index(value):
+    """Parsea el índice de pista de audio desde los ajustes.
+
+    Devuelve:
+        - ``KEEP_ALL_AUDIO`` (-1) si se pide conservar todas las pistas
+        - un entero >= 0 para una pista concreta
+        - 0 como fallback si el valor es inválido o ausente
+    """
+    if value is None:
+        return 0
+    try:
+        idx = int(value)
+    except (TypeError, ValueError):
+        return 0
+    return idx if idx >= 0 else KEEP_ALL_AUDIO
+
+
 def build_args(input_path, output_path, settings, loudnorm_meas=None):
     """Construye los argumentos de ffmpeg a partir de los ajustes.
 
@@ -598,17 +620,18 @@ def build_args(input_path, output_path, settings, loudnorm_meas=None):
     # Audio con soporte de audio boost (single-pass o two-pass lineal)
     audio = settings.get("audio", "copy")
     audio_boost = bool(settings.get("audio_boost", False))
-    try:
-        audio_stream_index = max(0, int(settings.get("audio_stream_index", 0)))
-    except (TypeError, ValueError):
-        audio_stream_index = 0
+    audio_stream_index = parse_audio_stream_index(settings.get("audio_stream_index", 0))
 
     # Explicit maps are important for MKV files with several audio tracks:
     # FFmpeg's implicit stream selection otherwise silently picks the first
-    # one, regardless of the track chosen in the UI.
+    # one, regardless of the track chosen in the UI. ``-1`` conserva TODAS
+    # las pistas (``-map 0:a?``).
     args.extend(["-map", "0:v:0"])
     if audio != "noaudio":
-        args.extend(["-map", f"0:a:{audio_stream_index}?"])
+        if audio_stream_index == KEEP_ALL_AUDIO:
+            args.extend(["-map", "0:a?"])
+        else:
+            args.extend(["-map", f"0:a:{audio_stream_index}?"])
 
     if audio == "noaudio":
         args.extend(["-an"])

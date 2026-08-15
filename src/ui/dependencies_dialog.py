@@ -18,6 +18,7 @@ from datetime import datetime, timezone
 from PySide6.QtCore import Qt, QThread, QTimer, Signal
 from PySide6.QtGui import QColor, QFont
 from PySide6.QtWidgets import (
+    QComboBox,
     QDialog,
     QFrame,
     QHBoxLayout,
@@ -72,8 +73,10 @@ def _friendly_convert_status(raw: str) -> str:
 
 
 from src.ffmpeg.manager import (
+    get_active_ffmpeg_choice,
     get_local_ffmpeg_full_path,
     has_libplacebo_support,
+    set_active_ffmpeg,
 )
 from src.ffmpeg.upstream import clear_cache
 from src.ui.engines_tab import EnginesTab
@@ -655,6 +658,29 @@ class DependenciesDialog(QDialog):
         binaries_layout = QVBoxLayout(binaries_tab)
         binaries_layout.setSpacing(8)
         binaries_layout.setContentsMargins(8, 8, 8, 8)
+
+        # Selector del binario FFmpeg activo (standard vs full).
+        choice_row = QHBoxLayout()
+        choice_row.setSpacing(8)
+        choice_label = QLabel("FFmpeg in use:")
+        choice_label.setStyleSheet("font-weight: bold;")
+        self.ffmpeg_choice_combo = QComboBox()
+        self.ffmpeg_choice_combo.addItem("Standard (gyan release-full)", "standard")
+        self.ffmpeg_choice_combo.addItem("Full (BtbN, libplacebo)", "full")
+        self.ffmpeg_choice_combo.setToolTip(
+            "Choose which FFmpeg binary encodes your videos. "
+            "The choice applies to new jobs after closing this dialog."
+        )
+        self.ffmpeg_choice_combo.currentIndexChanged.connect(self._on_ffmpeg_choice_changed)
+        choice_row.addWidget(choice_label)
+        choice_row.addWidget(self.ffmpeg_choice_combo, stretch=1)
+        binaries_layout.addLayout(choice_row)
+
+        self.ffmpeg_choice_hint = QLabel("")
+        self.ffmpeg_choice_hint.setStyleSheet("color: #a0a0b0; font-size: 10px;")
+        self.ffmpeg_choice_hint.setWordWrap(True)
+        binaries_layout.addWidget(self.ffmpeg_choice_hint)
+
         self.scroll = QScrollArea()
         self.scroll.setWidgetResizable(True)
         self.container = QWidget()
@@ -758,6 +784,51 @@ class DependenciesDialog(QDialog):
             row.uninstall_requested.connect(self._on_uninstall_requested)
             self.container_layout.insertWidget(self.container_layout.count() - 1, row)
             self._row_widgets.append(row)
+
+        self._sync_ffmpeg_choice_combo()
+
+    def _sync_ffmpeg_choice_combo(self):
+        """Sincroniza el selector del binario activo con lo instalado + preferencia."""
+        if not hasattr(self, "ffmpeg_choice_combo"):
+            return
+        from src.ffmpeg.manager import get_local_ffmpeg_path
+        standard_ok = bool(get_local_ffmpeg_path() and os.path.exists(get_local_ffmpeg_path()))
+        full_ok = bool(get_local_ffmpeg_full_path() and os.path.exists(get_local_ffmpeg_full_path()))
+        current = get_active_ffmpeg_choice()
+
+        self.ffmpeg_choice_combo.blockSignals(True)
+        full_idx = self.ffmpeg_choice_combo.findData("full")
+        model = self.ffmpeg_choice_combo.model()
+        if full_idx >= 0 and model is not None:
+            item = model.item(full_idx)
+            if item is not None:
+                item.setEnabled(full_ok)
+        idx = self.ffmpeg_choice_combo.findData(current)
+        self.ffmpeg_choice_combo.setCurrentIndex(idx if idx >= 0 else 0)
+        self.ffmpeg_choice_combo.blockSignals(False)
+
+        if current == "full":
+            hint = "Using the Full build (BtbN): libplacebo (FSR 3.1) + SVT-AV1 + x264/x265."
+        else:
+            hint = "Using the Standard build (gyan release-full): x264/x265 + SVT-AV1 + libplacebo."
+        if not full_ok:
+            hint += (" Install 'FFmpeg full' from the AI Engines tab (FSR 3.1 rows) "
+                     "to enable the Full option.")
+        self.ffmpeg_choice_hint.setText(hint)
+
+    def _on_ffmpeg_choice_changed(self, _index):
+        """Persiste la elección del binario activo (standard/full)."""
+        choice = self.ffmpeg_choice_combo.currentData()
+        if not choice:
+            return
+        if choice == "full":
+            full = get_local_ffmpeg_full_path()
+            if not (full and os.path.exists(full)):
+                # No instalado: la opción debería estar deshabilitada; revertir.
+                self._sync_ffmpeg_choice_combo()
+                return
+        set_active_ffmpeg(choice)
+        self._sync_ffmpeg_choice_combo()
 
     def _schedule_upstream_check(self, delay_ms=1500, force=False):
         """(Re)programa un único check upstream.
@@ -1403,7 +1474,7 @@ class DependenciesDialog(QDialog):
             "{}\n\n"
             "Hints:\n"
             "  - Check your internet connection.\n"
-            "  - All three upstream mirrors (BtbN lgpl-shared, BtbN gpl-shared, "
+            "  - All three upstream mirrors (BtbN gpl-shared, BtbN lgpl-shared, "
             "johnvansickle.com) failed.\n"
             "  - You can also drop a custom build with libplacebo at:\n"
             "    {}".format(msg, get_local_ffmpeg_full_path()),
@@ -1425,6 +1496,8 @@ class DependenciesDialog(QDialog):
             except Exception:
                 pass
         self._refresh_engines_tab()
+        # El build full ya está instalado: habilitar la opción "Full" del selector.
+        self._sync_ffmpeg_choice_combo()
 
     def _on_engine_convert(self, engine_id):
         if not engine_id:

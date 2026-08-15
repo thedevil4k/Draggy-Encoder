@@ -279,6 +279,62 @@ def get_install_info(ffmpeg_path=None):
 # ---------------------------------------------------------------------------
 
 
+FFMPEG_BINARY_PREF_KEY = "ffmpeg_binary"
+
+
+def get_active_ffmpeg_choice() -> str:
+    """Elección efectiva del binario FFmpeg (``"standard"`` | ``"full"``).
+
+    Lee la preferencia persistente. Si el usuario eligió ``"full"`` pero el
+    binario full no está instalado, cae a ``"standard"`` (fail-safe).
+    """
+    try:
+        from src.preferences import get as _prefs_get
+    except Exception:
+        _prefs_get = lambda *a, **k: "standard"
+    choice = _prefs_get(FFMPEG_BINARY_PREF_KEY, "standard")
+    if choice == "full":
+        full = get_local_ffmpeg_full_path()
+        if full and os.path.exists(full):
+            return "full"
+    return "standard"
+
+
+def get_active_ffmpeg_path():
+    """Ruta del binario FFmpeg que debe usarse para codificar.
+
+    Respeta la preferencia persistente (``ffmpeg_binary``). Cadena de fallback:
+    elección del usuario → estándar → full → ``None``.
+    """
+    choice = get_active_ffmpeg_choice()
+    if choice == "full":
+        full = get_local_ffmpeg_full_path()
+        if full and os.path.exists(full):
+            return full
+    standard = get_local_ffmpeg_path()
+    if standard and os.path.exists(standard):
+        return standard
+    full = get_local_ffmpeg_full_path()
+    if full and os.path.exists(full):
+        return full
+    return None
+
+
+def set_active_ffmpeg(choice: str) -> str:
+    """Persiste la elección del binario (``"standard"`` | ``"full"``).
+
+    Devuelve la elección efectiva tras validar/fallback (p. ej. pedir "full"
+    sin tenerlo instalado devuelve "standard").
+    """
+    choice = "full" if choice == "full" else "standard"
+    try:
+        from src.preferences import set as _prefs_set
+        _prefs_set(FFMPEG_BINARY_PREF_KEY, choice)
+    except Exception:
+        pass
+    return get_active_ffmpeg_choice()
+
+
 def get_ffmpeg_path_for_fsr31():
     """Get the appropriate FFmpeg path for FSR 3.1 processing.
 
@@ -416,7 +472,7 @@ def _migrate_legacy_layout():
         return False
 
 
-def ensure_ffmpeg(parent=None, progress_callback=None, prefer_full=True,
+def ensure_ffmpeg(parent=None, progress_callback=None, prefer_full=False,
                   abort_event=None, timeout=None):
     """Asegura que FFmpeg esté disponible dentro de la carpeta del programa.
 
@@ -425,8 +481,9 @@ def ensure_ffmpeg(parent=None, progress_callback=None, prefer_full=True,
         progress_callback: callable(percent, message) -> None. Recibe
             updates durante la descarga y la extracción. Compatible con
             callbacks de 1 argumento vía ``_emit``.
-        prefer_full: Si es True, intenta descargar FFmpeg completo (con libplacebo)
-            primero. Si falla, cae al FFmpeg estándar.
+        prefer_full: Por defecto False: usa el FFmpeg estándar (gyan release-full,
+            completo en codecs). El build BtbN "full" con libplacebo se instala
+            bajo demanda para FSR 3.1 (``ensure_ffmpeg_full``), no en el arranque.
         abort_event: threading.Event opcional para cancelar la descarga.
         timeout: presupuesto total de pared en segundos (opcional).
 
@@ -453,8 +510,10 @@ def ensure_ffmpeg(parent=None, progress_callback=None, prefer_full=True,
         # Refrescar manifest si no existe (binario traído manualmente).
         if not os.path.exists(get_manifest_path()):
             write_manifest(_manifest_from_binary(local))
+        # Respetar la elección del usuario (standard vs full) sin redescargar.
+        active = get_active_ffmpeg_path() or local
         _emit(progress_callback, 100, "FFmpeg ready (cached)")
-        return local
+        return active
 
     ensure_runtime_dirs()
     try:
@@ -498,7 +557,8 @@ def ensure_ffmpeg(parent=None, progress_callback=None, prefer_full=True,
     # Escribir manifest con datos de la descarga + huella upstream
     write_manifest(_build_install_manifest(path, "first-download"))
     # ``download_ffmpeg`` ya emite 100%/Ready al terminar; no re-emitimos.
-    return path
+    # Respetar la elección del usuario (standard vs full) si ya hay un binario activo.
+    return get_active_ffmpeg_path() or path
 
 
 def force_redownload(progress_callback=None, parent=None, abort_event=None,

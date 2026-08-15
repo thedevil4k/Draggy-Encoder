@@ -122,7 +122,7 @@ jobs:
           # de que GitHub responda a HEAD de paths que aún no existen.
           # El metainfo es una plantilla con @VERSION@ (como el .spec del RPM):
           # se valida sustituyendo una versión de ejemplo.
-          sed "s/@VERSION@/0.0.0/g" packaging/linux/flatpak-metainfo.xml.in \
+          sed "s/@VERSION@/1/g" packaging/linux/flatpak-metainfo.xml.in \
             > /tmp/flatpak-metainfo-smoke.xml
           appstreamcli validate --pedantic --no-net /tmp/flatpak-metainfo-smoke.xml
           python - <<'PY'
@@ -133,7 +133,7 @@ jobs:
           ) as fh:
               yaml.safe_load(fh)
           PY
-          sed "s/@VERSION@/0.0.0/g" packaging/linux/draggy-encoder.spec.in \
+          sed "s/@VERSION@/1/g" packaging/linux/draggy-encoder.spec.in \
             | grep -q "^Name: draggy-encoder"
 
   build-linux:
@@ -179,7 +179,7 @@ jobs:
         run: |
           set -euo pipefail
           version="${GITHUB_REF_NAME#v}"
-          if [[ "$GITHUB_REF" != refs/tags/v* ]]; then version="0.0.0"; fi
+          if [[ "$GITHUB_REF" != refs/tags/v* ]]; then version="1"; fi
           sed "s/@VERSION@/$version/g" packaging/linux/flatpak-metainfo.xml.in \
             > packaging/linux/flatpak-metainfo.xml
           grep -q "release version=\"$version\"" packaging/linux/flatpak-metainfo.xml
@@ -258,7 +258,7 @@ jobs:
         run: |
           set -euo pipefail
           version="${GITHUB_REF_NAME#v}"
-          if [[ "$GITHUB_REF" != refs/tags/v* ]]; then version="0.0.0"; fi
+          if [[ "$GITHUB_REF" != refs/tags/v* ]]; then version="1"; fi
           tar -czf "DraggyEncoder-Linux-x86_64-${version}.tar.gz" -C dist DraggyEncoder
 
       - name: Create Debian package
@@ -266,7 +266,7 @@ jobs:
         run: |
           set -euo pipefail
           version="${GITHUB_REF_NAME#v}"
-          if [[ "$GITHUB_REF" != refs/tags/v* ]]; then version="0.0.0"; fi
+          if [[ "$GITHUB_REF" != refs/tags/v* ]]; then version="1"; fi
           root=debian-root
           rm -rf "$root"
           mkdir -p "$root/DEBIAN" "$root/opt/draggy-encoder" "$root/usr/bin" "$root/usr/share/applications" "$root/usr/share/icons/hicolor/256x256/apps"
@@ -297,7 +297,7 @@ jobs:
         run: |
           set -euo pipefail
           version="${GITHUB_REF_NAME#v}"
-          if [[ "$GITHUB_REF" != refs/tags/v* ]]; then version="0.0.0"; fi
+          if [[ "$GITHUB_REF" != refs/tags/v* ]]; then version="1"; fi
           rpm_top="$PWD/rpm-root"
           rpm_stage="$PWD/rpm-staging/draggy-encoder-bundle"
           rm -rf "$rpm_top" "$PWD/rpm-staging"
@@ -322,7 +322,7 @@ jobs:
         run: |
           set -euo pipefail
           version="${GITHUB_REF_NAME#v}"
-          if [[ "$GITHUB_REF" != refs/tags/v* ]]; then version="0.0.0"; fi
+          if [[ "$GITHUB_REF" != refs/tags/v* ]]; then version="1"; fi
           appdir=AppDir
           rm -rf "$appdir"
           mkdir -p "$appdir"
@@ -382,7 +382,7 @@ jobs:
         run: |
           set -euo pipefail
           version="${GITHUB_REF_NAME#v}"
-          if [[ "$GITHUB_REF" != refs/tags/v* ]]; then version="0.0.0"; fi
+          if [[ "$GITHUB_REF" != refs/tags/v* ]]; then version="1"; fi
           sign_args=()
           if [[ "${FLATPAK_SIGN:-0}" == "1" ]]; then
             sign_args+=(--gpg-sign="$FLATPAK_GPG_KEY_ID")
@@ -409,7 +409,11 @@ jobs:
           # "$version" daba: Refspec 'app/.../x86_64/<version>' not found).
           # El número de versión vive en el metainfo (<releases>) y en el
           # nombre del .flatpak, no en la rama OSTree.
-          flatpak-builder --user --disable-rofiles-fuse --force-clean --no-debuginfo --default-branch=stable "${sign_args[@]}" --repo=flatpak-repo flatpak-build flatpak-manifest.yml
+          # NOTA: flatpak-builder NO tiene una opción --no-debuginfo. El paso
+          # "Strip debug symbols from the bundle" (anterior) ya elimina los
+          # símbolos de los .so, así que el export .Debug queda vacío sin
+          # necesidad de ningún flag.
+          flatpak-builder --user --disable-rofiles-fuse --force-clean --default-branch=stable "${sign_args[@]}" --repo=flatpak-repo flatpak-build flatpak-manifest.yml
           if [[ "${FLATPAK_SIGN:-0}" == "1" ]]; then
             # Firma el summary del repo para que `flatpak remote-add` sin
             # --no-gpg-verify pueda verificar descargas y updates.
@@ -434,7 +438,7 @@ jobs:
         run: |
           set -euo pipefail
           version="${GITHUB_REF_NAME#v}"
-          if [[ "$GITHUB_REF" != refs/tags/v* ]]; then version="0.0.0"; fi
+          if [[ "$GITHUB_REF" != refs/tags/v* ]]; then version="1"; fi
           bundle="DraggyEncoder-Linux-x86_64-${version}.flatpak"
           test -s "$bundle"
 

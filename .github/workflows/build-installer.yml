@@ -31,6 +31,14 @@ jobs:
           python -m pip install --upgrade pip setuptools wheel
           python -m pip install -r requirements-build.txt
 
+      # Regenera assets/app.ico (multi-resolución) desde assets/Import.png.
+      # Se versiona también, pero regenerarlo aquí garantiza que el EXE y el
+      # instalador usen SIEMPRE el logo actual aunque alguien cambie el PNG.
+      - name: Generate multi-resolution app icon
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: python packaging/windows/make_icon.py
+
       - name: Build EXE with PyInstaller
         run: python -m PyInstaller draggy_encoder.spec --noconfirm --clean
 
@@ -109,7 +117,7 @@ jobs:
 
       - name: Compile installer
         run: |
-          $v = "${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || '0.0.0' }}"
+          $v = "${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || '1' }}"
           if ($v -like "v*") { $v = $v.Substring(1) }
           iscc "/DDRAGGY_VERSION=$v" draggy_encoder.iss
 

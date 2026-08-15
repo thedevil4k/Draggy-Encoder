@@ -607,8 +607,8 @@ def download_ffmpeg_full(progress_callback=None, parent=None, abort_event=None,
                          timeout=None):
     """Download FFmpeg full (with libplacebo) for FSR 3.1 support.
 
-    Downloads from BtbN lgpl-shared build (smaller, includes libplacebo).
-    Falls back to gpl-shared, then johnvansickle.com static build.
+    Downloads from BtbN gpl-shared build (libplacebo + x264/x265 + SVT-AV1).
+    Falls back to lgpl-shared, then johnvansickle.com static build.
 
     ``abort_event`` cancela la descarga; ``timeout`` (segundos) acota el
     tiempo total. Returns the path to the FFmpeg executable or raises
@@ -634,10 +634,10 @@ def download_ffmpeg_full(progress_callback=None, parent=None, abort_event=None,
 
     # Build ordered list of (url, archive_type, label) candidates
     candidates = [
-        (primary_url, archive_type, "primary (BtbN lgpl-shared)"),
+        (primary_url, archive_type, "primary (BtbN gpl-shared)"),
     ]
     if backup_url:
-        candidates.append((backup_url, backup_archive_type, "backup-1 (BtbN gpl-shared)"))
+        candidates.append((backup_url, backup_archive_type, "backup-1 (BtbN lgpl-shared)"))
     if backup_url_2:
         candidates.append((backup_url_2, backup_archive_type_2, "backup-2 (johnvansickle.com)"))
 

@@ -997,6 +997,39 @@ def test_pytorch_install_command_includes_onnx_package():
     # Se instala con --target (store local) y desde el índice de PyTorch.
     assert "--target" in cmd
     assert any("download.pytorch.org" in part for part in cmd)
+    # onnx/onnxscript solo viven en PyPI, así que el comando debe combinar el
+    # índice de PyTorch con PyPI como índice adicional (regresión: "No matching
+    # distribution found for onnx").
+    assert "https://pypi.org/simple" in cmd
+
+
+def test_active_ffmpeg_choice_preference(monkeypatch, tmp_path):
+    """La preferencia ffmpeg_binary elige full/standard y cae a standard
+    si el build full no está instalado."""
+    import src.ffmpeg.manager as m
+
+    std = tmp_path / "ffmpeg.exe"
+    std.write_bytes(b"")
+    full = tmp_path / "ffmpeg-full.exe"
+    store = {"ffmpeg_binary": "standard"}
+
+    monkeypatch.setattr("src.preferences.get", lambda k, d=None: store.get(k, d))
+    monkeypatch.setattr("src.preferences.set", lambda k, v: store.__setitem__(k, v))
+    monkeypatch.setattr(m, "get_local_ffmpeg_path", lambda: str(std))
+    monkeypatch.setattr(m, "get_local_ffmpeg_full_path", lambda: str(full) if full.exists() else str(tmp_path / "missing"))
+
+    # Por defecto: standard.
+    assert m.get_active_ffmpeg_choice() == "standard"
+    assert m.get_active_ffmpeg_path() == str(std)
+
+    # Elegir full sin tenerlo instalado -> efectivo standard (fallback).
+    assert m.set_active_ffmpeg("full") == "standard"
+    assert m.get_active_ffmpeg_path() == str(std)
+
+    # Al instalar el build full, la preferencia 'full' ya surte efecto.
+    full.write_bytes(b"")
+    assert m.get_active_ffmpeg_choice() == "full"
+    assert m.get_active_ffmpeg_path() == str(full)
 
 
 def test_hf_engine_detection_ignores_system_runtime(monkeypatch):
@@ -1787,8 +1820,8 @@ def nvenc_clip():
         ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
         "-f", "lavfi", "-i", "testsrc=duration=1:size=640x360:rate=10",
         "-f", "lavfi", "-i", "sine=frequency=440:duration=1",
-        # The BtbN 'full' build is LGPL-shared (no libx264), but it ships
-        # NVENC, so generate the source clip with NVENC too.
+        # The BtbN 'full' build ships NVENC (and libx264 in the gpl-shared
+        # variant), so generate the source clip with NVENC either way.
         "-c:v", "h264_nvenc", "-c:a", "aac", clip,
     ]
     rc = subprocess.run(cmd, capture_output=True, timeout=60).returncode
@@ -5752,10 +5785,31 @@ def test_build_args_maps_selected_audio_track():
     audio_map_pos = args.index("-map", args.index("-map") + 1)
     assert args[audio_map_pos + 1] == "0:a:2?"
 
+    # -1 conserva TODAS las pistas (``-map 0:a?``).
+    keep_all = build_args("/in.mkv", "/out.mp4", {
+        "codec": "libx264", "bitrate": 1500, "audio": "copy",
+        "audio_stream_index": -1, "format": "mp4",
+    })
+    assert "0:a?" in keep_all
+    assert "0:a:0?" not in keep_all
+
     noaudio = build_args("/in.mkv", "/out.mp4", {
         "codec": "libx264", "bitrate": 1500, "audio": "noaudio",
     })
     assert "0:a:" not in " ".join(noaudio)
+
+
+def test_parse_audio_stream_index():
+    """parse_audio_stream_index normaliza None/válido/-1 e inválido."""
+    from src.ffmpeg.runner import KEEP_ALL_AUDIO, parse_audio_stream_index
+
+    assert parse_audio_stream_index(None) == 0
+    assert parse_audio_stream_index(0) == 0
+    assert parse_audio_stream_index(2) == 2
+    assert parse_audio_stream_index("3") == 3
+    assert parse_audio_stream_index(-1) == KEEP_ALL_AUDIO
+    assert parse_audio_stream_index("-1") == KEEP_ALL_AUDIO
+    assert parse_audio_stream_index("bogus") == 0
 
 
 def test_settings_panel_exposes_selected_audio_track(qapp):
@@ -5769,8 +5823,13 @@ def test_settings_panel_exposes_selected_audio_track(qapp):
         {"audio_index": 1, "codec_name": "opus", "language": "spa", "title": "Español", "channels": 6},
     ])
     assert panel.audio_track_combo.isVisible()
-    assert panel.audio_track_combo.count() == 2
-    panel.audio_track_combo.setCurrentIndex(1)
+    # Ítem 0 = "Keep all audio tracks (2)"; luego las dos pistas.
+    assert panel.audio_track_combo.count() == 3
+    assert panel.audio_track_combo.itemData(0) == -1
+    # Por defecto conserva TODAS las pistas.
+    assert panel.get_settings()["audio_stream_index"] == -1
+    # Elegir una pista concreta sigue funcionando (Español = índice 1).
+    panel.audio_track_combo.setCurrentIndex(2)
     settings = panel.get_settings()
     assert settings["audio_stream_index"] == 1
     assert "Español" in settings["audio_stream_label"]

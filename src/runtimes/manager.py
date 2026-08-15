@@ -502,6 +502,10 @@ def _build_pytorch_command(variant: str) -> list[str]:
     else:  # cuda121
         index_url = "https://download.pytorch.org/whl/cu121"
 
+    # ``--index-url`` apunta SOLO al índice de CUDA/CPU de PyTorch, así que
+    # hay que añadir PyPI como ``--extra-index-url``: ``onnx`` y ``onnxscript``
+    # únicamente existen en PyPI y, sin él, pip falla con
+    # "No matching distribution found for onnx".
     return [
         *_pip_command_prefix(), "install",
         "--isolated", "--no-cache-dir", "--disable-pip-version-check",
@@ -510,6 +514,7 @@ def _build_pytorch_command(variant: str) -> list[str]:
         "--no-warn-script-location",
         "--upgrade",
         "--index-url", index_url,
+        "--extra-index-url", "https://pypi.org/simple",
         "torch", "torchvision", "torchaudio", "onnx", "onnxscript",
     ]
 

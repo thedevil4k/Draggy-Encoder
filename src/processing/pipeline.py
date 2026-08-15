@@ -19,12 +19,14 @@ from src.ai.registry import get_engine_meta
 from src.config import get_codec_entry, get_logs_dir, resolve_codec
 from src.ffmpeg.loudnorm import measure_loudness
 from src.ffmpeg.runner import (
+    KEEP_ALL_AUDIO,
     _build_loudnorm_filter,
     _parse_time_to_seconds,
     build_args,
     extract_frame,
     get_video_info,
     health_check_ffmpeg,
+    parse_audio_stream_index,
     run_ffmpeg,
 )
 from src.ffmpeg.process_supervisor import (
@@ -1704,10 +1706,8 @@ def _encode_audio_parallel(ffmpeg_path, input_path, settings,
     audio_codec = str(settings.get("audio", "copy") or "copy")
     audio_boost = bool(settings.get("audio_boost", False))
     container_format = settings.get("format", "mp4")
-    try:
-        audio_stream_index = max(0, int(settings.get("audio_stream_index", 0)))
-    except (TypeError, ValueError):
-        audio_stream_index = 0
+    audio_stream_index = parse_audio_stream_index(settings.get("audio_stream_index", 0))
+    keep_all = audio_stream_index == KEEP_ALL_AUDIO
     if audio_codec == "noaudio":
         return None
 
@@ -1730,7 +1730,11 @@ def _encode_audio_parallel(ffmpeg_path, input_path, settings,
         audio_codec, loudnorm_meas, audio_boost, container_format,
     )
     enc_a = mux_args[1]
-    if enc_a == "libmp3lame":
+    if keep_all:
+        # Contenedor multi-pista (Matroska audio) para conservar TODAS las
+        # pistas re-codificadas; .mp3/.m4a/.opus no siempre admiten N streams.
+        ext = ".mka"
+    elif enc_a == "libmp3lame":
         ext = ".mp3"
     elif enc_a == "libopus":
         ext = ".opus"
@@ -1760,8 +1764,12 @@ def _encode_audio_parallel(ffmpeg_path, input_path, settings,
             cmd.extend(["-t", str(end_sec - start_sec)])
         elif start_sec is None:
             cmd.extend(["-t", str(end_sec)])
+    if keep_all:
+        audio_map = "0:a?"
+    else:
+        audio_map = f"0:a:{audio_stream_index}?"
     cmd.extend([
-        "-map", f"0:a:{audio_stream_index}?",
+        "-map", audio_map,
         "-vn",
         "-threads", "0",
         "-c:a", enc_a,
@@ -1968,11 +1976,13 @@ def _mux_audio(ffmpeg_path, input_path, output_path, audio_codec="copy",
             tmp_out = output_path + ".mux" + out_ext
             cleanup_path = tmp_out
 
-        try:
-            audio_stream_index = max(0, int(audio_stream_index))
-        except (TypeError, ValueError):
-            audio_stream_index = 0
-        source_audio_map = "1:a:0?" if audio_file else f"1:a:{audio_stream_index}?"
+        audio_stream_index = parse_audio_stream_index(audio_stream_index)
+        if audio_stream_index == KEEP_ALL_AUDIO:
+            source_audio_map = "1:a?"
+        elif audio_file:
+            source_audio_map = "1:a:0?"
+        else:
+            source_audio_map = f"1:a:{audio_stream_index}?"
         cmd = [
         ffmpeg_path,
         "-hide_banner", "-loglevel", "warning",

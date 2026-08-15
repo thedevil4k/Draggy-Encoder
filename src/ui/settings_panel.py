@@ -261,6 +261,12 @@ class SettingsPanel(QWidget):
         previous = self.audio_track_combo.currentData()
         self.audio_track_combo.blockSignals(True)
         self.audio_track_combo.clear()
+        # Con varias pistas ofrecemos conservarlas TODAS (MP4/MKV/MOV admiten
+        # múltiples pistas de audio). data=-1 es el sentinel de "keep all".
+        if len(tracks) >= 2:
+            self.audio_track_combo.addItem(
+                f"Keep all audio tracks ({len(tracks)})", -1
+            )
         for position, track in enumerate(tracks):
             try:
                 audio_index = int(track.get("audio_index", position))
@@ -280,8 +286,14 @@ class SettingsPanel(QWidget):
             if channels:
                 bits.append(f"{channels} ch")
             self.audio_track_combo.addItem(" — ".join(bits), audio_index)
-        target = self.audio_track_combo.findData(previous)
-        self.audio_track_combo.setCurrentIndex(target if target >= 0 else (0 if tracks else -1))
+        if previous is not None:
+            target = self.audio_track_combo.findData(previous)
+        else:
+            # Sin selección previa: con varias pistas conservar TODAS por defecto.
+            target = 0 if len(tracks) >= 2 else (0 if tracks else -1)
+        if target < 0:
+            target = 0 if tracks else -1
+        self.audio_track_combo.setCurrentIndex(target)
         self.audio_track_combo.blockSignals(False)
         visible = bool(tracks)
         self.audio_track_label.setVisible(visible)

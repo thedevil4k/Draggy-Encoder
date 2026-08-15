@@ -33,7 +33,12 @@ from src.ffmpeg.process_supervisor import (
 from datetime import datetime
 
 from src.config import get_bin_dir
-from src.ffmpeg.runner import _parse_time_to_seconds, _run_kwargs
+from src.ffmpeg.runner import (
+    KEEP_ALL_AUDIO,
+    _parse_time_to_seconds,
+    _run_kwargs,
+    parse_audio_stream_index,
+)
 
 
 def _log_dir():
@@ -94,12 +99,12 @@ def measure_loudness(ffmpeg_path, input_path, timeout_seconds=600,
         cmd.extend(["-t", str(end_sec - start_sec)])
     elif end_sec is not None:
         cmd.extend(["-to", str(end_sec)])
-    try:
-        audio_stream_index = max(0, int(audio_stream_index))
-    except (TypeError, ValueError):
-        audio_stream_index = 0
+    audio_stream_index = parse_audio_stream_index(audio_stream_index)
+    # Para "keep all" medimos la PRIMERA pista como referencia del boost;
+    # una única medición no puede mezclar pistas con niveles distintos.
+    map_idx = 0 if audio_stream_index == KEEP_ALL_AUDIO else audio_stream_index
     cmd.extend([
-        "-map", f"0:a:{audio_stream_index}?",
+        "-map", f"0:a:{map_idx}?",
         "-vn",              # sin vídeo: no decodificar la pista más pesada
         "-af", "loudnorm=I=-16:TP=-1.5:LRA=11:print_format=json",
         "-f", "null",

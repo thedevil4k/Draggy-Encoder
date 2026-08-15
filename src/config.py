@@ -232,10 +232,12 @@ RESOLUTIONS = [
     ("480", "480p (SD)"),
 ]
 
-# URLs de descarga de FFmpeg (builds estáticas)
+# URLs de descarga de FFmpeg por defecto (builds estáticas GPL).
+# gyan.dev "release-full" incluye libx264/libx265, SVT-AV1 y libplacebo, así que
+# el build por defecto ya cubre codecs modernos (incl. FSR 3.1) sin el segundo binario.
 FFMPEG_DOWNLOAD_URLS = {
     "Windows": {
-        "url": "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip",
+        "url": "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-full.zip",
         "archive_type": "zip",
     },
     "Linux": {
@@ -244,27 +246,29 @@ FFMPEG_DOWNLOAD_URLS = {
     },
 }
 
-# URLs de descarga de FFmpeg completo con libplacebo (FSR 3.1 support)
-# libplacebo is LGPL so it's included in BOTH gpl and lgpl BtbN variants.
-# Strategy: try smaller lgpl-shared first, then larger gpl-shared, then johnvansickle.com.
+# URLs de descarga del segundo FFmpeg "full" (BtbN master, bleeding-edge) para
+# FSR 3.1. Se instala bajo demanda desde el panel de dependencias, no en el
+# arranque (el build estándar gyan release-full ya trae libplacebo).
+# Strategy: gpl-shared first (libplacebo + x264/x265 + SVT-AV1, codecs completos),
+# then lgpl-shared (libplacebo, sin x264/x265), then johnvansickle.com.
 FFMPEG_FULL_DOWNLOAD_URLS = {
     "Windows": {
-        # Primary: BtbN lgpl-shared ~67 MB (libplacebo is LGPL, so it's included)
-        "url": "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-lgpl-shared.zip",
+        # Primary: BtbN gpl-shared ~76 MB (libplacebo + x264/x265 + SVT-AV1)
+        "url": "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl-shared.zip",
         "archive_type": "zip",
-        # Backup 1: BtbN gpl-shared ~76 MB (full GPL set, libplacebo present)
-        "backup_url": "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl-shared.zip",
+        # Backup 1: BtbN lgpl-shared ~67 MB (libplacebo, sin x264/x265)
+        "backup_url": "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-lgpl-shared.zip",
         "backup_archive_type": "zip",
         # Backup 2: johnvansickle.com static ~42 MB (libplacebo enabled)
         "backup_url_2": "https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz",
         "backup_archive_type_2": "tar.xz",
     },
     "Linux": {
-        # Primary: BtbN lgpl-shared ~52 MB
-        "url": "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-linux64-lgpl-shared.tar.xz",
+        # Primary: BtbN gpl-shared ~57 MB
+        "url": "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-linux64-gpl-shared.tar.xz",
         "archive_type": "tar.xz",
-        # Backup 1: BtbN gpl-shared ~57 MB
-        "backup_url": "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-linux64-gpl-shared.tar.xz",
+        # Backup 1: BtbN lgpl-shared ~52 MB
+        "backup_url": "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-linux64-lgpl-shared.tar.xz",
         "backup_archive_type": "tar.xz",
         # Backup 2: johnvansickle.com static ~42 MB
         "backup_url_2": "https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz",
