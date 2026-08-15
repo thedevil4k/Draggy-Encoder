@@ -382,7 +382,8 @@ jobs:
           fi
           gnupg_home="$RUNNER_TEMP/gnupg"
           rm -rf "$gnupg_home"
-          mkdir -p -m 700 "$gnupg_home"
+          mkdir -p "$gnupg_home"
+          chmod 700 "$gnupg_home"
           printf '%s\n' "$FLATPAK_GPG_PRIVATE_KEY" | gpg --batch --homedir "$gnupg_home" --import
 
           if [[ -n "${FLATPAK_GPG_KEY_ID:-}" ]]; then
@@ -397,9 +398,11 @@ jobs:
           # y en `flatpak install` funciona sin prompt.
           printf '%s:6:\n' "$keyid" | gpg --batch --homedir "$gnupg_home" --import-ownertrust
 
-          echo "FLATPAK_SIGN=1" >> "$GITHUB_ENV"
-          echo "FLATPAK_GPG_KEY_ID=$keyid" >> "$GITHUB_ENV"
-          echo "GNUPGHOME=$gnupg_home" >> "$GITHUB_ENV"
+          {
+            echo "FLATPAK_SIGN=1"
+            echo "FLATPAK_GPG_KEY_ID=$keyid"
+            echo "GNUPGHOME=$gnupg_home"
+          } >> "$GITHUB_ENV"
           echo "Clave de firma Flatpak: $keyid"
 
       - name: Create Flatpak bundle
