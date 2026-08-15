@@ -66,6 +66,15 @@ DRAGGY_ENCODER/
 
 See `requirements.txt` for the full Python dependency list.
 
+### AI runtimes: PyTorch vs ONNX Runtime
+
+- **Converting a `.pth`/`.pt`/`.safetensors` checkpoint to `.onnx` requires
+  PyTorch** — the app uses `torch.onnx.export` to rebuild the model from the
+  checkpoint and export it.
+- **Running an existing `.onnx` model only needs ONNX Runtime.** Models that
+  already ship as `.onnx` (many HuggingFace repos do) don't require PyTorch
+  at all.
+
 ## Portable builds
 
 GitHub Actions publishes these platform-specific artifacts:

@@ -903,15 +903,30 @@ class DependenciesDialog(QDialog):
     def _on_redownload_failed(self, dep_id, msg, progress):
         progress.close()
         self._active_worker = None
-        # Mensaje amigable: el usuario no tiene por qué leer la salida de
-        # pip. Los detalles técnicos quedan en "Mostrar detalles".
+        # El fallo ya viene clasificado (firewall/SSL/proxy/espacio en disco)
+        # por la sonda de conectividad o por el clasificador de pip: su primer
+        # párrafo nombra la causa real. La pista inferior se adapta a esa
+        # causa en lugar de culpar siempre a la conexión. Los detalles
+        # técnicos completos quedan en "Mostrar detalles".
+        lines = str(msg).strip().splitlines()
+        first_block = "\n".join(lines[:3]).strip() if lines else str(msg)
+        low = first_block.lower()
+        if "espacio" in low or "space" in low:
+            hint = "Libera espacio en disco y vuelve a intentarlo."
+        elif "ssl" in low or "certificado" in low:
+            hint = "Revisa los certificados SSL y el proxy de tu red."
+        elif "proxy" in low:
+            hint = "Revisa la configuración del proxy (posible autenticación)."
+        elif "firewall" in low or "red" in low or "conexión" in low or "dns" in low:
+            hint = "Revisa el firewall, la conexión y el DNS, y vuelve a intentarlo."
+        else:
+            hint = "Revisa el motivo indicado arriba y vuelve a intentarlo."
         box = QMessageBox(self)
         box.setIcon(QMessageBox.Icon.Critical)
         box.setWindowTitle("La instalación falló")
         box.setText(
-            f"No se pudo instalar '{dep_id}'.\n\n"
-            "Revisa tu conexión a internet y vuelve a intentarlo. "
-            "Si el problema continúa, cierra la aplicación y vuelve a abrirla."
+            f"No se pudo instalar '{dep_id}'.\n\n{first_block}\n\n"
+            f"{hint}\n\nLos detalles completos están en 'Mostrar detalles'."
         )
         box.setDetailedText(str(msg))
         box.exec()

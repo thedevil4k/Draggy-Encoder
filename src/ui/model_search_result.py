@@ -282,9 +282,17 @@ class ModelSearchResult(QFrame):
             self.btn_convert.setToolTip("FSR is algorithmic — no ONNX conversion needed.")
         elif not installed:
             self.btn_convert.setEnabled(False)
-            self.btn_convert.setToolTip("Install the engine first, then convert to ONNX.")
+            self.btn_convert.setToolTip(
+                "Install the engine first, then convert to ONNX. "
+                "Converting .pth weights requires PyTorch; .onnx models "
+                "only need ONNX Runtime."
+            )
         elif onnx_converted:
             self.btn_convert.setText("Re-convert ONNX")
+            self.btn_convert.setToolTip(
+                "Weights already converted to ONNX. Click to refresh. "
+                "Re-converting requires PyTorch (torch.onnx.export)."
+            )
         elif arch_known and not arch_convertible:
             self.btn_convert.setEnabled(False)
             self.btn_convert.setText("No ONNX")
@@ -295,6 +303,11 @@ class ModelSearchResult(QFrame):
             )
         elif needs_conversion:
             self.btn_convert.setEnabled(True)
+            self.btn_convert.setToolTip(
+                "Convert .pth weights to .onnx with torch.onnx.export. "
+                "Requires PyTorch — models that already ship as .onnx only "
+                "need ONNX Runtime."
+            )
         else:
             # Already has ONNX file
             self.btn_convert.setEnabled(False)

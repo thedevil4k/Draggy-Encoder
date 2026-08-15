@@ -18,12 +18,14 @@ en el arranque de la aplicación (main.py) y también antes de importar
 from __future__ import annotations
 
 import importlib.util
+import json
 import os
 import queue
 import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 
@@ -531,6 +533,365 @@ def _build_onnx_command(variant: str) -> list[str]:
 # Installation
 # ---------------------------------------------------------------------------
 
+
+# ---------------------------------------------------------------------------
+# Connectivity pre-flight (antes de descargar runtimes de IA)
+# ---------------------------------------------------------------------------
+
+# Hosts que pip necesita para instalar los runtimes. La sonda usa HTTPS y el
+# mismo certificado CA que pip (certifi vendido) para medir lo que pip vería
+# de verdad, no el store CA (a menudo ausente) del Python embebido.
+_CONNECTIVITY_HOSTS = (
+    ("download.pytorch.org", "https://download.pytorch.org/whl/cpu/torch/"),
+    ("PyPI", "https://pypi.org/simple/onnxruntime/"),
+)
+
+_PROBE_TIMEOUT_S = 10
+
+# Caché corta de la sonda de conectividad: reinstalaciones seguidas (p. ej.
+# instalar PyTorch y luego ONNX Runtime como dos filas separadas) no deben
+# volver a sondear la red cada vez. Solo se cachea un resultado NO fatal: si
+# hubo un bloqueo inequívoco (DNS/firewall/SSL/proxy) se re-sondea en el
+# siguiente intento, para no penalizar un arreglo rápido de la red.
+_PROBE_CACHE_TTL_S = 5 * 60  # 5 minutos
+_probe_cache: dict = {"ts": 0.0, "report": None}
+_probe_cache_lock = threading.Lock()
+
+
+def clear_connectivity_cache() -> None:
+    """Invalida la caché de la sonda de conectividad (tests y cambios de red)."""
+    with _probe_cache_lock:
+        _probe_cache["ts"] = 0.0
+        _probe_cache["report"] = None
+
+
+_PROBE_SCRIPT = r'''
+import json, os, socket, ssl, urllib.request, urllib.error
+
+hosts = json.loads(os.environ.get("DRAGGY_PROBE_HOSTS", "[]"))
+timeout = float(os.environ.get("DRAGGY_PROBE_TIMEOUT", "10"))
+proxy = (os.environ.get("HTTPS_PROXY") or os.environ.get("HTTP_PROXY") or "")
+
+def _ca_context():
+    # Mirror pip: usa el certifi vendido por pip, que es el CA que pip
+    # realmente confía; el Python embebido no trae su propio CA bundle.
+    try:
+        import pip._vendor.certifi as _c
+        return ssl.create_default_context(cafile=_c.where())
+    except Exception:
+        return ssl.create_default_context()
+
+def _classify(exc):
+    if isinstance(exc, ssl.SSLCertVerificationError):
+        return "ssl"
+    if isinstance(exc, socket.gaierror):
+        return "dns"
+    if isinstance(exc, ConnectionRefusedError):
+        return "refused"
+    if isinstance(exc, (socket.timeout, TimeoutError)):
+        return "timeout"
+    if isinstance(exc, ssl.SSLError):
+        return "ssl"
+    return "unreachable"
+
+out = {}
+for name, url in hosts:
+    try:
+        req = urllib.request.Request(
+            url, headers={"User-Agent": "DraggyEncoder connectivity-probe"})
+        with urllib.request.urlopen(req, timeout=timeout, context=_ca_context()) as resp:
+            out[name] = {"status": "ok", "code": resp.status}
+    except urllib.error.HTTPError as e:
+        out[name] = {"status": "proxy" if e.code == 407 else ("http_%d" % e.code),
+                     "code": e.code}
+    except urllib.error.URLError as e:
+        out[name] = {"status": _classify(e.reason), "detail": str(e.reason)}
+    except Exception as e:
+        out[name] = {"status": _classify(e), "detail": repr(e)}
+
+out["__proxy__"] = proxy
+print(json.dumps(out))
+'''
+
+_HOST_STATUS_ES = {
+    "ok": "accesible",
+    "dns": "no se pudo resolver el dominio (fallo de DNS)",
+    "refused": "conexión rechazada — posible firewall o antivirus bloqueando la salida",
+    "timeout": "tiempo de espera agotado — posible firewall o red muy lenta",
+    "ssl": "certificado SSL no verificado — posible proxy/MITM o reloj del sistema incorrecto",
+    "proxy": "el proxy pidió autenticación (HTTP 407)",
+    "unreachable": "no alcanzable",
+    "unknown": "error desconocido",
+}
+
+
+def _friendly_host_line(name: str, res: dict) -> str:
+    status = res.get("status", "unknown")
+    if status.startswith("http_"):
+        msg = f"el servidor respondió HTTP {status[len('http_'):]}"
+    else:
+        msg = _HOST_STATUS_ES.get(status, "no alcanzable")
+    detail = res.get("detail")
+    line = f"  - {name}: {msg}"
+    if detail and status != "ok":
+        line += f" ({detail})"
+    return line
+
+
+def run_connectivity_probe(timeout: float | None = None,
+                           use_cache: bool = True) -> dict:
+    """Comprueba si el Python que ejecutará pip puede llegar a los servidores
+    de descarga de los runtimes de IA (download.pytorch.org y PyPI).
+
+    Ejecuta una sonda HTTPS con el MISMO intérprete y entorno que usará pip
+    (el Python embebido en el instalador) y clasifica el fallo: DNS, firewall
+    (rechazo/timeout), certificados SSL rotos o proxy con autenticación.
+
+    Devuelve un dict con ``ok``, ``fatal``, ``summary`` (texto legible en
+    español), ``hosts``, ``proxy`` y ``error``. ``fatal=True`` significa un
+    bloqueo inequívoco de la red: la instalación debe abortarse de inmediato
+    con ``summary`` en lugar de esperar el timeout de pip.
+    """
+    timeout = _PROBE_TIMEOUT_S if timeout is None else timeout
+
+    if use_cache:
+        with _probe_cache_lock:
+            cached = _probe_cache.get("report")
+            if cached is not None and time.monotonic() - _probe_cache["ts"] < _PROBE_CACHE_TTL_S:
+                return dict(cached)
+
+    report: dict = {
+        "ok": False,
+        "fatal": False,
+        "summary": "",
+        "hosts": {},
+        "proxy": "",
+        "error": None,
+    }
+
+    try:
+        python = _pip_python()
+    except RuntimeError as exc:
+        report["fatal"] = True
+        report["error"] = str(exc)
+        report["summary"] = str(exc)
+        return report
+
+    env = _isolated_pip_env()
+    env["DRAGGY_PROBE_HOSTS"] = json.dumps(
+        [[name, url] for name, url in _CONNECTIVITY_HOSTS]
+    )
+    env["DRAGGY_PROBE_TIMEOUT"] = str(timeout)
+    env["PYTHONIOENCODING"] = "utf-8"
+
+    try:
+        proc = subprocess.run(
+            [python, "-I", "-c", _PROBE_SCRIPT],
+            capture_output=True, text=True, env=env,
+            encoding="utf-8", errors="replace",
+            timeout=timeout * len(_CONNECTIVITY_HOSTS) + 20,
+        )
+    except subprocess.TimeoutExpired:
+        report["fatal"] = True
+        report["error"] = "La sonda de red no respondió (timeout)."
+        report["summary"] = report["error"]
+        return report
+    except Exception as exc:
+        report["fatal"] = True
+        report["error"] = f"No se pudo ejecutar la sonda de red: {exc}"
+        report["summary"] = report["error"]
+        return report
+
+    if proc.returncode != 0:
+        stderr = (proc.stderr or "").strip()
+        report["fatal"] = True
+        report["error"] = (
+            "La sonda de red no pudo ejecutarse en el Python embebido"
+            + (f": {stderr}" if stderr else "")
+        )
+        report["summary"] = report["error"]
+        return report
+
+    try:
+        raw = json.loads(proc.stdout or "{}")
+    except json.JSONDecodeError:
+        report["fatal"] = True
+        report["error"] = "La sonda de red devolvió una respuesta ilegible."
+        report["summary"] = report["error"]
+        return report
+
+    report["proxy"] = raw.pop("__proxy__", "") or ""
+    report["hosts"] = raw
+
+    statuses = [h.get("status", "unknown") for h in raw.values()]
+    report["ok"] = "ok" in statuses
+
+    # Bloqueo inequívoco: ningún host alcanzable y al menos uno falla de forma
+    # definitiva (DNS, rechazo, SSL o proxy). Un simple timeout se considera
+    # transitorio y no aborta: pip tiene sus propios reintentos.
+    definitive = any(s in ("dns", "refused", "ssl", "proxy") for s in statuses)
+    report["fatal"] = (not report["ok"]) and definitive
+
+    if report["fatal"]:
+        lines = [
+            "No se pudo contactar con los servidores de descarga de los "
+            "runtimes de IA (posible firewall, proxy o certificados SSL):",
+        ]
+    elif report["ok"]:
+        lines = ["Red verificada: los servidores de descarga son accesibles."]
+    else:
+        lines = [
+            "La sonda de red no pudo confirmar todos los servidores de "
+            "descarga (se continúa con la instalación):",
+        ]
+    for name, _url in _CONNECTIVITY_HOSTS:
+        res = raw.get(name)
+        if res is not None:
+            lines.append(_friendly_host_line(name, res))
+    if report["proxy"]:
+        lines.append(f"  - Proxy detectado: {report['proxy']}")
+    report["summary"] = "\n".join(lines)
+
+    if use_cache and not report["fatal"]:
+        with _probe_cache_lock:
+            _probe_cache["ts"] = time.monotonic()
+            _probe_cache["report"] = dict(report)
+    return report
+
+
+def _preflight_connectivity() -> dict:
+    """Aborta rápido con un mensaje claro si la red bloquea la descarga."""
+    report = run_connectivity_probe()
+    if report["fatal"]:
+        raise RuntimeError(report["summary"])
+    return report
+
+
+# ---------------------------------------------------------------------------
+# Disk space pre-flight (antes de descargar runtimes de IA)
+# ---------------------------------------------------------------------------
+
+
+def _required_disk_bytes(kind: str, variant: str) -> tuple[int, int]:
+    """Estimación conservadora de disco en bytes: ``(instalado, descarga)``.
+
+    ``kind`` es "pytorch", "onnxruntime" o "all"; ``variant`` es
+    cpu/cudaXXX. Los wheels CUDA de torch pesan ~2.5 GB instalados (más la
+    descarga comprimida), frente a ~400 MB en CPU; ONNX Runtime es mucho más
+    ligero. Se incluye margen para torchvision/torchaudio/onnx y futuros
+    updates, de modo que el aviso dispare ANTES de que pip falle a mitad de
+    una descarga de gigabytes.
+    """
+    is_cuda = variant != "cpu"
+    if kind == "pytorch":
+        if is_cuda:
+            return (4_500_000_000, 3_000_000_000)
+        return (400_000_000, 250_000_000)
+    if kind == "onnxruntime":
+        if is_cuda:
+            return (400_000_000, 200_000_000)
+        return (150_000_000, 60_000_000)
+    # "all": suma de ambos paquetes.
+    pt = _required_disk_bytes("pytorch", variant)
+    onx = _required_disk_bytes("onnxruntime", variant)
+    return (pt[0] + onx[0], pt[1] + onx[1])
+
+
+def _existing_ancestor(path: str) -> str:
+    """Sube hasta el ancestro que existe (``shutil.disk_usage`` lo exige)."""
+    candidate = os.path.abspath(path)
+    while candidate and not os.path.isdir(candidate):
+        parent = os.path.dirname(candidate)
+        if parent == candidate:
+            break
+        candidate = parent
+    return candidate or os.path.abspath(os.sep)
+
+
+def _free_bytes(path: str) -> int:
+    """Bytes libres en la unidad que contiene ``path``; -1 si no se mide."""
+    try:
+        return shutil.disk_usage(_existing_ancestor(path)).free
+    except OSError:
+        return -1
+
+
+def _device_id(path: str) -> str:
+    """Identificador del dispositivo de ``path`` ('' si no se mide)."""
+    try:
+        return str(os.stat(_existing_ancestor(path)).st_dev)
+    except OSError:
+        return ""
+
+
+def _human_size(num: float) -> str:
+    gb = 1024 ** 3
+    mb = 1024 ** 2
+    if num >= gb:
+        return f"{num / gb:.1f} GB"
+    if num >= mb:
+        return f"{num / mb:.0f} MB"
+    return f"{int(num)} bytes"
+
+
+def _check_disk_space(kind: str, variant: str) -> None:
+    """Aborta ANTES de descargar si no hay espacio libre suficiente.
+
+    El umbral depende de la variante (CPU/CUDA). Revisa la unidad del store
+    de instalación (``RUNTIME_MODULES_DIR``) y la de la carpeta temporal de
+    descargas (``tempfile.gettempdir()``). Si ambas son la misma unidad (el
+    caso habitual en Windows con un solo disco), exige la SUMA de descarga +
+    instalación, porque pip pica ambas a la vez en el pico.
+
+    Si no se puede medir el espacio (``-1``), no se aborta: pip ya reportará
+    el error de disco si de verdad falta.
+    """
+    installed, download = _required_disk_bytes(kind, variant)
+
+    target_dir = RUNTIME_MODULES_DIR
+    tmp_dir = tempfile.gettempdir()
+
+    target_free = _free_bytes(target_dir)
+    tmp_free = _free_bytes(tmp_dir)
+    target_dev = _device_id(target_dir)
+    tmp_dev = _device_id(tmp_dir)
+    same_device = bool(target_dev) and target_dev == tmp_dev
+
+    problems: list[str] = []
+    if same_device:
+        free = target_free if target_free >= 0 else tmp_free
+        need = installed + download
+        if free >= 0 and free < need:
+            problems.append(
+                f"  - Espacio libre en {target_dir}: {_human_size(free)} "
+                f"(se necesitan ~{_human_size(need)} para descarga + instalación)."
+            )
+    else:
+        if 0 <= target_free < installed:
+            problems.append(
+                f"  - Carpeta de instalación ({target_dir}): "
+                f"{_human_size(target_free)} libres, "
+                f"se necesitan ~{_human_size(installed)}."
+            )
+        if 0 <= tmp_free < download:
+            problems.append(
+                f"  - Carpeta temporal de descargas ({tmp_dir}): "
+                f"{_human_size(tmp_free)} libres, "
+                f"se necesitan ~{_human_size(download)}."
+            )
+
+    if not problems:
+        return
+
+    label = "CUDA" if variant != "cpu" else "CPU"
+    raise RuntimeError(
+        "No hay espacio libre en disco para instalar los runtimes de IA "
+        f"(variante {label}):\n\n"
+        + "\n".join(problems)
+        + "\n\nLibera espacio en disco y vuelve a intentarlo."
+    )
+
+
 # Expresiones para traducir la salida cruda de pip a fases amigables para el
 # usuario. El usuario final NO debe ver líneas de pip ni términos técnicos.
 _DL_FRACTION_RE = re.compile(
@@ -593,6 +954,55 @@ def _stop_process(proc) -> None:
         proc.wait(timeout=2)
     except Exception:
         pass
+
+
+# Categorías de fallo de pip traducidas a causas legibles. La sonda de
+# conectividad cubre "red caída" ANTES de instalar; aquí se clasifica lo que
+# pip reporta cuando la red funciona pero la instalación falla por otro
+# motivo (espacio en disco, SSL, proxy, versión incompatible...).
+_PIP_FAILURE_TITLES = {
+    "disk_space": "No hay espacio libre en disco para instalar los runtimes",
+    "ssl": "Fallo de certificados SSL durante la descarga (posible proxy/MITM o reloj del sistema incorrecto)",
+    "network": "Problema de red durante la descarga (firewall, caída de conexión o DNS)",
+    "proxy": "El proxy bloqueó la descarga (posible autenticación requerida)",
+    "no_version": "No se encontró un wheel compatible para tu versión de Python/plataforma (o el índice no es accesible)",
+    "pip": "pip falló al instalar los runtimes",
+}
+
+
+def _classify_pip_failure(text: str) -> str:
+    """Clasifica la salida cruda de pip en una categoría legible."""
+    low = (text or "").lower()
+    if any(s in low for s in (
+            "no space left", "errno 28", "not enough space",
+            "disk full", "enospc", "no queda espacio",
+    )):
+        return "disk_space"
+    if any(s in low for s in (
+            "certificate_verify_failed", "certificate verify failed",
+            "sslcertverificationerror", "sslerror", "ssl:", "ssl3_",
+            "ssl connection", "tls/ssl", "tlsv1", "handshake failure",
+            "unable to get local issuer",
+    )):
+        return "ssl"
+    if any(s in low for s in (
+            "407 ", "proxyerror", "proxy authentication",
+            "tunnel connection failed", "cannot connect to proxy",
+    )):
+        return "proxy"
+    if any(s in low for s in (
+            "connection refused", "timed out", "timeout", "getaddrinfo",
+            "name or service not known", "temporary failure in name resolution",
+            "connection reset", "failed to establish a new connection",
+            "network is unreachable", "no route to host", "connection aborted",
+    )):
+        return "network"
+    if any(s in low for s in (
+            "no matching distribution", "could not find a version",
+            "no versions available", "not a supported wheel",
+    )):
+        return "no_version"
+    return "pip"
 
 
 def _run_pip(cmd: list[str], progress_callback, start_pct: int, end_pct: int,
@@ -731,10 +1141,30 @@ def _run_pip(cmd: list[str], progress_callback, start_pct: int, end_pct: int,
         )
     if ret != 0:
         detail = "\n".join(tail) or "(no output)"
-        raise RuntimeError(f"pip exited with code {ret}\n\n{detail}")
+        category = _classify_pip_failure(detail)
+        raise RuntimeError(
+            f"{_PIP_FAILURE_TITLES[category]}\n\n"
+            f"pip exited with code {ret}.\n\n{detail}"
+        )
 
     if progress_callback:
         progress_callback(end_pct, message)
+
+
+def _run_pip_checked(report: dict, cmd, progress_callback, start_pct: int,
+                     end_pct: int, message: str, abort_event=None,
+                     timeout: float | None = None):
+    """Igual que ``_run_pip`` pero, si pip falla, adjunta el resultado de la
+    sonda de conectividad para distinguir 'red caída' de 'problema de pip'."""
+    try:
+        _run_pip(
+            cmd, progress_callback, start_pct=start_pct, end_pct=end_pct,
+            message=message, abort_event=abort_event, timeout=timeout,
+        )
+    except RuntimeError as exc:
+        if str(exc) == "cancelled by user":
+            raise
+        raise RuntimeError(f"{exc}\n\n{report['summary']}") from exc
 
 
 def _raise_unsupported_python() -> None:
@@ -764,12 +1194,15 @@ def install_pytorch(
     """
     if not _is_python_version_supported():
         _raise_unsupported_python()
+    report = _preflight_connectivity()
     os.makedirs(RUNTIME_MODULES_DIR, exist_ok=True)
     # Purga previa: si el store tiene wheels de otra versión de Python
     # (cp314 vs cp311), quitarlos para que pip resuelva limpio.
     _purge_foreign_version_wheels()
     used_variant = _resolve_variant(variant)
-    _run_pip(
+    _check_disk_space("pytorch", used_variant)
+    _run_pip_checked(
+        report,
         _build_pytorch_command(used_variant),
         progress_callback,
         start_pct=5,
@@ -807,10 +1240,13 @@ def install_onnxruntime(
     """
     if not _is_python_version_supported():
         _raise_unsupported_python()
+    report = _preflight_connectivity()
     os.makedirs(RUNTIME_MODULES_DIR, exist_ok=True)
     _purge_foreign_version_wheels()
     used_variant = _resolve_variant(variant)
-    _run_pip(
+    _check_disk_space("onnxruntime", used_variant)
+    _run_pip_checked(
+        report,
         _build_onnx_command(used_variant),
         progress_callback,
         start_pct=5,
@@ -852,13 +1288,19 @@ def install_runtimes(
     if not _is_python_version_supported():
         _raise_unsupported_python()
 
+    report = _preflight_connectivity()
+
     os.makedirs(RUNTIME_MODULES_DIR, exist_ok=True)
     _purge_foreign_version_wheels()
 
     used_variant = _resolve_variant(variant)
 
+    # Umbral combinado: el pico de disco lo marcan los wheels CUDA de torch.
+    _check_disk_space("all", used_variant)
+
     # 1. PyTorch (la parte más grande)
-    _run_pip(
+    _run_pip_checked(
+        report,
         _build_pytorch_command(used_variant),
         progress_callback,
         start_pct=5,
@@ -869,7 +1311,8 @@ def install_runtimes(
     )
 
     # 2. ONNX Runtime
-    _run_pip(
+    _run_pip_checked(
+        report,
         _build_onnx_command(used_variant),
         progress_callback,
         start_pct=86,

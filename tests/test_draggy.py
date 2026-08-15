@@ -1133,6 +1133,243 @@ def test_run_pip_times_out_with_wall_clock(monkeypatch):
         )
 
 
+def test_connectivity_probe_classifies_network_failures(monkeypatch):
+    """The pre-install probe must categorize firewall/DNS/SSL/proxy failures
+    and mark them fatal, while timeouts and partial failures stay non-fatal."""
+    import json
+    import types
+    import src.runtimes.manager as rm
+
+    rm.clear_connectivity_cache()
+
+    def _fake_run(stdout: str):
+        def run(*a, **k):
+            return types.SimpleNamespace(returncode=0, stdout=stdout, stderr="")
+        return run
+
+    cases = {
+        "all-ok": ({"download.pytorch.org": {"status": "ok", "code": 200},
+                     "PyPI": {"status": "ok", "code": 200}, "__proxy__": ""}, False),
+        "dns": ({"download.pytorch.org": {"status": "dns"},
+                 "PyPI": {"status": "dns"}, "__proxy__": ""}, True),
+        "refused": ({"download.pytorch.org": {"status": "refused"},
+                     "PyPI": {"status": "refused"}, "__proxy__": ""}, True),
+        "ssl": ({"download.pytorch.org": {"status": "ssl",
+                                           "detail": "CERTIFICATE_VERIFY_FAILED"},
+                 "PyPI": {"status": "ssl"}, "__proxy__": ""}, True),
+        "proxy": ({"download.pytorch.org": {"status": "proxy", "code": 407},
+                   "PyPI": {"status": "proxy", "code": 407},
+                   "__proxy__": "http://p:8080"}, True),
+        "timeout": ({"download.pytorch.org": {"status": "timeout"},
+                     "PyPI": {"status": "ok", "code": 200}, "__proxy__": ""}, False),
+    }
+
+    for name, (payload, expect_fatal) in cases.items():
+        monkeypatch.setattr(rm.subprocess, "run", _fake_run(json.dumps(payload)))
+        report = rm.run_connectivity_probe(timeout=1, use_cache=False)
+        assert report["fatal"] is expect_fatal, (name, report)
+        assert report["summary"], name
+
+    # Definitive block must fail fast with a specific hint.
+    rm.clear_connectivity_cache()
+    monkeypatch.setattr(rm.subprocess, "run",
+                        _fake_run(json.dumps(cases["refused"][0])))
+    with pytest.raises(RuntimeError, match="firewall"):
+        rm._preflight_connectivity()
+
+    # All reachable → no exception.
+    rm.clear_connectivity_cache()
+    monkeypatch.setattr(rm.subprocess, "run",
+                        _fake_run(json.dumps(cases["all-ok"][0])))
+    assert rm._preflight_connectivity()["ok"] is True
+
+
+def test_connectivity_probe_cache_skips_reprobe(monkeypatch):
+    """A non-fatal probe result is cached for a few minutes so consecutive
+    runtime installs don't re-test the network; fatal results are NOT cached
+    (a fixed network must not stay blocked by a stale cache)."""
+    import json
+    import types
+    import src.runtimes.manager as rm
+
+    def _resp(status):
+        code = 200 if status == "ok" else None
+        payload = {
+            "download.pytorch.org": {"status": status, "code": code},
+            "PyPI": {"status": status, "code": code},
+            "__proxy__": "",
+        }
+        return types.SimpleNamespace(
+            returncode=0, stdout=json.dumps(payload), stderr="")
+
+    rm.clear_connectivity_cache()
+    calls = {"n": 0}
+
+    def _counting(status):
+        def run(*a, **k):
+            calls["n"] += 1
+            return _resp(status)
+        return run
+
+    monkeypatch.setattr(rm.subprocess, "run", _counting("ok"))
+    first = rm.run_connectivity_probe(timeout=1)
+    second = rm.run_connectivity_probe(timeout=1)
+    assert first["ok"] and second["ok"]
+    assert calls["n"] == 1, calls  # second call served from cache
+
+    # Fatal results must NOT be cached.
+    rm.clear_connectivity_cache()
+    monkeypatch.setattr(rm.subprocess, "run", lambda *a, **k: _resp("refused"))
+    assert rm.run_connectivity_probe(timeout=1)["fatal"] is True
+
+    calls["n"] = 0
+    monkeypatch.setattr(rm.subprocess, "run", _counting("ok"))
+    assert rm.run_connectivity_probe(timeout=1)["ok"] is True
+    assert calls["n"] == 1, calls  # fatal was not cached → subprocess ran again
+
+    # clear_connectivity_cache invalidates an otherwise-fresh entry.
+    rm.clear_connectivity_cache()
+    calls["n"] = 0
+    rm.run_connectivity_probe(timeout=1)
+    assert calls["n"] == 1
+
+
+def test_install_pytorch_fails_fast_on_blocked_network(monkeypatch):
+    """A fatal connectivity probe must abort install_pytorch BEFORE pip runs,
+    so the user gets the firewall/SSL diagnosis instead of a long hang."""
+    import src.runtimes.manager as rm
+
+    monkeypatch.setattr(rm, "_is_python_version_supported", lambda: True)
+
+    def _fail(*a, **k):
+        raise RuntimeError("No se pudo contactar con los servidores (firewall/SSL)")
+    monkeypatch.setattr(rm, "_preflight_connectivity", _fail)
+
+    pip_called = {"v": False}
+    monkeypatch.setattr(rm, "_run_pip", lambda *a, **k: pip_called.__setitem__("v", True))
+
+    with pytest.raises(RuntimeError, match="firewall/SSL"):
+        rm.install_pytorch(variant="cpu", progress_callback=None)
+    assert pip_called["v"] is False
+
+
+def test_classify_pip_failure_categories():
+    """pip's raw output must map to the real cause (disk/SSL/proxy/network/version)
+    so the install dialog can stop blaming the internet for everything."""
+    from src.runtimes.manager import _classify_pip_failure
+
+    assert _classify_pip_failure(
+        "OSError: [Errno 28] No space left on device") == "disk_space"
+    assert _classify_pip_failure(
+        "ERROR: Could not install packages due to an OSError: [Errno 28] "
+        "No space left on device") == "disk_space"
+    assert _classify_pip_failure(
+        "SSLError: certificate verify failed: unable to get local issuer "
+        "certificate") == "ssl"
+    assert _classify_pip_failure(
+        "Could not fetch URL ... TLS/SSL connection has been closed") == "ssl"
+    assert _classify_pip_failure(
+        "Retrying after connection broken by 'ProxyError('Cannot connect to "
+        "proxy.')'") == "proxy"
+    assert _classify_pip_failure("407 Proxy Authentication Required") == "proxy"
+    assert _classify_pip_failure("Connection refused") == "network"
+    assert _classify_pip_failure("ReadTimeoutError: timed out") == "network"
+    assert _classify_pip_failure(
+        "Could not find a version that satisfies the requirement torch "
+        "(from versions: none)") == "no_version"
+    assert _classify_pip_failure("No matching distribution found for torch") == "no_version"
+    assert _classify_pip_failure("Some totally unexpected failure") == "pip"
+
+
+def test_run_pip_checked_appends_probe_summary(monkeypatch):
+    """When the network probe passed but pip still fails, the error must say
+    so (pip problem), not blame the internet; cancellations stay untouched."""
+    import src.runtimes.manager as rm
+
+    def _pip_fail(*a, **k):
+        raise RuntimeError("pip falló: X")
+    monkeypatch.setattr(rm, "_run_pip", _pip_fail)
+
+    report = {"summary": "Red verificada: los servidores de descarga son accesibles."}
+    with pytest.raises(RuntimeError) as exc:
+        rm._run_pip_checked(report, ["pip"], None, 0, 100, "install")
+    assert "pip falló: X" in str(exc.value)
+    assert "Red verificada" in str(exc.value)
+
+    def _pip_cancel(*a, **k):
+        raise RuntimeError("cancelled by user")
+    monkeypatch.setattr(rm, "_run_pip", _pip_cancel)
+    with pytest.raises(RuntimeError, match="cancelled by user"):
+        rm._run_pip_checked(report, ["pip"], None, 0, 100, "install")
+
+
+def test_required_disk_bytes_scale_with_variant():
+    """CUDA wheels need far more disk than CPU; onnxruntime is the light one."""
+    from src.runtimes.manager import _required_disk_bytes
+
+    pt_cpu = _required_disk_bytes("pytorch", "cpu")
+    pt_cuda = _required_disk_bytes("pytorch", "cuda126")
+    onx_cpu = _required_disk_bytes("onnxruntime", "cpu")
+
+    assert pt_cuda[0] > pt_cpu[0] and pt_cuda[1] > pt_cpu[1]
+    assert onx_cpu[0] < pt_cpu[0]
+    # "all" sums both packages.
+    all_cpu = _required_disk_bytes("all", "cpu")
+    assert all_cpu[0] == pt_cpu[0] + onx_cpu[0]
+    assert all_cpu[1] == pt_cpu[1] + onx_cpu[1]
+
+
+def test_check_disk_space_passes_on_healthy_disk(monkeypatch):
+    """Plenty of free space must NOT abort the install."""
+    import src.runtimes.manager as rm
+
+    monkeypatch.setattr(rm, "_free_bytes", lambda p: 100 * 1024**3)
+    monkeypatch.setattr(rm, "_device_id", lambda p: "same")
+    rm._check_disk_space("pytorch", "cpu")
+    rm._check_disk_space("all", "cuda126")
+
+
+def test_check_disk_space_aborts_when_disk_full(monkeypatch):
+    """A full disk must raise BEFORE pip runs, naming the variant and cause."""
+    import src.runtimes.manager as rm
+
+    monkeypatch.setattr(rm, "_free_bytes", lambda p: 1)
+    monkeypatch.setattr(rm, "_device_id", lambda p: "same")
+    with pytest.raises(RuntimeError) as exc:
+        rm._check_disk_space("pytorch", "cuda126")
+    msg = str(exc.value)
+    assert "espacio" in msg.lower()
+    assert "CUDA" in msg
+
+
+def test_check_disk_space_unmeasurable_does_not_block(monkeypatch):
+    """If disk usage can't be measured (-1), don't block; pip reports later."""
+    import src.runtimes.manager as rm
+
+    monkeypatch.setattr(rm, "_free_bytes", lambda p: -1)
+    monkeypatch.setattr(rm, "_device_id", lambda p: "")
+    rm._check_disk_space("pytorch", "cpu")  # no raise
+
+
+def test_install_pytorch_checks_disk_before_pip(monkeypatch):
+    """The disk preflight runs before pip: on a full disk pip must not start."""
+    import src.runtimes.manager as rm
+
+    monkeypatch.setattr(rm, "_is_python_version_supported", lambda: True)
+    monkeypatch.setattr(rm, "_preflight_connectivity", lambda: {"summary": "ok"})
+    monkeypatch.setattr(rm, "_resolve_variant", lambda v: "cuda126")
+    monkeypatch.setattr(rm, "_free_bytes", lambda p: 1)
+    monkeypatch.setattr(rm, "_device_id", lambda p: "same")
+
+    pip_called = {"v": False}
+    monkeypatch.setattr(rm, "_run_pip_checked",
+                        lambda *a, **k: pip_called.__setitem__("v", True))
+
+    with pytest.raises(RuntimeError, match="espacio"):
+        rm.install_pytorch(variant="auto", progress_callback=None)
+    assert pip_called["v"] is False
+
+
 def test_download_file_aborts_and_removes_partial(tmp_path, monkeypatch):
     """Single-stream download must honor abort_event and clean up the
     partial file instead of leaving a corrupt archive behind."""

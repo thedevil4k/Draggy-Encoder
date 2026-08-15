@@ -113,7 +113,9 @@ class EnginesTab(QWidget):
             "AI engines are optional building blocks. 'Add Engine' clones the "
             "weights from HuggingFace into bin/models/<category>/. Pick an "
             "installed engine directly from the workflow nodes. 'Convert to "
-            "ONNX' prepares the weights for the onnxruntime backend."
+            "ONNX' prepares the weights for the onnxruntime backend. "
+            "Converting .pth weights requires PyTorch — models that already "
+            "ship as .onnx only need ONNX Runtime."
         )
         intro.setStyleSheet("color: #a0a0b0; font-size: 11px;")
         intro.setWordWrap(True)

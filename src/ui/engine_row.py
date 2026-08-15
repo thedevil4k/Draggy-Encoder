@@ -451,7 +451,11 @@ class EngineRow(QFrame):
         elif not installed:
             self.btn_convert.setEnabled(False)
             self.btn_convert.setText("Convert to ONNX")
-            self.btn_convert.setToolTip("Install the engine first, then convert to ONNX.")
+            self.btn_convert.setToolTip(
+                "Install the engine first, then convert to ONNX. "
+                "Converting .pth weights requires PyTorch; .onnx models "
+                "only need ONNX Runtime."
+            )
         elif is_fsr:
             self.btn_convert.setEnabled(False)
             self.btn_convert.setText("N/A (built-in)")
@@ -459,7 +463,10 @@ class EngineRow(QFrame):
         elif converted:
             self.btn_convert.setEnabled(True)
             self.btn_convert.setText("Re-convert ONNX")
-            self.btn_convert.setToolTip("Weights already converted to ONNX. Click to refresh.")
+            self.btn_convert.setToolTip(
+                "Weights already converted to ONNX. Click to refresh. "
+                "Re-converting requires PyTorch (torch.onnx.export)."
+            )
         elif arch_known and not arch_convertible:
             self.btn_convert.setEnabled(False)
             self.btn_convert.setText("No ONNX")
@@ -467,6 +474,14 @@ class EngineRow(QFrame):
                 f"Architecture '{arch}' cannot be exported to ONNX: only "
                 "Real-ESRGAN (RRDB/SRVGG), Real-CUGAN and OmniSR weights "
                 "are supported. The render will use PyTorch instead."
+            )
+        else:
+            # Convertible + installed + not yet converted: the main path.
+            self.btn_convert.setEnabled(True)
+            self.btn_convert.setToolTip(
+                "Convert .pth weights to .onnx with torch.onnx.export. "
+                "Requires PyTorch — models that already ship as .onnx only "
+                "need ONNX Runtime."
             )
         self.btn_convert.clicked.connect(self._on_convert_clicked)
         right.addWidget(self.btn_convert)
