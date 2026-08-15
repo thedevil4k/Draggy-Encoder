@@ -29,10 +29,28 @@ jobs:
       contents: read
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
+
+      # actionlint valida la sintaxis YAML, las expresiones ${{ }} y el shell
+      # de cada bloque run:. Falla aquí (en segundos) en vez de en el build
+      # largo de PyInstaller + flatpak-builder. Binario de Go autocontenido,
+      # sin dependencias del sistema.
+      - name: Lint workflows with actionlint
+        shell: bash
+        run: |
+          set -euo pipefail
+          al_dir="$RUNNER_TEMP/actionlint"
+          mkdir -p "$al_dir"
+          curl -fsSL --retry 3 \
+            https://github.com/rhysd/actionlint/releases/download/v1.7.12/actionlint_1.7.12_linux_amd64.tar.gz \
+            -o "$al_dir/actionlint.tar.gz"
+          tar -xzf "$al_dir/actionlint.tar.gz" -C "$al_dir"
+          # Sin argumentos descubre y revisa .github/workflows/*.{yml,yaml}
+          # automáticamente (pasar un directorio no es válido: se lee como fichero).
+          "$al_dir/actionlint"
 
       - name: Set up Python 3.13
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: "3.13"
 
@@ -142,10 +160,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Set up Python 3.13
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: "3.13"
 
@@ -195,7 +213,10 @@ jobs:
           set -euo pipefail
           api='https://api.github.com/repos/indygreg/python-build-standalone/releases/latest'
           url="$(curl -fsSL "$api" | jq -r '.assets[].browser_download_url | select(test("cpython-3\\.13\\..*x86_64-unknown-linux-gnu-install_only\\.tar\\.gz$"))' | head -n 1)"
-          test -n "$url"
+          if [ -z "$url" ]; then
+            echo "No se encontró un Python standalone 3.13 x86_64 en python-build-standalone" >&2
+            exit 1
+          fi
           mkdir -p dist/DraggyEncoder/runtime-python
           curl -fL --retry 3 "$url" -o /tmp/python-standalone.tar.gz
           tar -xzf /tmp/python-standalone.tar.gz -C dist/DraggyEncoder/runtime-python --strip-components=1
@@ -314,7 +335,11 @@ jobs:
           sed "s/@VERSION@/$version/g" packaging/linux/draggy-encoder.spec.in > "$rpm_top/SPECS/draggy-encoder.spec"
           rpmbuild --define "_topdir $rpm_top" -bb "$rpm_top/SPECS/draggy-encoder.spec"
           rpm_file="$(find "$rpm_top/RPMS" -type f -name '*.rpm' -print -quit)"
-          test -n "$rpm_file"
+          if [ -z "$rpm_file" ]; then
+            echo "rpmbuild no generó ningún .rpm. Contenido de $rpm_top:" >&2
+            find "$rpm_top" -type f | sed 's/^/  /' >&2 || true
+            exit 1
+          fi
           cp "$rpm_file" "DraggyEncoder-Linux-x86_64-${version}.rpm"
 
       - name: Create AppImage
@@ -476,12 +501,16 @@ jobs:
         run: touch flatpak-repo/.nojekyll
 
       - name: Upload Flatpak repository to Pages
-        uses: actions/upload-pages-artifact@v3
+        uses: actions/upload-pages-artifact@v5
         with:
           path: flatpak-repo
+          # upload-pages-artifact@v5 excluye los dotfiles por defecto;
+          # sin .nojekyll GitHub Pages procesaría el repo con Jekyll y
+          # rompería la estructura del repo Flatpak (refs/objects/summary).
+          include-hidden-files: true
 
       - name: Upload Linux packages
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: DraggyEncoder-Linux-packages
           path: |
@@ -495,7 +524,7 @@ jobs:
 
       - name: Attach Linux packages to release
         if: startsWith(github.ref, 'refs/tags/v')
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: |
             DraggyEncoder-Linux-x86_64-*.tar.gz
@@ -509,7 +538,7 @@ jobs:
       # además de en el repo OSTree de Pages.
       - name: Attach Flatpak GPG signing key to release
         if: startsWith(github.ref, 'refs/tags/v') && env.FLATPAK_SIGN == '1'
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: draggy-encoder.gpg
 
@@ -521,7 +550,7 @@ jobs:
       contents: read
     steps:
       - name: Download Linux packages artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           name: DraggyEncoder-Linux-packages
           path: artifacts
@@ -536,8 +565,15 @@ jobs:
         run: |
           set -euo pipefail
           deb="$(find artifacts -type f -name '*.deb' -print -quit)"
-          test -n "$deb"
-          sudo apt-get install -y "$deb"
+          if [ -z "$deb" ]; then
+            echo "No .deb found in artifacts/. Contents:" >&2
+            ls -laR artifacts || true
+            exit 1
+          fi
+          # apt trata una ruta relativa SIN './' como NOMBRE de paquete
+          # ("E: Unable to locate package artifacts/..."). El prefijo ./ la
+          # convierte en ruta local y apt además resuelve las dependencias.
+          sudo apt-get install -y "./$deb"
 
       - name: Validate installed AppStream component
         shell: bash
@@ -570,6 +606,6 @@ jobs:
     steps:
       - name: Deploy Flatpak repository to GitHub Pages
         id: deployment
-        uses: actions/deploy-pages@v4
+        uses: actions/deploy-pages@v5
 
 
