@@ -565,6 +565,98 @@ def test_wheel_tag_matches_current_and_rejects_foreign():
     assert _wheel_tag_matches("py3-none-any") is True
 
 
+def test_wheel_matches_cp_rejects_free_threaded():
+    from src.runtimes.manager import _wheel_matches_cp
+
+    cur = "cp%d%d" % (sys.version_info.major, sys.version_info.minor)
+    assert _wheel_matches_cp(f"onnxruntime-1.28.0-{cur}-{cur}-win_amd64.whl") is True
+    # Free-threaded (cp314t) must NOT match cp314-cp314.
+    assert _wheel_matches_cp(f"onnxruntime-1.28.0-{cur}-{cur}t-win_amd64.whl") is False
+    # Another interpreter version must not match.
+    assert _wheel_matches_cp("onnxruntime-1.28.0-cp999-cp999-win_amd64.whl") is False
+
+
+def test_wheel_matches_platform_current():
+    from src.runtimes.manager import _wheel_matches_platform
+
+    assert _wheel_matches_platform("x-1.0-cp311-cp311-win_amd64.whl") is (sys.platform == "win32")
+    assert _wheel_matches_platform("x-1.0-cp311-cp311-manylinux_2_27_x86_64.whl") is (sys.platform not in ("win32", "darwin"))
+    assert _wheel_matches_platform("x-1.0-cp311-cp311-macosx_14_0_arm64.whl") is (sys.platform == "darwin")
+
+
+def test_onnx_wheel_info_picks_matching_wheel(monkeypatch):
+    import src.runtimes.manager as rm
+
+    cur = rm._cp_tag()
+    good = f"onnxruntime-1.28.0-{cur}-{cur}-win_amd64.whl"
+
+    class _Resp:
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {"urls": [
+                {"filename": "onnxruntime-1.28.0-cp999-cp999-win_amd64.whl",
+                 "url": "https://x/bad", "digests": {"sha256": "a" * 64}},
+                {"filename": f"onnxruntime-1.28.0-{cur}-{cur}t-win_amd64.whl",
+                 "url": "https://x/freet", "digests": {"sha256": "b" * 64}},
+                {"filename": good,
+                 "url": "https://x/good", "digests": {"sha256": "c" * 64}},
+            ]}
+
+    class _FakeRequests:
+        RequestException = RuntimeError
+
+        @staticmethod
+        def get(*a, **k):
+            return _Resp()
+
+    monkeypatch.setitem(sys.modules, "requests", _FakeRequests)
+    url, sha, fn = rm._onnx_wheel_info("cpu")
+    assert url == "https://x/good" and fn == good and sha == "c" * 64
+
+
+def test_download_resumable_rejects_bad_sha256(monkeypatch, tmp_path):
+    import src.runtimes.manager as rm
+
+    payload = b"0123456789" * 100
+
+    class _Stream:
+        def __init__(self):
+            self._it = iter([payload[:512], payload[512:]])
+
+        def iter_content(self, _n):
+            for chunk in self._it:
+                yield chunk
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    class _Resp(_Stream):
+        status_code = 200
+        headers = {"Content-Length": str(len(payload))}
+
+    class _FakeRequests:
+        RequestException = RuntimeError
+
+        @staticmethod
+        def get(*a, **k):
+            return _Resp()
+
+    monkeypatch.setitem(sys.modules, "requests", _FakeRequests)
+    dest = str(tmp_path / "bad.whl")
+    try:
+        rm._download_resumable("https://x/w.whl", dest, sha256_hex="f" * 64)
+        raised = False
+    except RuntimeError as exc:
+        raised = "SHA-256" in str(exc)
+    assert raised, "must reject a download whose SHA-256 does not match"
+    assert not os.path.exists(dest) and not os.path.exists(dest + ".part")
+
+
 def test_store_incompatible_when_wheel_is_for_other_python(tmp_path, monkeypatch):
     import src.runtimes.manager as rm
 
@@ -2393,9 +2485,13 @@ def test_compress_video_audio_boost_reports_real_phases(monkeypatch, tmp_path):
 
     audio = [e for e in events if e[0] == "audio"]
     compress = [e for e in events if e[0] == "compress"]
+    measure = [e for e in events if e[0] == "measure"]
 
     # La fase de audio ya no es un flash start(100)+end: arranca en 0.
     assert audio[0] == ("audio", "start", 0)
+    # La medición loudnorm es una fase PROPIA que termina antes del encode.
+    assert measure[0] == ("measure", "start", 0)
+    assert measure[-1][1] == "end"
     # El encode avanza ambas fases (boost + compresión van a la vez).
     assert ("compress", "progress", 50) in compress
     assert ("audio", "progress", 50) in audio
@@ -2443,6 +2539,27 @@ def test_compress_video_without_boost_has_no_audio_phase(monkeypatch, tmp_path):
     assert ok is True
     assert all(e[0] != "audio" for e in events)
     assert statuses[-1] == "Compressing video..."
+
+
+def test_measure_bounds_short_clip_is_exact():
+    from src.processing.pipeline import _measure_bounds
+
+    # Ventana que cabe en el techo -> medición exacta (sin cambios).
+    assert _measure_bounds(None, None, 60.0) == (None, None)
+    assert _measure_bounds(10.0, 20.0, 60.0) == (10.0, 20.0)
+
+
+def test_measure_bounds_long_clip_uses_middle_window():
+    from src.processing.pipeline import _measure_bounds
+
+    # 1 hora con cap de 600s -> ventana central de 600s.
+    ms, me = _measure_bounds(None, None, 3600.0, cap=600.0)
+    assert ms == 1500.0 and me == 2100.0
+
+    # Con recorte explícito, la ventana central queda dentro del recorte.
+    ms, me = _measure_bounds(100.0, 2200.0, 3600.0, cap=600.0)
+    assert me - ms == 600.0
+    assert ms >= 100.0 and me <= 2200.0
 
 
 def test_list_all_has_face_restore_slot(isolated_engines_state):
@@ -3902,7 +4019,7 @@ def test_compress_video_with_ai_audio_boost_keeps_audio(nvenc_clip):
 
 
 def test_ai_chain_emits_phase_order(nvenc_clip):
-    """compress_video_with_ai must emit probe -> engine -> audio -> mux."""
+    """compress_video_with_ai must emit probe -> engine -> measure -> audio -> mux."""
     from src.processing.pipeline import compress_video_with_ai
 
     ffmpeg, src, tmp = nvenc_clip
@@ -3934,9 +4051,10 @@ def test_ai_chain_emits_phase_order(nvenc_clip):
     ids = [e["id"] for e in starts]
     assert ids[0] == "probe", ids
     assert any(i.startswith("engine-") for i in ids), ids
+    assert "measure" in ids, ids  # boost adds a loudness-measure phase
     assert "audio" in ids, ids
     assert "mux" in ids, ids
-    assert ids.index("probe") < ids.index("audio") < ids.index("mux")
+    assert ids.index("probe") < ids.index("measure") < ids.index("audio") < ids.index("mux")
     # Every phase that started also ended (or failed).
     for ph in ids:
         ended = [e["id"] for e in events if e["ev"] in ("end", "failed")]
@@ -3971,6 +4089,7 @@ def test_ai_chain_mux_phase_completes_when_no_audio(nvenc_clip):
     # Finalization phase always runs (encoder finalize); audio phase does not.
     assert "mux" in ended_ids
     assert "audio" not in ended_ids
+    assert "measure" not in ended_ids
     assert any(i.startswith("engine-") for i in ended_ids)
     assert "probe" in ended_ids
     assert not [f for f in os.listdir(tmp) if f.startswith(".drag-audio-")]
@@ -5570,6 +5689,304 @@ def test_capture_screenshots_main_success_writes_expected_pngs(
         contents["DraggyEncoder-screenshot-workflow.png"]
         != contents["DraggyEncoder-screenshot-engines.png"]
     )
+
+
+def test_get_audio_streams_parses_track_metadata(tmp_path, monkeypatch):
+    """FFprobe audio ordinals are exposed with language/title metadata."""
+    import json
+    import types
+    import src.ffmpeg.runner as runner
+
+    ffprobe = tmp_path / "ffprobe.exe"
+    video = tmp_path / "multi.mkv"
+    ffprobe.write_bytes(b"probe")
+    video.write_bytes(b"video")
+    payload = {
+        "streams": [
+            {
+                "index": 1,
+                "codec_name": "aac",
+                "channels": 2,
+                "tags": {"language": "eng", "title": "English"},
+            },
+            {
+                "index": 3,
+                "codec_name": "opus",
+                "channels": 6,
+                "channel_layout": "5.1",
+                "tags": {"language": "spa", "title": "Español"},
+            },
+        ]
+    }
+
+    monkeypatch.setattr(runner, "get_ffprobe_path", lambda: str(ffprobe))
+    monkeypatch.setattr(
+        runner.subprocess,
+        "run",
+        lambda *args, **kwargs: types.SimpleNamespace(
+            returncode=0, stdout=json.dumps(payload), stderr=""
+        ),
+    )
+
+    tracks = runner.get_audio_streams("ffmpeg", str(video))
+    assert [track["audio_index"] for track in tracks] == [0, 1]
+    assert tracks[1]["index"] == 3
+    assert tracks[1]["language"] == "spa"
+    assert tracks[1]["title"] == "Español"
+    assert tracks[1]["codec_name"] == "opus"
+
+
+def test_build_args_maps_selected_audio_track():
+    """The selected MKV audio ordinal, not implicit stream 0, reaches FFmpeg."""
+    from src.ffmpeg.runner import build_args
+
+    args = build_args("/in.mkv", "/out.mp4", {
+        "codec": "libx264",
+        "bitrate": 1500,
+        "audio": "aac",
+        "audio_stream_index": 2,
+        "format": "mp4",
+    })
+    assert "-map" in args
+    assert args[args.index("-map") + 1] == "0:v:0"
+    audio_map_pos = args.index("-map", args.index("-map") + 1)
+    assert args[audio_map_pos + 1] == "0:a:2?"
+
+    noaudio = build_args("/in.mkv", "/out.mp4", {
+        "codec": "libx264", "bitrate": 1500, "audio": "noaudio",
+    })
+    assert "0:a:" not in " ".join(noaudio)
+
+
+def test_settings_panel_exposes_selected_audio_track(qapp):
+    """A detected multi-track file gets a selectable snapshot setting."""
+    from src.ui.settings_panel import SettingsPanel
+
+    panel = SettingsPanel(hardware_info={})
+    panel.show()
+    panel.set_audio_tracks([
+        {"audio_index": 0, "codec_name": "aac", "language": "eng", "title": "English", "channels": 2},
+        {"audio_index": 1, "codec_name": "opus", "language": "spa", "title": "Español", "channels": 6},
+    ])
+    assert panel.audio_track_combo.isVisible()
+    assert panel.audio_track_combo.count() == 2
+    panel.audio_track_combo.setCurrentIndex(1)
+    settings = panel.get_settings()
+    assert settings["audio_stream_index"] == 1
+    assert "Español" in settings["audio_stream_label"]
+
+
+def test_ai_rendered_bitrate_is_hidden_without_active_ai_and_shown_when_active():
+    """A default model selection must not imply an active AI pipeline."""
+    from types import SimpleNamespace
+    from src.ui.main_window import MainWindow
+
+    class _Settings:
+        def __init__(self):
+            self.value = None
+
+        def set_ai_bitrate(self, value):
+            self.value = value
+
+    class _Step:
+        def __init__(self, name, active, scale=1):
+            self.name = name
+            self.active = active
+            self.scale = scale
+
+        def get_selected_model_info(self):
+            return {"engine_id": "fake", "scale": self.scale}
+
+    settings = _Settings()
+    workflow = SimpleNamespace(
+        middle_steps=[_Step("Upscale", False, 4), _Step("Interp", False)]
+    )
+    obj = SimpleNamespace(
+        workflow=workflow,
+        settings_panel=settings,
+        _input_width=1920,
+        _input_height=1080,
+        _input_bitrate_kbps=4000,
+    )
+
+    MainWindow._update_ai_rendered_bitrate(obj)
+    assert settings.value == ""
+
+    workflow.middle_steps[1].active = True
+    MainWindow._update_ai_rendered_bitrate(obj)
+    assert settings.value.startswith("AI Rendered bitrate:")
+    assert "4,000" in settings.value
+
+
+def test_run_ffmpeg_reports_machine_progress_incrementally(monkeypatch):
+    """The runner must parse FFmpeg's pipe progress, not buffered \r stats."""
+    import src.ffmpeg.runner as runner
+
+    class _Pipe:
+        def __init__(self, lines):
+            self._lines = iter(lines)
+            self.closed = False
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            return next(self._lines)
+
+        def close(self):
+            self.closed = True
+
+    class _Proc:
+        def __init__(self, command):
+            self.command = command
+            self.stdout = _Pipe([
+                "Duration: 00:00:10.00, start: 0.000000\n",
+                "out_time_us=0\n",
+                "out_time_us=5000000\n",
+                "out_time_us=10000000\n",
+                "progress=end\n",
+            ])
+            self.returncode = 0
+
+        def wait(self, timeout=None):
+            return self.returncode
+
+        def poll(self):
+            return self.returncode
+
+    processes = []
+
+    def _popen(command, **kwargs):
+        proc = _Proc(command)
+        processes.append(proc)
+        return proc
+
+    monkeypatch.setattr(runner.subprocess, "Popen", _popen)
+    progress = []
+    assert runner.run_ffmpeg("ffmpeg", ["-i", "in", "out"], progress_callback=progress.append)
+    assert "-progress" in processes[0].command
+    assert progress == [50, 100]
+
+
+def test_parallel_audio_progress_uses_selected_track(monkeypatch):
+    """Parallel audio encoding emits monotonic percentages and maps 0:a:N."""
+    from pathlib import Path
+    import src.processing.pipeline as pipeline
+
+    class _Pipe:
+        def __init__(self, lines):
+            self._lines = iter(lines)
+            self.closed = False
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            return next(self._lines)
+
+        def close(self):
+            self.closed = True
+
+    class _Proc:
+        def __init__(self, command):
+            self.command = command
+            self.stdout = _Pipe([
+                "out_time_us=0\n",
+                "out_time_us=5000000\n",
+                "out_time_us=10000000\n",
+                "progress=end\n",
+            ])
+            self.stderr = _Pipe([])
+            self.returncode = 0
+            Path(command[-1]).write_bytes(b"audio")
+
+        def poll(self):
+            return self.returncode
+
+        def wait(self, timeout=None):
+            return self.returncode
+
+    processes = []
+    monkeypatch.setattr(
+        pipeline.subprocess,
+        "Popen",
+        lambda command, **kwargs: (processes.append(_Proc(command)) or processes[-1]),
+    )
+    monkeypatch.setattr(pipeline, "_get_duration_seconds", lambda *a, **k: 10.0)
+    events = []
+    path = pipeline._encode_audio_parallel(
+        "ffmpeg", "input.mkv",
+        {"audio": "aac", "audio_boost": False, "format": "mp4", "audio_stream_index": 1},
+        phase_cb=events.append,
+    )
+    try:
+        assert path and os.path.exists(path)
+        assert "0:a:1?" in processes[0].command
+        assert [e["pct"] for e in events if e["ev"] == "progress"] == [0, 50, 100]
+    finally:
+        if path:
+            os.remove(path)
+
+
+def test_codec_table_resolves_10_12bit_pix_fmt():
+    """resolve_codec derives 8/10/12-bit pixel formats from the table."""
+    from src.config import resolve_codec
+
+    assert resolve_codec("libx265_12bit") == ("libx265", ["-pix_fmt", "yuv420p12le"])
+    assert resolve_codec("libx265_10bit") == ("libx265", ["-pix_fmt", "yuv420p10le"])
+    assert resolve_codec("hevc_nvenc_10bit") == ("hevc_nvenc", ["-pix_fmt", "p010le"])
+    # ProRes/DNxHR carry their profile as extra args.
+    real, extra = resolve_codec("dnxhr_hq")
+    assert real == "dnxhd"
+    assert "-profile:v" in extra and "dnxhr_hq" in extra
+    # Unknown codec falls back to its own id with no extra args.
+    assert resolve_codec("totally_unknown") == ("totally_unknown", [])
+
+
+def test_codec_table_vendors_and_known_codecs():
+    """The fixed lists derive from the declarative table (lossless/mezzanine included)."""
+    from src.config import ALL_KNOWN_CODECS, codecs_for_vendor, get_codec_entry, get_codec_label
+
+    cpu_ids = [cid for cid, _ in codecs_for_vendor("cpu")]
+    for new_codec in ("ffv1", "prores_ks", "dnxhr_hq", "libx265_12bit"):
+        assert new_codec in cpu_ids
+        assert new_codec in [cid for cid, _ in ALL_KNOWN_CODECS["CPU"]]
+
+    assert get_codec_entry("ffv1")["mp4_incompatible"] is True
+    assert get_codec_entry("prores_ks")["container"] == "mov"
+    assert get_codec_label("ffv1") == "FFV1 (lossless)"
+    assert get_codec_entry("nope") is None
+    assert get_codec_label("nope") == "nope"
+
+
+def test_coerce_output_switches_container_for_mp4_incompatible_codecs():
+    """FFV1/ProRes/DNxHR auto-switch away from MP4; 12-bit HEVC stays."""
+    from src.processing.pipeline import _coerce_output_for_codec
+
+    out, settings = _coerce_output_for_codec(
+        "/tmp/out.mp4", {"codec": "ffv1", "format": "mp4"}
+    )
+    assert out == "/tmp/out.mkv" and settings["format"] == "mkv"
+
+    out, settings = _coerce_output_for_codec(
+        "/tmp/out.mp4", {"codec": "prores_ks", "format": "mp4"}
+    )
+    assert out == "/tmp/out.mov" and settings["format"] == "mov"
+
+    out, settings = _coerce_output_for_codec(
+        "/tmp/out.mp4", {"codec": "dnxhr_hq", "format": "mp4"}
+    )
+    assert out == "/tmp/out.mkv" and settings["format"] == "mkv"
+
+    # MP4-compatible codecs are not rewritten, and non-mp4 formats untouched.
+    out, settings = _coerce_output_for_codec(
+        "/tmp/out.mp4", {"codec": "libx265_12bit", "format": "mp4"}
+    )
+    assert out == "/tmp/out.mp4" and settings["format"] == "mp4"
+    out, settings = _coerce_output_for_codec(
+        "/tmp/out.mkv", {"codec": "ffv1", "format": "mkv"}
+    )
+    assert out == "/tmp/out.mkv" and settings["format"] == "mkv"
 
 
 # ==--------------------------------------------------------------------==

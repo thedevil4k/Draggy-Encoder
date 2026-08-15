@@ -805,17 +805,33 @@ def _format_queue_item_details(item: dict) -> str:
                 )
 
     if settings:
+        # The live SettingsPanel stores the codec as ``audio``; older queue
+        # snapshots used ``audio_codec``. Render both so historical jobs keep
+        # their complete explanation.
+        audio_codec = settings.get("audio", settings.get("audio_codec"))
         audio_any = (
-            settings.get("audio_boost")
+            "audio" in settings
             or settings.get("audio_codec")
             or settings.get("audio_bitrate")
+            or settings.get("audio_stream_index") is not None
             or settings.get("normalize_audio")
+            or settings.get("audio_boost")
         )
         if audio_any:
             parts.append(
                 "<div style='margin-top:6px;'>"
                 "<b style='color:#00d2d3;'>Audio:</b></div>"
             )
+            if audio_codec == "noaudio":
+                parts.append(
+                    "<div style='margin-left:12px;color:#c8c8d4;'>"
+                    "\u25b8 Mode: <code>disabled</code></div>"
+                )
+            elif audio_codec:
+                parts.append(
+                    "<div style='margin-left:12px;color:#c8c8d4;'>"
+                    f"\u25b8 Codec: <code>{_esc(audio_codec)}</code></div>"
+                )
             audio_boost = settings.get("audio_boost")
             if isinstance(audio_boost, dict):
                 target = (
@@ -832,15 +848,20 @@ def _format_queue_item_details(item: dict) -> str:
                     "<div style='margin-left:12px;color:#c8c8d4;'>"
                     "\u25b8 Loudness boost: <code>enabled</code></div>"
                 )
-            if settings.get("audio_codec"):
-                parts.append(
-                    "<div style='margin-left:12px;color:#c8c8d4;'>"
-                    f"\u25b8 Codec: <code>{_esc(settings['audio_codec'])}</code></div>"
-                )
             if settings.get("audio_bitrate"):
                 parts.append(
                     "<div style='margin-left:12px;color:#c8c8d4;'>"
                     f"\u25b8 Bitrate: <code>{_esc(settings['audio_bitrate'])}</code></div>"
+                )
+            stream_index = settings.get("audio_stream_index")
+            if stream_index is not None and audio_codec != "noaudio":
+                try:
+                    track_label = settings.get("audio_stream_label") or f"Track {int(stream_index) + 1}"
+                except (TypeError, ValueError):
+                    track_label = settings.get("audio_stream_label") or str(stream_index)
+                parts.append(
+                    "<div style='margin-left:12px;color:#c8c8d4;'>"
+                    f"\u25b8 Selected track: <code>{_esc(track_label)}</code></div>"
                 )
 
     if item.get("created_at"):

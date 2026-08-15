@@ -59,7 +59,8 @@ def _append_log(status, detail):
 
 def measure_loudness(ffmpeg_path, input_path, timeout_seconds=600,
                        start_time=None, end_time=None, status_callback=None,
-                       abort_event=None, supervisor: ProcessSupervisor | None = None):
+                       abort_event=None, supervisor: ProcessSupervisor | None = None,
+                       audio_stream_index=0):
     """Run pass-1 loudnorm measurement and return parsed JSON dict, or None.
 
     Returns a dict with keys: input_i, input_tp, input_lra, input_thresh,
@@ -93,8 +94,12 @@ def measure_loudness(ffmpeg_path, input_path, timeout_seconds=600,
         cmd.extend(["-t", str(end_sec - start_sec)])
     elif end_sec is not None:
         cmd.extend(["-to", str(end_sec)])
+    try:
+        audio_stream_index = max(0, int(audio_stream_index))
+    except (TypeError, ValueError):
+        audio_stream_index = 0
     cmd.extend([
-        "-map", "0:a:0?",   # solo la primera pista de audio
+        "-map", f"0:a:{audio_stream_index}?",
         "-vn",              # sin vídeo: no decodificar la pista más pesada
         "-af", "loudnorm=I=-16:TP=-1.5:LRA=11:print_format=json",
         "-f", "null",

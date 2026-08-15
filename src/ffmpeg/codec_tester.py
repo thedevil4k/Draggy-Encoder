@@ -2,7 +2,7 @@ import os
 import subprocess
 from datetime import datetime
 
-from src.config import ALL_KNOWN_CODECS, get_bin_dir, resolve_codec
+from src.config import ALL_KNOWN_CODECS, get_bin_dir, get_codec_entry, resolve_codec
 
 
 def _log_dir():
@@ -34,25 +34,27 @@ def _append_log(codec_id, success, error=""):
 def _test_codec(ffmpeg_path, codec):
     """Prueba si un codec puede codificar un frame de prueba.
 
-    Estrategia robusta:
-    - Input: testsrc2 con duración 0.2s @ 30fps (6 frames).
-    - Pixel format de input explícito (yuv420p) → compatible con TODOS los encoders.
-    - Bitrate explícito (-b:v 1M) → evita fallos de rate control.
-    - Output a -f null - → no depende del muxer, solo prueba el encoder.
-    - Pix_fmt extra (p010le para codecs 10-bit) se aplica como opción de OUTPUT.
+    Deriva el comando de la tabla declarativa (``get_codec_entry``): usa el
+    pixel format de salida del codec (8/10/12 bits), sus args extra (perfil
+    ProRes/DNxHR) y el tamaño de fuente que exige (DNxHR requiere 1080p).
+    La salida va a ``-f null -``, así el probe solo valida el encoder y no
+    depende del muxer ni del contenedor.
     """
     try:
-        real_codec, extra_args = resolve_codec(codec)
+        entry = get_codec_entry(codec)
+        real_codec, _extra = resolve_codec(codec)
+        pix_fmt = (entry or {}).get("pix_fmt", "yuv420p")
+        extra_args = list((entry or {}).get("extra") or [])
+        size = (entry or {}).get("probe_size", "320x240")
         cmd = [
             ffmpeg_path,
             "-y",
             "-hide_banner",
             "-loglevel", "error",
             "-f", "lavfi",
-            "-i", "testsrc2=size=320x240:rate=30:duration=0.2",
-            "-pix_fmt", "yuv420p",
+            "-i", f"testsrc2=size={size}:rate=25:duration=0.2",
+            "-pix_fmt", pix_fmt,
             "-c:v", real_codec,
-            "-b:v", "1M",
             "-frames:v", "1",
         ] + extra_args + [
             "-f", "null",

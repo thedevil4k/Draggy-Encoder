@@ -240,6 +240,19 @@ jobs:
         shell: bash
         run: rm -rf dist/DraggyEncoder/bin dist/DraggyEncoder/personal
 
+      # Los símbolos de depuración de Python/PySide6/FFmpeg no le sirven al
+      # usuario final, pero flatpak-builder los extrae y comprime .so a .so
+      # (el log gigante de "compressing debuginfo") y exporta un .Debug de
+      # cientos de MB. Stripeamos el árbol entero antes de empaquetar: bundles
+      # más pequeños y sin ese paso. Los binarios stripeados ejecutan igual.
+      - name: Strip debug symbols from the bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+          find dist/DraggyEncoder -type f \( -name '*.so' -o -name '*.so.*' \) -print0 \
+            | xargs -0 -r strip --strip-unneeded
+          strip --strip-unneeded dist/DraggyEncoder/DraggyEncoder
+
       - name: Create portable archive
         shell: bash
         run: |
@@ -384,6 +397,10 @@ jobs:
           chmod 0755 flatpak-staging/flatpak-wrapper flatpak-staging/DraggyEncoder/DraggyEncoder
           appstreamcli validate --pedantic --no-net flatpak-staging/com.draggyencoder.DraggyEncoder.metainfo.xml
           cp packaging/linux/com.draggyencoder.DraggyEncoder.yml flatpak-manifest.yml
+          # Lint del manifiesto antes del build caro: --show-manifest fuerza a
+          # flatpak-builder a parsear y resolver el manifiesto sin construir,
+          # fallando rápido con un error claro ante un error de sintaxis.
+          flatpak-builder --show-manifest flatpak-manifest.yml > /dev/null
           flatpak remote-add --if-not-exists --user flathub https://flathub.org/repo/flathub.flatpakrepo
           flatpak install --user --noninteractive flathub org.freedesktop.Sdk//24.08 org.freedesktop.Platform//24.08
           # Exportamos a una rama estable ("stable") para que `flatpak update`
@@ -392,7 +409,7 @@ jobs:
           # "$version" daba: Refspec 'app/.../x86_64/<version>' not found).
           # El número de versión vive en el metainfo (<releases>) y en el
           # nombre del .flatpak, no en la rama OSTree.
-          flatpak-builder --user --disable-rofiles-fuse --force-clean --default-branch=stable "${sign_args[@]}" --repo=flatpak-repo flatpak-build flatpak-manifest.yml
+          flatpak-builder --user --disable-rofiles-fuse --force-clean --no-debuginfo --default-branch=stable "${sign_args[@]}" --repo=flatpak-repo flatpak-build flatpak-manifest.yml
           if [[ "${FLATPAK_SIGN:-0}" == "1" ]]; then
             # Firma el summary del repo para que `flatpak remote-add` sin
             # --no-gpg-verify pueda verificar descargas y updates.

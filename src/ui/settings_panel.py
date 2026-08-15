@@ -173,15 +173,28 @@ class SettingsPanel(QWidget):
         grid.addWidget(self.audio_label, 9, 0)
         grid.addWidget(self.audio_combo, 9, 1)
 
+        # Audio track (the ordinal is used with FFmpeg's 0:a:N mapping).
+        # It stays hidden until an imported video has at least one audio
+        # stream, so files without audio do not get an irrelevant control.
+        self.audio_track_label = QLabel("Audio track")
+        self.audio_track_combo = QComboBox()
+        self.audio_track_combo.setToolTip(
+            "Choose which audio track to keep when exporting the video."
+        )
+        self.audio_track_label.setVisible(False)
+        self.audio_track_combo.setVisible(False)
+        grid.addWidget(self.audio_track_label, 10, 0)
+        grid.addWidget(self.audio_track_combo, 10, 1)
+
         # Audio boost
         self.audio_boost_check = QCheckBox("Audio Boost (normalize volume)")
         self.audio_boost_check.setChecked(False)
-        grid.addWidget(self.audio_boost_check, 10, 1)
+        grid.addWidget(self.audio_boost_check, 11, 1)
 
         # Trim
         self.trim_check = QCheckBox("Trim (only export a portion of the video)")
         self.trim_check.toggled.connect(self._on_trim_toggled)
-        grid.addWidget(self.trim_check, 11, 1)
+        grid.addWidget(self.trim_check, 12, 1)
 
         self.start_edit = QLineEdit("00:00:00")
         self.end_edit = QLineEdit("00:00:00")
@@ -192,7 +205,7 @@ class SettingsPanel(QWidget):
         trim_layout.addWidget(self.start_edit)
         trim_layout.addWidget(QLabel("End"))
         trim_layout.addWidget(self.end_edit)
-        grid.addLayout(trim_layout, 12, 1)
+        grid.addLayout(trim_layout, 13, 1)
 
         layout.addWidget(group)
         layout.addStretch()
@@ -230,6 +243,50 @@ class SettingsPanel(QWidget):
         # It is disabled only when audio is completely disabled (-an).
         audio = self.audio_combo.currentData()
         self.audio_boost_check.setEnabled(audio != "noaudio")
+        self._refresh_audio_track_enabled()
+
+    def _refresh_audio_track_enabled(self):
+        has_tracks = self.audio_track_combo.count() > 0
+        audio_enabled = self.audio_combo.currentData() != "noaudio"
+        self.audio_track_combo.setEnabled(has_tracks and audio_enabled and self.audio_track_combo.count() > 1)
+
+    def set_audio_tracks(self, tracks):
+        """Populate the audio-track selector from FFprobe metadata.
+
+        ``audio_index`` is the ordinal among audio streams, not FFmpeg's
+        global stream number; this is exactly what ``0:a:N`` expects and is
+        stable when a file also contains subtitles/data streams.
+        """
+        tracks = list(tracks or [])
+        previous = self.audio_track_combo.currentData()
+        self.audio_track_combo.blockSignals(True)
+        self.audio_track_combo.clear()
+        for position, track in enumerate(tracks):
+            try:
+                audio_index = int(track.get("audio_index", position))
+            except (TypeError, ValueError, AttributeError):
+                audio_index = position
+            bits = [f"Track {audio_index + 1}"]
+            language = str(track.get("language") or "").strip()
+            title = str(track.get("title") or "").strip()
+            codec = str(track.get("codec_name") or "").strip()
+            channels = track.get("channels")
+            if language:
+                bits.append(language)
+            if title:
+                bits.append(title)
+            if codec:
+                bits.append(codec.upper())
+            if channels:
+                bits.append(f"{channels} ch")
+            self.audio_track_combo.addItem(" — ".join(bits), audio_index)
+        target = self.audio_track_combo.findData(previous)
+        self.audio_track_combo.setCurrentIndex(target if target >= 0 else (0 if tracks else -1))
+        self.audio_track_combo.blockSignals(False)
+        visible = bool(tracks)
+        self.audio_track_label.setVisible(visible)
+        self.audio_track_combo.setVisible(visible)
+        self._refresh_audio_track_enabled()
 
     def _on_trim_toggled(self, checked):
         self.start_edit.setEnabled(checked)
@@ -253,6 +310,8 @@ class SettingsPanel(QWidget):
             "format": self.format_combo.currentData(),
             "audio": self.audio_combo.currentData(),
             "audio_boost": self.audio_boost_check.isChecked(),
+            "audio_stream_index": self.audio_track_combo.currentData(),
+            "audio_stream_label": self.audio_track_combo.currentText(),
             "trim": self.trim_check.isChecked(),
             "start_time": self.start_edit.text() if self.trim_check.isChecked() else None,
             "end_time": self.end_edit.text() if self.trim_check.isChecked() else None,

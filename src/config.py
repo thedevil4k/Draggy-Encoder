@@ -116,41 +116,94 @@ def get_asset_path(filename):
     return os.path.join(base_path, "assets", filename)
 
 
-# Lista maestra de codecs agrupados por familia de dispositivo.
-# Se usa tanto para la detección de hardware como para probar compatibilidad con FFmpeg.
+# ---------------------------------------------------------------------------
+# Tabla declarativa de codecs de vídeo — fuente de verdad única.
+#
+# Cada entrada describe TODO lo que necesita el encoder: el encoder real de
+# FFmpeg, el pixel format de salida (8/10/12 bits), el modo de control de
+# tasa y el contenedor preferido. De aquí derivan ``ALL_KNOWN_CODECS`` (para
+# el probe de compatibilidad), ``resolve_codec`` (para build_args y la ruta
+# IA) y el catálogo de CPU.
+#
+#   pix_fmt          : pixel format de salida que el encoder necesita
+#   rate_mode        : "crf" | "bitrate" | "lossless"
+#   container        : contenedor preferido para ese codec
+#   mp4_incompatible : True si el codec NO puede muxearse en MP4
+#   extra            : args extra del encoder (perfil ProRes/DNxHR, etc.)
+#   probe_size       : tamaño de la fuente del probe (DNxHR exige 1080p)
+# ---------------------------------------------------------------------------
+VIDEO_CODEC_TABLE = [
+    # --- CPU: H.264 / H.265 / AV1 en 8/10/12 bits ---
+    {"id": "libx264", "label": "H.264 (CPU)", "encoder": "libx264", "pix_fmt": "yuv420p", "rate_mode": "crf", "container": "mp4", "vendor": "cpu"},
+    {"id": "libx264_10bit", "label": "H.264 10-bit (CPU)", "encoder": "libx264", "pix_fmt": "yuv420p10le", "rate_mode": "crf", "container": "mkv", "vendor": "cpu"},
+    {"id": "libx265", "label": "HEVC (CPU)", "encoder": "libx265", "pix_fmt": "yuv420p", "rate_mode": "crf", "container": "mp4", "vendor": "cpu"},
+    {"id": "libx265_10bit", "label": "HEVC 10-bit (CPU)", "encoder": "libx265", "pix_fmt": "yuv420p10le", "rate_mode": "crf", "container": "mkv", "vendor": "cpu"},
+    {"id": "libx265_12bit", "label": "HEVC 12-bit (CPU)", "encoder": "libx265", "pix_fmt": "yuv420p12le", "rate_mode": "crf", "container": "mkv", "vendor": "cpu"},
+    {"id": "libsvtav1", "label": "AV1 SVT (CPU)", "encoder": "libsvtav1", "pix_fmt": "yuv420p", "rate_mode": "crf", "container": "mp4", "vendor": "cpu"},
+    {"id": "libsvtav1_10bit", "label": "AV1 10-bit (CPU)", "encoder": "libsvtav1", "pix_fmt": "yuv420p10le", "rate_mode": "crf", "container": "mkv", "vendor": "cpu"},
+    {"id": "libaom-av1", "label": "AV1 AOM (CPU)", "encoder": "libaom-av1", "pix_fmt": "yuv420p", "rate_mode": "crf", "container": "mp4", "vendor": "cpu"},
+    # --- Lossless / intermedio ---
+    {"id": "ffv1", "label": "FFV1 (lossless)", "encoder": "ffv1", "pix_fmt": "yuv420p", "rate_mode": "lossless", "container": "mkv", "mp4_incompatible": True, "vendor": "cpu"},
+    {"id": "prores_ks", "label": "ProRes 422", "encoder": "prores_ks", "pix_fmt": "yuv422p10le", "rate_mode": "lossless", "container": "mov", "mp4_incompatible": True, "extra": ["-profile:v", "2"], "vendor": "cpu"},
+    {"id": "dnxhr_hq", "label": "DNxHR HQ", "encoder": "dnxhd", "pix_fmt": "yuv422p", "rate_mode": "bitrate", "container": "mkv", "mp4_incompatible": True, "extra": ["-profile:v", "dnxhr_hq"], "probe_size": "1920x1080", "vendor": "cpu"},
+    # --- NVIDIA NVENC ---
+    {"id": "h264_nvenc", "label": "H.264 NVENC (8-bit)", "encoder": "h264_nvenc", "pix_fmt": "yuv420p", "rate_mode": "crf", "container": "mp4", "vendor": "nvidia"},
+    {"id": "hevc_nvenc", "label": "HEVC NVENC (8-bit)", "encoder": "hevc_nvenc", "pix_fmt": "yuv420p", "rate_mode": "crf", "container": "mp4", "vendor": "nvidia"},
+    {"id": "hevc_nvenc_10bit", "label": "HEVC NVENC (10-bit)", "encoder": "hevc_nvenc", "pix_fmt": "p010le", "rate_mode": "crf", "container": "mkv", "vendor": "nvidia"},
+    {"id": "av1_nvenc", "label": "AV1 NVENC (8-bit)", "encoder": "av1_nvenc", "pix_fmt": "yuv420p", "rate_mode": "crf", "container": "mp4", "vendor": "nvidia"},
+    {"id": "av1_nvenc_10bit", "label": "AV1 NVENC (10-bit)", "encoder": "av1_nvenc", "pix_fmt": "p010le", "rate_mode": "crf", "container": "mkv", "vendor": "nvidia"},
+    # --- AMD AMF ---
+    {"id": "h264_amf", "label": "H.264 AMF", "encoder": "h264_amf", "pix_fmt": "yuv420p", "rate_mode": "crf", "container": "mp4", "vendor": "amd"},
+    {"id": "hevc_amf", "label": "HEVC AMF", "encoder": "hevc_amf", "pix_fmt": "yuv420p", "rate_mode": "crf", "container": "mp4", "vendor": "amd"},
+    {"id": "av1_amf", "label": "AV1 AMF", "encoder": "av1_amf", "pix_fmt": "yuv420p", "rate_mode": "crf", "container": "mp4", "vendor": "amd"},
+    # --- Intel QSV ---
+    {"id": "h264_qsv", "label": "H.264 QuickSync", "encoder": "h264_qsv", "pix_fmt": "yuv420p", "rate_mode": "crf", "container": "mp4", "vendor": "intel"},
+    {"id": "hevc_qsv", "label": "HEVC QuickSync", "encoder": "hevc_qsv", "pix_fmt": "yuv420p", "rate_mode": "crf", "container": "mp4", "vendor": "intel"},
+    {"id": "av1_qsv", "label": "AV1 QuickSync", "encoder": "av1_qsv", "pix_fmt": "yuv420p", "rate_mode": "crf", "container": "mp4", "vendor": "intel"},
+]
+
+_CODEC_BY_ID = {entry["id"]: entry for entry in VIDEO_CODEC_TABLE}
+
+
+def get_codec_entry(codec_id):
+    """Devuelve la entrada declarativa del codec (o None si no existe)."""
+    return _CODEC_BY_ID.get(codec_id)
+
+
+def get_codec_label(codec_id):
+    """Etiqueta legible de un codec (fallback: el propio id)."""
+    entry = _CODEC_BY_ID.get(codec_id)
+    return entry["label"] if entry else codec_id
+
+
 def resolve_codec(codec_id):
-    """Mapea un ID lógico de codec al encoder real de FFmpeg y sus argumentos extra."""
-    mapping = {
-        "hevc_nvenc_10bit": ("hevc_nvenc", ["-pix_fmt", "p010le"]),
-        "av1_nvenc_10bit": ("av1_nvenc", ["-pix_fmt", "p010le"]),
-    }
-    return mapping.get(codec_id, (codec_id, []))
+    """Mapea un ID lógico de codec al encoder real y sus argumentos extra.
+
+    Deriva de la tabla declarativa: aplica el pixel format de salida propio
+    del codec (8/10/12 bits) y los args extra declarados (p. ej. el perfil de
+    ProRes/DNxHR). Mantiene la firma histórica ``(encoder, extra_args)``.
+    """
+    entry = _CODEC_BY_ID.get(codec_id)
+    if entry is None:
+        return (codec_id, [])
+    extra = []
+    if entry.get("pix_fmt"):
+        extra.extend(["-pix_fmt", entry["pix_fmt"]])
+    if entry.get("extra"):
+        extra.extend(entry["extra"])
+    return (entry["encoder"], extra)
+
+
+def codecs_for_vendor(vendor):
+    """Lista ``(id, label)`` de codecs de un vendor ("cpu"/"nvidia"/"amd"/"intel")."""
+    return [(e["id"], e["label"]) for e in VIDEO_CODEC_TABLE if e.get("vendor") == vendor]
 
 
 ALL_KNOWN_CODECS = {
-    "CPU": [
-        ("libx264", "H.264 (CPU)"),
-        ("libx265", "HEVC (CPU)"),
-        ("libsvtav1", "AV1 SVT (CPU)"),
-        ("libaom-av1", "AV1 AOM (CPU)"),
-    ],
-    "NVIDIA GPU": [
-        ("h264_nvenc", "H.264 NVENC (8-bit)"),
-        ("hevc_nvenc", "HEVC NVENC (8-bit)"),
-        ("hevc_nvenc_10bit", "HEVC NVENC (10-bit)"),
-        ("av1_nvenc", "AV1 NVENC (8-bit)"),
-        ("av1_nvenc_10bit", "AV1 NVENC (10-bit)"),
-    ],
-    "AMD GPU": [
-        ("h264_amf", "H.264 AMF"),
-        ("hevc_amf", "HEVC AMF"),
-        ("av1_amf", "AV1 AMF"),
-    ],
-    "Intel GPU": [
-        ("h264_qsv", "H.264 QuickSync"),
-        ("hevc_qsv", "HEVC QuickSync"),
-        ("av1_qsv", "AV1 QuickSync"),
-    ],
+    "CPU": codecs_for_vendor("cpu"),
+    "NVIDIA GPU": codecs_for_vendor("nvidia"),
+    "AMD GPU": codecs_for_vendor("amd"),
+    "Intel GPU": codecs_for_vendor("intel"),
 }
 
 FORMATS = [

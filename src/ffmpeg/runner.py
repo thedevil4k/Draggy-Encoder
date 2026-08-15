@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import collections
+import json
 import logging
 import os
 import re
@@ -140,7 +141,17 @@ def run_ffmpeg(ffmpeg_path, args, progress_callback=None, abort_event=None,
     run_ffmpeg in time — see ``_abort_running_worker`` in
     ``src/ui/main_window.py``).
     """
-    cmd = [ffmpeg_path] + args
+    # Human-readable FFmpeg statistics are written with carriage returns and
+    # are therefore buffered by ``for line in stdout`` until the encode ends.
+    # Ask FFmpeg for its machine-readable progress protocol instead so audio
+    # and video progress callbacks advance continuously on Windows too.
+    if progress_callback:
+        cmd = [
+            ffmpeg_path, "-hide_banner", "-nostats", "-progress", "pipe:1",
+            "-stats_period", "0.1",
+        ] + list(args)
+    else:
+        cmd = [ffmpeg_path] + list(args)
     process = subprocess.Popen(cmd, **_popen_kwargs())
     if supervisor is not None:
         supervisor.register(process, "ffmpeg")
@@ -157,6 +168,68 @@ def run_ffmpeg(ffmpeg_path, args, progress_callback=None, abort_event=None,
     # after the loop exits) share the same cell safely without
     # requiring a lock for the racy write-once / read-after pattern.
     duration = [None]
+    last_progress = [-1]
+
+    def _emit_time_progress(current_seconds):
+        if not progress_callback or duration[0] is None or not current_seconds:
+            return
+        try:
+            pct = min(max(int(current_seconds * 100 / duration[0]), 0), 100)
+            # FFmpeg can repeat a timestamp or report a small correction when
+            # streams have different time bases; never move the UI backwards.
+            if pct < last_progress[0]:
+                return
+            if pct == last_progress[0]:
+                return
+            last_progress[0] = pct
+            progress_callback(pct)
+        except Exception:
+            pass
+
+    def _parse_progress_line(line):
+        """Parse both FFmpeg's progress protocol and legacy stats lines."""
+        if not progress_callback:
+            return
+        if duration[0] is None:
+            m = re.search(r"Duration: (\d+):(\d+):(\d+\.\d+)", line)
+            if m:
+                duration[0] = (
+                    float(m.group(1)) * 3600
+                    + float(m.group(2)) * 60
+                    + float(m.group(3))
+                )
+
+        key, sep, value = line.partition("=")
+        if sep and key.strip() in {"out_time_us", "out_time_ms"}:
+            try:
+                # Both names are expressed in microseconds by FFmpeg's
+                # progress protocol (the *_ms name is historical).
+                _emit_time_progress(float(value.strip()) / 1_000_000.0)
+            except (TypeError, ValueError):
+                pass
+            return
+        if sep and key.strip() == "out_time":
+            _emit_time_progress(_parse_time_to_seconds(value.strip()))
+            return
+        if sep and key.strip() == "progress" and value.strip() == "end":
+            if last_progress[0] < 100:
+                last_progress[0] = 100
+                try:
+                    progress_callback(100)
+                except Exception:
+                    pass
+            return
+
+        # Keep compatibility with callers/older FFmpeg builds that emit the
+        # human-readable ``time=HH:MM:SS.xx`` form.
+        m = re.search(r"time=(\d+):(\d+):(\d+\.\d+)", line)
+        if m:
+            current = (
+                float(m.group(1)) * 3600
+                + float(m.group(2)) * 60
+                + float(m.group(3))
+            )
+            _emit_time_progress(current)
 
     def _reader_loop():
         """Daemon thread: consume stdout line by line.
@@ -179,28 +252,9 @@ def run_ffmpeg(ffmpeg_path, args, progress_callback=None, abort_event=None,
             for line in process.stdout:
                 log_tail.append(line.rstrip())
                 if progress_callback:
-                    # Parse progress inline. The reader thread is the
-                    # only writer to ``duration``; the main thread
-                    # reads it only after the while loop drains.
-                    if duration[0] is None:
-                        m = re.search(r"Duration: (\d+):(\d+):(\d+\.\d+)", line)
-                        if m:
-                            duration[0] = (
-                                float(m.group(1)) * 3600
-                                + float(m.group(2)) * 60
-                                + float(m.group(3))
-                            )
-                    m = re.search(r"time=(\d+):(\d+):(\d+\.\d+)", line)
-                    if m and duration[0]:
-                        current = (
-                            float(m.group(1)) * 3600
-                            + float(m.group(2)) * 60
-                            + float(m.group(3))
-                        )
-                        try:
-                            progress_callback(min(int(current * 100 / duration[0]), 100))
-                        except Exception:
-                            pass
+                    # The reader thread is the only writer to ``duration``;
+                    # the main thread reads it only after the loop drains.
+                    _parse_progress_line(line)
         except (ValueError, OSError):
             # pipe closed by ``terminate()`` / ``kill()`` — expected
             # during an abort, not a bug.
@@ -311,6 +365,56 @@ def get_video_info(ffmpeg_path, video_path):
         return info
     except Exception:
         return {}
+
+
+def get_audio_streams(ffmpeg_path, video_path):
+    """Return the audio tracks in ``video_path`` in FFmpeg audio order.
+
+    Each result contains ``audio_index`` (the value used by ``-map
+    0:a:<index>``), the global stream ``index`` and user-facing metadata such
+    as language, title, codec and channel count. An empty list is returned on
+    missing binaries, malformed media or probe errors.
+    """
+    ffprobe = get_ffprobe_path()
+    if not ffprobe or not os.path.exists(video_path):
+        return []
+    try:
+        cmd = [
+            ffprobe,
+            "-v", "error",
+            "-select_streams", "a",
+            "-show_entries",
+            "stream=index,codec_name,channels,channel_layout,sample_rate,bit_rate:"
+            "stream_tags=language,title",
+            "-of", "json",
+            video_path,
+        ]
+        result = subprocess.run(cmd, timeout=30, **_run_kwargs())
+        if result.returncode != 0:
+            return []
+        payload = json.loads(result.stdout or "{}")
+        streams = payload.get("streams", [])
+        if not isinstance(streams, list):
+            return []
+        tracks = []
+        for audio_index, stream in enumerate(streams):
+            if not isinstance(stream, dict):
+                continue
+            tags = stream.get("tags") or {}
+            tracks.append({
+                "audio_index": audio_index,
+                "index": stream.get("index"),
+                "codec_name": stream.get("codec_name", ""),
+                "channels": stream.get("channels"),
+                "channel_layout": stream.get("channel_layout", ""),
+                "sample_rate": stream.get("sample_rate", ""),
+                "bit_rate": stream.get("bit_rate", ""),
+                "language": tags.get("language", ""),
+                "title": tags.get("title", ""),
+            })
+        return tracks
+    except Exception:
+        return []
 
 
 def health_check_ffmpeg(ffmpeg_path, timeout=10):
@@ -494,6 +598,17 @@ def build_args(input_path, output_path, settings, loudnorm_meas=None):
     # Audio con soporte de audio boost (single-pass o two-pass lineal)
     audio = settings.get("audio", "copy")
     audio_boost = bool(settings.get("audio_boost", False))
+    try:
+        audio_stream_index = max(0, int(settings.get("audio_stream_index", 0)))
+    except (TypeError, ValueError):
+        audio_stream_index = 0
+
+    # Explicit maps are important for MKV files with several audio tracks:
+    # FFmpeg's implicit stream selection otherwise silently picks the first
+    # one, regardless of the track chosen in the UI.
+    args.extend(["-map", "0:v:0"])
+    if audio != "noaudio":
+        args.extend(["-map", f"0:a:{audio_stream_index}?"])
 
     if audio == "noaudio":
         args.extend(["-an"])

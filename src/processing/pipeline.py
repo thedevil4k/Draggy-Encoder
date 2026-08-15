@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import queue as queue_module
 import random
 import re
 import shutil
@@ -15,7 +16,7 @@ from datetime import datetime
 import numpy as np
 
 from src.ai.registry import get_engine_meta
-from src.config import get_logs_dir, resolve_codec
+from src.config import get_codec_entry, get_logs_dir, resolve_codec
 from src.ffmpeg.loudnorm import measure_loudness
 from src.ffmpeg.runner import (
     _build_loudnorm_filter,
@@ -229,6 +230,56 @@ def _needs_audio_reencode(settings):
     return True
 
 
+# Techo para la pasada de medición loudnorm. La medición decodifica SOLO
+# audio (~65x tiempo real): un vídeo de 8 min tarda ~7 s, pero una película
+# de 2 h tardaría ~2 min en serie antes de que arranque el encode. Los clips
+# más largos que el techo se miden sobre una VENTANA CENTRAL representativa
+# (evita intros/outros atípicos); el resto se mide exacto. Ajustable con
+# ``settings["measure_cap_seconds"]``.
+_MEASURE_CAP_SECONDS = 600.0  # 10 min
+
+
+def _measure_bounds(start_time, end_time, duration_s, cap=_MEASURE_CAP_SECONDS):
+    """Devuelve ``(ms_start, ms_end)`` en segundos para la pasada de medición.
+
+    Si la ventana a medir cabe entera en ``cap`` se devuelve tal cual
+    (medición exacta, sin pérdida de precisión). Si es más larga, se toma
+    una ventana central de ``cap`` segundos para acotar el tiempo de análisis
+    manteniendo una muestra representativa.
+    """
+    start = _parse_time_to_seconds(start_time)
+    end = _parse_time_to_seconds(end_time)
+    s = 0.0 if start is None else float(start)
+    e = float(duration_s or 0) if end is None else float(end)
+    if e <= s:
+        return start_time, end_time
+    window = e - s
+    if window <= cap:
+        return start_time, end_time
+    mid = s + window / 2.0
+    ms = max(s, mid - cap / 2.0)
+    me = min(e, ms + cap)
+    return ms, me
+
+
+def _coerce_output_for_codec(output_path, settings):
+    """Ajusta contenedor y extensión si el codec elegido no cabe en MP4.
+
+    ProRes y DNxHR (y cualquier codec ``mp4_incompatible``) no se pueden
+    muxear en MP4: si el usuario eligió "mp4", cambiamos el contenedor al
+    preferido por el codec (mov/mkv) y reescribimos la extensión del destino
+    para que FFmpeg infiera el muxer correcto en vez de fallar en silencio.
+    """
+    entry = get_codec_entry(settings.get("codec"))
+    if not (entry and entry.get("mp4_incompatible") and settings.get("format") == "mp4"):
+        return output_path, settings
+    container = entry.get("container", "mkv")
+    settings = dict(settings)
+    settings["format"] = container
+    base, _ext = os.path.splitext(output_path)
+    return base + "." + container, settings
+
+
 def _measure_if_needed(ffmpeg_path, input_path, settings, status_callback=None,
                        start_time=None, end_time=None, abort_event=None,
                        supervisor: ProcessSupervisor | None = None):
@@ -236,21 +287,33 @@ def _measure_if_needed(ffmpeg_path, input_path, settings, status_callback=None,
 
     Devuelve el dict medido (modulo de loudnorm) o None si no aplica / falla.
     Para el preview se puede pasar ``start_time`` / ``end_time`` para medir
-    únicamente el trozo que se va a codificar, ahorrando tiempo.
+    únicamente el trozo que se va a codificar. Para clips muy largos la
+    medición se acota a una ventana central (``_measure_bounds``) para no
+    serializar minutos de análisis de audio antes del encode.
     """
     if not settings.get("audio_boost"):
         return None
     if not _needs_audio_reencode(settings):
         return None
+    cap = settings.get("measure_cap_seconds")
+    try:
+        cap = float(cap) if cap is not None else _MEASURE_CAP_SECONDS
+    except (TypeError, ValueError):
+        cap = _MEASURE_CAP_SECONDS
+    duration_s = settings.get("duration_seconds")
+    if duration_s is None:
+        duration_s = _get_duration_seconds(ffmpeg_path, input_path) or 0
+    ms_start, ms_end = _measure_bounds(start_time, end_time, duration_s, cap)
     if status_callback:
         status_callback("Analyzing audio levels (first pass)...")
     try:
         return measure_loudness(
             ffmpeg_path, input_path,
-            start_time=start_time, end_time=end_time,
+            start_time=ms_start, end_time=ms_end,
             status_callback=status_callback,
             abort_event=abort_event,
             supervisor=supervisor,
+            audio_stream_index=settings.get("audio_stream_index", 0),
         )
     except Exception:
         return None
@@ -275,6 +338,7 @@ def compress_video(ffmpeg_path, input_path, output_path, settings,
     ``_abort_running_worker`` in ``src/ui/main_window.py``).
     """
     settings = dict(settings)
+    output_path, settings = _coerce_output_for_codec(output_path, settings)
     preflight_errors = validate_render_preflight(
         ffmpeg_path, input_path, output_path, settings,
     )
@@ -312,22 +376,26 @@ def compress_video(ffmpeg_path, input_path, output_path, settings,
         except Exception as exc:
             logger.warning("ai_engines plumbing failed: %s", exc)
 
-    # El audio boost en la ruta estándar es two-pass loudnorm: primero se
-    # mide (fase "Audio boost") y después el filtro se aplica DENTRO del
-    # mismo encode que comprime el vídeo. Antes la fase de audio se emitía
-    # como un flash 0→100 al terminar la medición y el status_label se
-    # quedaba pegado en "Analyzing audio levels..." durante TODO el encode,
-    # así que el usuario veía la barra "en audio" hasta el final.
+    # El audio boost en la ruta estándar es two-pass loudnorm. La fase
+    # "measure" cubre SOLO la medición (pasada 1) y termina en cuanto se
+    # obtienen los valores; la pasada 2 comprime el vídeo y aplica el filtro
+    # loudnorm EN EL MISMO encode, así que "Compressing video" y "Boosting
+    # audio" avanzan juntas (es exactamente lo que hace ffmpeg). Antes la
+    # medición iba metida dentro de la fase de audio y el usuario veía la
+    # barra "en audio" hasta el final de la compresión.
     audio_boost_active = (
         bool(settings.get("audio_boost")) and _needs_audio_reencode(settings)
     )
     if audio_boost_active:
-        _emit_phase(phase_cb, "start", "audio", label="Audio boost", pct=0)
+        _emit_phase(phase_cb, "start", "measure", label="Analyzing audio levels", pct=0)
         # "start" deja la fase en PENDING; un progress inicial la marca
-        # RUNNING mientras se mide y se aplica el boost.
-        _emit_phase(phase_cb, "progress", "audio", pct=0)
+        # RUNNING mientras dura la pasada de medición.
+        _emit_phase(phase_cb, "progress", "measure", pct=0)
 
-    _emit_phase(phase_cb, "start", "compress", label="Compress / Encode", pct=0)
+    _emit_phase(phase_cb, "start", "compress", label="Compressing video", pct=0)
+    if audio_boost_active:
+        _emit_phase(phase_cb, "start", "audio", label="Boosting audio", pct=0)
+
     loudnorm_meas = _measure_if_needed(
         ffmpeg_path, input_path, settings, status_callback=status_callback,
         start_time=settings.get("start_time"),
@@ -336,15 +404,19 @@ def compress_video(ffmpeg_path, input_path, output_path, settings,
         supervisor=supervisor,
     )
 
+    if audio_boost_active:
+        _emit_phase(phase_cb, "progress", "measure", pct=100)
+        _emit_phase(phase_cb, "end", "measure")
+
     temp_output = _make_temp_output_path(output_path)
     try:
         args = build_args(input_path, temp_output, settings, loudnorm_meas=loudnorm_meas)
 
         # Progreso real del encode: avanza a la vez la barra principal y las
         # filas del panel de tareas. Con audio boost, el filtro loudnorm se
-        # aplica en este mismo pase, así que "Audio boost" y "Compress"
-        # avanzan juntos (es exactamente lo que hace ffmpeg: comprimir
-        # vídeo + boostear audio a la vez).
+        # aplica en este mismo pase, así que "Compressing video" y
+        # "Boosting audio" avanzan juntos (es exactamente lo que hace
+        # ffmpeg: comprimir vídeo + boostear audio a la vez).
         def _encode_progress(pct):
             if progress_callback:
                 progress_callback(pct)
@@ -605,6 +677,7 @@ def compress_video_with_ai(
     # create one here so decoder, encoder, audio and mux children still have
     # a common kill path when a model or pipe fails unexpectedly.
     supervisor = supervisor or ProcessSupervisor()
+    output_path, settings = _coerce_output_for_codec(output_path, settings)
     preflight_errors = validate_render_preflight(
         ffmpeg_path, input_path, output_path, settings,
     )
@@ -800,9 +873,9 @@ def compress_video_with_ai(
         _audio_codec != "noaudio" and (_audio_boost or _audio_codec != "copy")
     )
     if _has_audio_phase:
-        phase_labels.append(
-            ("audio", "Audio (parallel)" if _audio_boost else "Audio encode")
-        )
+        if _audio_boost:
+            phase_labels.append(("measure", "Analyzing audio levels"))
+        phase_labels.append(("audio", "Encoding audio"))
     phase_labels.append(("mux", "Finalizing / Mux"))
     for ph_id, ph_label in phase_labels:
         _emit_phase(phase_cb, "start", ph_id, label=ph_label, pct=0)
@@ -954,6 +1027,8 @@ def compress_video_with_ai(
         "pixel_format": pixel_fmt,
         "audio_codec": settings.get("audio", "copy"),
         "audio_boost": bool(settings.get("audio_boost", False)),
+        "audio_stream_index": settings.get("audio_stream_index"),
+        "audio_stream_label": settings.get("audio_stream_label", ""),
         "total_frames": total_frames,
         "fps": fps_str,
         "encoder_fps": encoder_fps_str,
@@ -1307,9 +1382,9 @@ def compress_video_with_ai(
             audio_thread.join(timeout=10)
         if _has_audio_phase:
             if audio_tmp[0]:
-                _emit_phase(phase_cb, "end", "audio", label="Audio (parallel)")
+                _emit_phase(phase_cb, "end", "audio", label="Encoding audio")
             else:
-                _emit_phase(phase_cb, "failed", "audio", label="Audio (parallel)")
+                _emit_phase(phase_cb, "failed", "audio", label="Encoding audio")
         mux_ok = _mux_audio(
             ffmpeg_path, input_path, output_path, audio_codec,
             loudnorm_meas=None,
@@ -1318,6 +1393,7 @@ def compress_video_with_ai(
             audio_file=audio_tmp[0],
             abort_event=abort_event,
             supervisor=supervisor,
+            audio_stream_index=settings.get("audio_stream_index", 0),
         )
         # Si el mux falló sin que el usuario abortase, lo surfaceamos
         # para que no parezca un éxito silencioso (la salida queda
@@ -1620,22 +1696,35 @@ def _encode_audio_parallel(ffmpeg_path, input_path, settings,
     El extension se elige según el codec final para que el mux del
     contenedor destino pueda copiar la pista sin re-encodear.
 
-    ``phase_cb`` (opcional) recibe eventos de fase ``audio`` con progreso
-    real del encode leyendo ``-progress pipe:1`` de ffmpeg, para que la
-    fase "Audio (parallel)" avance en el panel de tareas.
+    ``phase_cb`` (opcional) recibe eventos de fase ``audio`` (y ``measure``
+    cuando hay boost) con progreso real del encode leyendo
+    ``-progress pipe:1`` de ffmpeg, para que esas fases avancen en el panel
+    de tareas.
     """
     audio_codec = str(settings.get("audio", "copy") or "copy")
     audio_boost = bool(settings.get("audio_boost", False))
     container_format = settings.get("format", "mp4")
+    try:
+        audio_stream_index = max(0, int(settings.get("audio_stream_index", 0)))
+    except (TypeError, ValueError):
+        audio_stream_index = 0
     if audio_codec == "noaudio":
         return None
 
     loudnorm_meas = None
     if audio_boost:
+        # El "start" de la fase measure ya lo emite el bucle inicial de
+        # phase_labels (hilo principal); aquí solo la marcamos RUNNING y la
+        # cerramos al terminar la pasada de medición.
+        _emit_phase(phase_cb, "progress", "measure", label="Analyzing audio levels", pct=0)
         loudnorm_meas = _measure_if_needed(
             ffmpeg_path, input_path, settings, status_callback=status_callback,
+            start_time=settings.get("start_time"),
+            end_time=settings.get("end_time"),
             abort_event=abort_event, supervisor=supervisor,
         )
+        _emit_phase(phase_cb, "progress", "measure", pct=100)
+        _emit_phase(phase_cb, "end", "measure")
 
     mux_args = _audio_mux_args(
         audio_codec, loudnorm_meas, audio_boost, container_format,
@@ -1654,16 +1743,30 @@ def _encode_audio_parallel(ffmpeg_path, input_path, settings,
     except Exception:
         pass
 
+    start_time = settings.get("start_time")
+    end_time = settings.get("end_time")
+    start_sec = _parse_time_to_seconds(start_time)
+    end_sec = _parse_time_to_seconds(end_time)
     cmd = [
         ffmpeg_path,
         "-hide_banner", "-loglevel", "warning",
         "-y",
-        "-i", input_path,
-        "-map", "0:a:0?",
+    ]
+    if start_sec is not None:
+        cmd.extend(["-ss", str(start_sec)])
+    cmd.extend(["-i", input_path])
+    if end_sec is not None:
+        if start_sec is not None and end_sec > start_sec:
+            cmd.extend(["-t", str(end_sec - start_sec)])
+        elif start_sec is None:
+            cmd.extend(["-t", str(end_sec)])
+    cmd.extend([
+        "-map", f"0:a:{audio_stream_index}?",
         "-vn",
+        "-threads", "0",
         "-c:a", enc_a,
         "-b:a", "192k",
-    ]
+    ])
     if audio_boost and len(mux_args) >= 4:
         af = mux_args[mux_args.index("-af") + 1]
         cmd.extend(["-af", af])
@@ -1677,8 +1780,19 @@ def _encode_audio_parallel(ffmpeg_path, input_path, settings,
         # un % de la duración del input para que la fase Audio avance.
         cmd.insert(1, "-progress")
         cmd.insert(2, "pipe:1")
+        cmd.insert(3, "-stats_period")
+        cmd.insert(4, "0.1")
 
     duration_s = _get_duration_seconds(ffmpeg_path, input_path) or 0
+    if start_sec is not None:
+        duration_s = max(0.0, duration_s - start_sec)
+    if end_sec is not None:
+        if start_sec is not None and end_sec > start_sec:
+            duration_s = end_sec - start_sec
+        elif start_sec is None:
+            duration_s = end_sec
+    if phase_cb is not None:
+        _emit_phase(phase_cb, "progress", "audio", label="Encoding audio", pct=0)
 
     audio_kwargs = {
         "stdout": subprocess.PIPE if phase_cb is not None else subprocess.DEVNULL,
@@ -1688,15 +1802,36 @@ def _encode_audio_parallel(ffmpeg_path, input_path, settings,
         "stderr": subprocess.DEVNULL,
         "encoding": "utf-8",
         "errors": "replace",
+        "bufsize": 1,
     }
     audio_kwargs.update(process_group_popen_kwargs())
     proc = subprocess.Popen(cmd, **audio_kwargs)
     if supervisor is not None:
         supervisor.register(proc, "audio")
+    progress_reader = None
+    progress_lines = queue_module.Queue()
+    if phase_cb is not None:
+        def _drain_progress():
+            try:
+                for line in proc.stdout:
+                    progress_lines.put(line)
+            except (ValueError, OSError):
+                pass
+            finally:
+                progress_lines.put(None)
+
+        progress_reader = threading.Thread(
+            target=_drain_progress, daemon=True, name="audio-progress-reader"
+        )
+        progress_reader.start()
+
     try:
-        # Track del último out_time_ms para emitir sólo cambios de %.
-        last_pct = -1
-        while proc.poll() is None:
+        # Consume FFmpeg's progress protocol from a reader thread. Reading
+        # stdout directly in this worker made aborts block and could lose the
+        # final progress lines when the process exited between polls.
+        last_pct = 0 if phase_cb is not None else -1
+        eof = False
+        while not eof:
             if abort_event and abort_event.is_set():
                 try:
                     proc.terminate()
@@ -1710,36 +1845,54 @@ def _encode_audio_parallel(ffmpeg_path, input_path, settings,
                 except Exception:
                     pass
                 return None
-            if phase_cb is not None:
-                try:
-                    line = proc.stdout.readline()
-                except Exception:
-                    line = ""
-                if line:
-                    line = line.strip()
-                    if line and "=" in line:
-                        key, _, value = line.partition("=")
-                        value = value.strip()
-                        if key == "out_time_us" or key == "out_time_ms":
-                            # Legacy: out_time_ms en ffmpeg son MICROsegundos.
-                            try:
-                                out_us = float(value)
-                            except (TypeError, ValueError):
-                                out_us = 0.0
-                            if duration_s and duration_s > 0:
-                                pct = int(min(out_us / (duration_s * 1000000.0) * 100, 100))
-                            else:
-                                pct = -1
-                            if pct != last_pct and pct >= 0:
-                                last_pct = pct
-                                _emit_phase(phase_cb, "progress", "audio",
-                                            label="Audio (parallel)", pct=pct)
+            if phase_cb is None:
+                if proc.poll() is not None:
+                    break
+                time.sleep(0.1)
                 continue
-            time.sleep(0.1)
+            try:
+                line = progress_lines.get(timeout=0.1)
+            except queue_module.Empty:
+                if proc.poll() is not None and progress_reader is not None:
+                    # The reader will enqueue its sentinel as soon as the
+                    # pipe reaches EOF; keep draining it before finishing.
+                    continue
+                continue
+            if line is None:
+                eof = True
+                continue
+            line = str(line).strip()
+            if not line or "=" not in line:
+                continue
+            key, _, value = line.partition("=")
+            value = value.strip()
+            seconds = None
+            if key in ("out_time_us", "out_time_ms"):
+                try:
+                    # FFmpeg reports both historical keys in microseconds.
+                    seconds = float(value) / 1_000_000.0
+                except (TypeError, ValueError):
+                    pass
+            elif key == "out_time":
+                seconds = _parse_time_to_seconds(value)
+            if key == "progress" and value == "end":
+                seconds = duration_s
+            if seconds is not None and duration_s > 0:
+                pct = min(max(int(seconds * 100 / duration_s), 0), 100)
+                if pct >= last_pct and pct != last_pct:
+                    last_pct = pct
+                    _emit_phase(
+                        phase_cb, "progress", "audio",
+                        label="Encoding audio", pct=pct,
+                    )
+        if progress_reader is not None:
+            progress_reader.join(timeout=2.0)
+        if proc.poll() is None:
+            proc.wait(timeout=5)
         if proc.returncode == 0 and os.path.exists(tmp_path) and os.path.getsize(tmp_path) > 0:
-            if phase_cb is not None:
+            if phase_cb is not None and last_pct < 100:
                 _emit_phase(phase_cb, "progress", "audio",
-                            label="Audio (parallel)", pct=100)
+                            label="Encoding audio", pct=100)
             return tmp_path
         # stderr is intentionally DEVNULL to keep this background path
         # deadlock-free on Windows. The process return code remains the
@@ -1754,6 +1907,16 @@ def _encode_audio_parallel(ffmpeg_path, input_path, settings,
             proc.stderr.close()
         except Exception:
             pass
+        try:
+            if proc.stdout and not proc.stdout.closed:
+                proc.stdout.close()
+        except Exception:
+            pass
+        if progress_reader is not None:
+            try:
+                progress_reader.join(timeout=1.0)
+            except Exception:
+                pass
         if (proc.returncode is None or proc.returncode != 0) and os.path.exists(tmp_path):
             try:
                 os.remove(tmp_path)
@@ -1764,7 +1927,8 @@ def _encode_audio_parallel(ffmpeg_path, input_path, settings,
 def _mux_audio(ffmpeg_path, input_path, output_path, audio_codec="copy",
                loudnorm_meas=None, audio_boost=False, container_format="mp4",
                audio_file=None, abort_event=None,
-               supervisor: ProcessSupervisor | None = None):
+               supervisor: ProcessSupervisor | None = None,
+               audio_stream_index=0):
     """Mux audio from the original input into the upscaled output.
 
     Uses ``ffmpeg -i upscaled.{ext} -i original.mp4 -map 0:v -map 1:a
@@ -1804,13 +1968,18 @@ def _mux_audio(ffmpeg_path, input_path, output_path, audio_codec="copy",
             tmp_out = output_path + ".mux" + out_ext
             cleanup_path = tmp_out
 
+        try:
+            audio_stream_index = max(0, int(audio_stream_index))
+        except (TypeError, ValueError):
+            audio_stream_index = 0
+        source_audio_map = "1:a:0?" if audio_file else f"1:a:{audio_stream_index}?"
         cmd = [
         ffmpeg_path,
         "-hide_banner", "-loglevel", "warning",
         "-i", output_path,
         "-i", (audio_file or input_path),
         "-map", "0:v:0",
-        "-map", "1:a?",
+        "-map", source_audio_map,
         "-c:v", "copy",
         ]
         if audio_file:

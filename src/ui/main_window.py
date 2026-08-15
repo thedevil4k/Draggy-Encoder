@@ -25,7 +25,7 @@ from PySide6.QtWidgets import (
 
 from src.config import APP_NAME, get_asset_path
 import src.preferences as preferences
-from src.ffmpeg.runner import get_video_info, health_check_ffmpeg
+from src.ffmpeg.runner import get_audio_streams, get_video_info, health_check_ffmpeg
 from src.ffmpeg.process_supervisor import ProcessSupervisor
 from src.processing.pipeline import (
     compress_video,
@@ -899,6 +899,9 @@ class MainWindow(QMainWindow):
         self.workflow.engine_changed.connect(
             self._on_engine_changed
         )
+        self.workflow.active_changed.connect(
+            self._on_ai_activity_changed
+        )
         self.workflow.video_dropped.connect(self._on_video_dropped)
         layout.addWidget(self.workflow)
 
@@ -1242,6 +1245,14 @@ class MainWindow(QMainWindow):
             event.ignore()
 
     def _update_original_bitrate(self, path):
+        # Probe every audio stream as well as the video metadata. The selected
+        # ordinal is later propagated to FFmpeg as ``-map 0:a:N``.
+        try:
+            self.settings_panel.set_audio_tracks(
+                get_audio_streams(self.ffmpeg_path, path)
+            )
+        except Exception:
+            self.settings_panel.set_audio_tracks([])
         info = get_video_info(self.ffmpeg_path, path)
         try:
             bitrate = int(info.get("bit_rate", 0))
@@ -1301,20 +1312,23 @@ class MainWindow(QMainWindow):
         w = getattr(self, "_input_width", 0)
         h = getattr(self, "_input_height", 0)
         if not w or not h:
+            self.workflow.set_upscale_output_info("")
             return
-        # Get the selected upscale model info from the workflow.
+        # An installed/default model is not an active pipeline step. Do not
+        # advertise an output resolution until the user enables Upscale.
         for step in self.workflow.middle_steps:
             if getattr(step, "name", "") == "Upscale":
+                if not getattr(step, "active", False):
+                    self.workflow.set_upscale_output_info("")
+                    return
                 info = step.get_selected_model_info()
                 engine_id = info.get("engine_id", "")
                 scale = info.get("scale", 1)
-                model_path = info.get("model_path")
                 if not engine_id:
                     self.workflow.set_upscale_output_info("")
                     return
                 if scale > 1:
                     out_w, out_h = w * scale, h * scale
-                    model_name = os.path.basename(model_path) if model_path else engine_id
                     self.workflow.set_upscale_output_info(
                         f"Output: {out_w}x{out_h} ({scale}x)"
                     )
@@ -1323,40 +1337,50 @@ class MainWindow(QMainWindow):
                 return
 
     def _update_ai_rendered_bitrate(self):
-        """Show estimated output bitrate after AI processing.
+        """Show the estimate only when at least one AI node is active.
 
-        The idea: if the video goes through upscale (and eventually
-        interpolation/denoise), the output has more pixels (and
-        potentially more frames).  To keep the *same visual quality*
-        the bitrate must scale proportionally.
+        Upscaling increases pixels and interpolation increases frames per
+        second, so both factors affect the bitrate estimate. Denoise,
+        colorize and face restoration keep the source dimensions but still
+        count as an active AI pipeline and therefore show the unchanged
+        baseline instead of a misleading always-visible label.
         """
+        active_steps = [
+            step for step in getattr(self.workflow, "middle_steps", [])
+            if getattr(step, "active", False)
+        ]
         w = getattr(self, "_input_width", 0)
         h = getattr(self, "_input_height", 0)
         orig_kbps = getattr(self, "_input_bitrate_kbps", 0)
-        if not w or not h or not orig_kbps:
+        if not active_steps or not w or not h or not orig_kbps:
             self.settings_panel.set_ai_bitrate("")
             return
 
-        # Determine effective output resolution from active AI steps.
         scale = 1
-        for step in self.workflow.middle_steps:
+        interpolation_factor = 1
+        for step in active_steps:
             if getattr(step, "name", "") == "Upscale":
                 info = step.get_selected_model_info()
-                scale = info.get("scale", 1)
-                break
+                try:
+                    scale *= max(1, int(info.get("scale", 1) or 1))
+                except (TypeError, ValueError):
+                    pass
+            elif getattr(step, "name", "") == "Interp":
+                # The current interpolation pipeline doubles the frame rate.
+                interpolation_factor = 2
 
-        out_w = w * scale
-        out_h = h * scale
-
-        if out_w == w and out_h == h:
-            self.settings_panel.set_ai_bitrate("")
-            return
-
-        pixel_ratio = (out_w * out_h) / (w * h)
-        estimated = int(orig_kbps * pixel_ratio)
+        pixel_ratio = float(scale * scale)
+        estimated = max(1, int(orig_kbps * pixel_ratio * interpolation_factor))
+        suffix = []
+        if scale > 1:
+            suffix.append(f"{scale}x pixels")
+        if interpolation_factor > 1:
+            suffix.append("2x FPS")
+        reason = f"; {', '.join(suffix)}" if suffix else ""
         self.settings_panel.set_ai_bitrate(
-            f"AI Rendered bitrate: ~{estimated:,} kbps (estimated)"
+            f"AI Rendered bitrate: ~{estimated:,} kbps (estimated{reason})"
         )
+
 
     def _select_output(self):
         dir_path = QFileDialog.getExistingDirectory(
@@ -1373,10 +1397,14 @@ class MainWindow(QMainWindow):
                 pass
 
     def _on_engine_changed(self, node_name, engine_id):
-        """Handle engine selection change in any AI workflow node."""
-        if node_name == "Upscale":
-            self._update_upscale_output_info()
-            self._update_ai_rendered_bitrate()
+        """Refresh AI-derived hints after any node/model change."""
+        self._update_upscale_output_info()
+        self._update_ai_rendered_bitrate()
+
+    def _on_ai_activity_changed(self, node_name, active):
+        """Refresh AI-derived hints when a node is toggled on or off."""
+        self._update_upscale_output_info()
+        self._update_ai_rendered_bitrate()
 
     def _show_hardware(self):
         dialog = HardwareDialog(self.hardware_info, self)

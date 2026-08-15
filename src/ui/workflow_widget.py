@@ -853,6 +853,9 @@ class WorkflowWidget(QWidget):
     model_selected = Signal(dict)
     # Emitted when any AI step's engine dropdown changes. Arg: (node_name, engine_id).
     engine_changed = Signal(str, str)
+    # Emitted when an AI node is enabled/disabled. MainWindow uses this to
+    # refresh derived hints such as the estimated AI bitrate immediately.
+    active_changed = Signal(str, bool)
     # Emitted when the user drops video files onto the Import step.
     # Arg: list of local video paths.
     video_dropped = Signal(list)
@@ -883,6 +886,7 @@ class WorkflowWidget(QWidget):
             step.clicked_for_manage.connect(self._on_step_manage_requested)
             step.search_requested.connect(self._on_search_requested)
             step.engine_changed.connect(self.engine_changed.emit)
+            step.active_changed.connect(self.active_changed.emit)
 
     def _connect_state_bus(self):
         """Wire workflow nodes to the AI state bus.

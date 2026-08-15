@@ -515,7 +515,12 @@ def _build_pytorch_command(variant: str) -> list[str]:
 
 
 def _build_onnx_command(variant: str) -> list[str]:
-    """Construye el comando pip para instalar onnxruntime."""
+    """Construye el comando pip para instalar onnxruntime.
+
+    Se conserva como referencia del contrato (pip privado + flags aislantes)
+    y para los tests; ``install_onnxruntime`` usa ahora la descarga directa
+    del wheel (``_install_onnxruntime_from_wheel``), que es más robusta.
+    """
     variant = _resolve_variant(variant)
     pkg = "onnxruntime-gpu" if variant.startswith("cuda") else "onnxruntime"
     return [
@@ -527,6 +532,205 @@ def _build_onnx_command(variant: str) -> list[str]:
         "--upgrade",
         pkg,
     ]
+
+
+def _cp_tag() -> str:
+    """Tag de CPython exacto del intérprete en ejecución (``cp314``)."""
+    return f"cp{sys.version_info.major}{sys.version_info.minor}"
+
+
+def _wheel_matches_cp(filename: str) -> bool:
+    """True si el wheel es ABI-compatible con el intérprete en ejecución.
+
+    Compara el tag de Python Y el tag ABI exactos (``cp314-cp314``). Así un
+    wheel free-threaded (``cp314-cp314t``) NO coincide, porque sus últimos
+    tres segmentos son ``python-abi-platform``.
+    """
+    stem = filename[:-4] if filename.endswith(".whl") else filename
+    parts = stem.split("-")
+    if len(parts) < 3:
+        return False
+    cp = _cp_tag()
+    return parts[-3] == cp and parts[-2] == cp
+
+
+def _wheel_matches_platform(filename: str) -> bool:
+    """True si el wheel es para la plataforma/arquitectura actual."""
+    stem = filename[:-4] if filename.endswith(".whl") else filename
+    platform = stem.split("-")[-1]
+    if sys.platform == "win32":
+        return platform in ("win_amd64", "win32", "win_arm64")
+    if sys.platform == "darwin":
+        return platform.startswith("macosx")
+    return platform.startswith("manylinux") or platform.startswith("linux")
+
+
+def _onnx_wheel_info(variant: str) -> tuple[str, str, str]:
+    """Resuelve ``(url, sha256, filename)`` del wheel oficial de ONNX Runtime.
+
+    Consulta la API JSON de PyPI (lo mismo que usa pip, pero sin su resolución
+    ni su pila SSL) y elige el wheel compatible con el intérprete y la
+    plataforma actuales. Lanza ``RuntimeError`` con un mensaje accionable si
+    no existe (p. ej. Python demasiado nuevo).
+    """
+    import requests
+
+    variant = _resolve_variant(variant)
+    pkg = "onnxruntime-gpu" if variant.startswith("cuda") else "onnxruntime"
+    try:
+        resp = requests.get(f"https://pypi.org/pypi/{pkg}/json", timeout=30)
+        resp.raise_for_status()
+        data = resp.json()
+    except requests.RequestException as exc:
+        raise RuntimeError(
+            f"No se pudo consultar la versión disponible de {pkg}: {exc}"
+        ) from exc
+    for entry in data.get("urls", []):
+        filename = entry.get("filename", "")
+        if not filename.endswith(".whl"):
+            continue
+        if not _wheel_matches_cp(filename) or not _wheel_matches_platform(filename):
+            continue
+        sha256 = (entry.get("digests") or {}).get("sha256", "")
+        return entry["url"], sha256, filename
+    raise RuntimeError(
+        f"No se encontró un wheel de {pkg} compatible con tu Python "
+        f"({sys.version.split()[0]}) y plataforma ({sys.platform}). "
+        "Prueba con otra versión de Python."
+    )
+
+
+def _sha256_file(path: str) -> str:
+    import hashlib
+
+    digest = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _download_resumable(
+    url: str,
+    dest: str,
+    sha256_hex: str = "",
+    progress_callback=None,
+    start_pct: int = 0,
+    end_pct: int = 100,
+    message: str = "Descargando...",
+    abort_event=None,
+) -> str:
+    """Descarga ``url`` a ``dest`` con reanudación (``Range``) y verificación.
+
+    Escribe en ``dest + ".part"`` y, al terminar y verificar el SHA-256, lo
+    mueve atómicamente a ``dest`` (``os.replace``). Si la descarga se
+    interrumpe, la siguiente llamada reanuda desde lo ya descargado; un
+    checksum incorrecto borra el ``.part`` para no arrastrar datos corruptos.
+    Lanza ``RuntimeError("cancelled by user")`` si se setea ``abort_event``.
+    """
+    import requests
+
+    part = dest + ".part"
+    have = os.path.getsize(part) if os.path.exists(part) else 0
+    headers = {"Range": f"bytes={have}-"} if have else {}
+    mode = "ab" if have else "wb"
+    try:
+        with requests.get(url, stream=True, headers=headers, timeout=60) as resp:
+            if resp.status_code == 416:
+                # El servidor dice que el rango pedido ya está completo; la
+                # verificación de checksum de abajo lo confirma o lo rechaza.
+                pass
+            else:
+                if have and resp.status_code != 206:
+                    # El servidor ignoró Range: reiniciar desde cero.
+                    have = 0
+                    mode = "wb"
+                total = have
+                content_length = resp.headers.get("Content-Length", "")
+                if content_length and content_length.isdigit():
+                    total = have + int(content_length)
+                with open(part, mode) as fh:
+                    for chunk in resp.iter_content(1 << 20):
+                        if abort_event is not None and abort_event.is_set():
+                            raise RuntimeError("cancelled by user")
+                        if not chunk:
+                            continue
+                        fh.write(chunk)
+                        have += len(chunk)
+                        if progress_callback and total:
+                            frac = min(1.0, have / total)
+                            pct = start_pct + (end_pct - start_pct) * frac
+                            progress_callback(int(pct), message)
+    except requests.RequestException as exc:
+        raise RuntimeError(
+            f"Fallo de red descargando el runtime: {exc}. "
+            "Se guardó lo descargado; reintenta para continuar donde quedó."
+        ) from exc
+
+    if sha256_hex and _sha256_file(part).lower() != sha256_hex.lower():
+        try:
+            os.remove(part)
+        except OSError:
+            pass
+        raise RuntimeError(
+            "La descarga no pasó la verificación SHA-256 (archivo corrupto o "
+            "incompleto). Vuelve a intentarlo."
+        )
+
+    os.replace(part, dest)
+    return dest
+
+
+def _install_onnxruntime_from_wheel(
+    variant: str,
+    report: dict,
+    progress_callback,
+    start_pct: int,
+    end_pct: int,
+    abort_event=None,
+    timeout: float | None = None,
+) -> None:
+    """Descarga el wheel de ONNX Runtime (reanudable + SHA-256) y lo instala.
+
+    La parte pesada (el wheel, 20–250 MB) se baja con ``_download_resumable``,
+    de modo que un corte de red no reinicia la descarga y el contenido se
+    verifica. pip instala el archivo LOCAL y solo resuelve las dependencias
+    pequeñas (flatbuffers/numpy/packaging/protobuf), que fallan mucho menos.
+    """
+    url, sha256_hex, filename = _onnx_wheel_info(variant)
+    wheel_dir = tempfile.mkdtemp(prefix=".drag-onnx-")
+    try:
+        download_end = start_pct + int((end_pct - start_pct) * 0.7)
+        wheel_path = _download_resumable(
+            url,
+            os.path.join(wheel_dir, filename),
+            sha256_hex=sha256_hex,
+            progress_callback=progress_callback,
+            start_pct=start_pct,
+            end_pct=download_end,
+            message="Descargando ONNX Runtime...",
+            abort_event=abort_event,
+        )
+        _run_pip_checked(
+            report,
+            [
+                *_pip_command_prefix(), "install",
+                "--isolated", "--no-cache-dir", "--disable-pip-version-check",
+                "--ignore-installed", "--only-binary=:all:",
+                "--target", RUNTIME_MODULES_DIR,
+                "--no-warn-script-location",
+                "--upgrade",
+                wheel_path,
+            ],
+            progress_callback,
+            start_pct=download_end,
+            end_pct=end_pct,
+            message="Instalando ONNX Runtime...",
+            abort_event=abort_event,
+            timeout=timeout,
+        )
+    finally:
+        _rmtree_quiet(wheel_dir)
 
 
 # ---------------------------------------------------------------------------
@@ -1245,15 +1449,10 @@ def install_onnxruntime(
     _purge_foreign_version_wheels()
     used_variant = _resolve_variant(variant)
     _check_disk_space("onnxruntime", used_variant)
-    _run_pip_checked(
-        report,
-        _build_onnx_command(used_variant),
-        progress_callback,
-        start_pct=5,
-        end_pct=99,
-        message="Descargando ONNX Runtime...",
-        abort_event=abort_event,
-        timeout=timeout,
+    _install_onnxruntime_from_wheel(
+        used_variant, report, progress_callback,
+        start_pct=5, end_pct=99,
+        abort_event=abort_event, timeout=timeout,
     )
     _purge_foreign_version_wheels()
     if progress_callback:
@@ -1310,16 +1509,11 @@ def install_runtimes(
         timeout=timeout,
     )
 
-    # 2. ONNX Runtime
-    _run_pip_checked(
-        report,
-        _build_onnx_command(used_variant),
-        progress_callback,
-        start_pct=86,
-        end_pct=99,
-        message="Descargando ONNX Runtime...",
-        abort_event=abort_event,
-        timeout=timeout,
+    # 2. ONNX Runtime (wheel oficial descargado de forma reanudable)
+    _install_onnxruntime_from_wheel(
+        used_variant, report, progress_callback,
+        start_pct=86, end_pct=99,
+        abort_event=abort_event, timeout=timeout,
     )
 
     _purge_foreign_version_wheels()

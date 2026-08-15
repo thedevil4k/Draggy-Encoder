@@ -1,6 +1,6 @@
 import re
 
-from src.config import ALL_KNOWN_CODECS
+from src.config import ALL_KNOWN_CODECS, codecs_for_vendor
 
 
 def _match_any(text, patterns):
@@ -150,13 +150,12 @@ def get_intel_codecs(device_name):
 
 
 def get_cpu_codecs():
-    """Codecs software siempre disponibles en CPU."""
-    return [
-        ("libx264", "H.264 (CPU)"),
-        ("libx265", "HEVC (CPU)"),
-        ("libsvtav1", "AV1 SVT (CPU)"),
-        ("libaom-av1", "AV1 AOM (CPU)"),
-    ]
+    """Codecs software disponibles en CPU (derivados de la tabla declarativa).
+
+    Incluye 8/10/12-bit y lossless/mezzanine (FFV1, ProRes, DNxHR); el probe
+    de compatibilidad de FFmpeg filtra los que no estén compilados.
+    """
+    return codecs_for_vendor("cpu")
 
 
 def get_available_devices_with_codecs(hardware_info):
