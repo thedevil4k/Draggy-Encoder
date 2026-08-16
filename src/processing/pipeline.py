@@ -1358,7 +1358,7 @@ def compress_video_with_ai(
 
     # Gate de integridad: para nosotros un render "éxito" DEVUELVE ALGO.
     # Si nunca llegó a escribir ningún frame (encoder muerto al inicio,
-    # disco lleno, libplacebo incompat) y nadie noto el abort, aquí
+    # disco lleno, codec inválido) y nadie noto el abort, aquí
     # fallamos de verdad en lugar de muxear el 0-frames y reportar True.
     if frame_num == 0:
         msg = (

@@ -27,7 +27,6 @@ from PySide6.QtWidgets import (
     QProgressDialog,
     QPushButton,
     QScrollArea,
-    QTabWidget,
     QVBoxLayout,
     QWidget,
 )
@@ -55,7 +54,6 @@ from src.ai.fetcher import (
 from src.ai.registry import CATALOG, get_engine_dir
 from src.ai.engines_state import dir_has_weights
 from src.config import get_logs_dir
-from src.ffmpeg.full_download_worker import FFmpegFullDownloadWorker
 
 
 # Fases del worker de conversión a mensajes amigables para la fila del
@@ -72,12 +70,6 @@ def _friendly_convert_status(raw: str) -> str:
     return _CONVERT_STATUS_MAP.get(str(raw or "").strip(), str(raw or ""))
 
 
-from src.ffmpeg.manager import (
-    get_active_ffmpeg_choice,
-    get_local_ffmpeg_full_path,
-    has_libplacebo_support,
-    set_active_ffmpeg,
-)
 from src.ffmpeg.upstream import clear_cache
 from src.ui.engines_tab import EnginesTab
 
@@ -258,15 +250,6 @@ class _UpstreamCheckWorker(QThread):
             # La falla queda registrada en el cache (last_error); no
             # necesitamos propagarla. El panel leerá el cache y mostrará
             # el último estado conocido.
-            pass
-        # Warm-up del probe libplacebo (spawn de ``ffmpeg -filters``,
-        # ~250 ms la primera vez). Correrlo aquí evita que el primer
-        # ``get_state()`` de los engines FSR 3.1 no bloquee la GUI con
-        # un subproceso síncrono en el hilo principal.
-        try:
-            from src.ffmpeg.manager import has_libplacebo_support
-            has_libplacebo_support()
-        except Exception:
             pass
         self.done.emit()
 
@@ -555,7 +538,14 @@ class DependenciesDialog(QDialog):
 
     def __init__(self, parent=None, initial_tab=None):
         super().__init__(parent)
-        self.setWindowTitle("Manage Dependencies — DRAGGY ENCODER")
+        # Modo pane único: "ai_engines" abre SOLO el catálogo de modelos;
+        # cualquier otro valor (o None) abre SOLO binarios y runtimes.
+        # Los dos paneles ya no conviven en un mismo diálogo con pestañas.
+        self._engines_mode = initial_tab == "ai_engines"
+        self.setWindowTitle(
+            "AI Engines — DRAGGY ENCODER" if self._engines_mode
+            else "Dependencies — DRAGGY ENCODER"
+        )
         self.setMinimumSize(820, 560)
         self.resize(960, 640)
         self.setStyleSheet(
@@ -572,12 +562,10 @@ class DependenciesDialog(QDialog):
         # el destructor del QThread libera solo).
         self._git_worker = None
         self._onnx_worker = None
-        # Worker de descarga de FFmpeg "full" para FSR 3.1 (libplacebo).
-        self._fsr31_worker = None
-        # Worker de borrado de motores IA (modelos / FFmpeg full).
+        # Worker de borrado de motores IA.
         self._remove_worker = None
-        # Tab a enfocar en el primer paint ("ai_engines" o "binaries").
-        self._initial_tab = initial_tab
+        # Pane de modelos; solo existe en modo AI Engines.
+        self.engines_tab = None
         # Escuchamos el bus de estado para repintar la pestaña AI Engines
         # aunque las mutaciones ocurran en otra ventana (workflow widget,
         # followup al cerrar, etc.). UniqueConnection evita handlers
@@ -623,7 +611,25 @@ class DependenciesDialog(QDialog):
         layout.setSpacing(10)
         layout.setContentsMargins(16, 14, 16, 14)
 
-        title = QLabel("Dependencies")
+        if self._engines_mode:
+            title = QLabel("AI Engines")
+            subtitle_text = (
+                "Catálogo de motores de IA (HuggingFace): descarga, convierte "
+                "a ONNX, cambia de backend y desinstala modelos de upscale, "
+                "interpolación, denoise, colorize y face restore. Los binarios "
+                "y runtimes (FFmpeg, PyTorch, ONNX Runtime) se gestionan en el "
+                "diálogo 'Dependencies'."
+            )
+        else:
+            title = QLabel("Dependencies")
+            subtitle_text = (
+                "Binarios y runtimes (FFmpeg, PyTorch, ONNX Runtime) se "
+                "almacenan dentro de la carpeta del programa (bin/). Los "
+                "modelos de IA se gestionan en el diálogo 'AI Engines'. El "
+                "panel consulta el upstream una vez cada 24 h y muestra una "
+                "insignia 'UPDATE AVAILABLE' cuando hay una build más "
+                "reciente; pulsa 'Update' para traerla."
+            )
         title_font = QFont()
         title_font.setPointSize(16)
         title_font.setBold(True)
@@ -631,98 +637,54 @@ class DependenciesDialog(QDialog):
         title.setStyleSheet("color: #00d2d3;")
         layout.addWidget(title)
 
-        subtitle = QLabel(
-            "Binarios y runtimes se almacenan dentro de la carpeta del programa "
-            "(bin/). Los modelos de IA se gestionan por motor en la pestaña "
-            "'AI Engines'. El panel consulta el upstream una vez cada 24 h y "
-            "muestra una insignia 'UPDATE AVAILABLE' cuando hay una build más "
-            "reciente; pulsa 'Update' para traerla."
-        )
+        subtitle = QLabel(subtitle_text)
         subtitle.setStyleSheet("color: #a0a0b0;")
         subtitle.setWordWrap(True)
         layout.addWidget(subtitle)
 
-        # Pestañas: una para el registro binario/runtime existente y otra
-        # nueva para AI Engines (catálogo HuggingFace). Compartir un mismo
-        # QDialog con QTabWidget es más limpio que un QSplitter (que obligaría
-        # al usuario a gestionar el ancho de los dos paneles).
-        self.tabs = QTabWidget()
-        self.tabs.setStyleSheet(
-            "QTabWidget::pane { border: 1px solid #2c3e50; border-radius: 6px; background-color: #0f0f1a; }"
-            "QTabBar::tab { background-color: #16213e; color: #a0a0b0; padding: 8px 16px; border-top-left-radius: 6px; border-top-right-radius: 6px; }"
-            "QTabBar::tab:selected { background-color: #00d2d3; color: #0f0f1a; font-weight: bold; }"
-        )
-
-        # --- Tab 1: Runtimes & Binaries (comportamiento existente) ---
-        binaries_tab = QWidget()
-        binaries_layout = QVBoxLayout(binaries_tab)
-        binaries_layout.setSpacing(8)
-        binaries_layout.setContentsMargins(8, 8, 8, 8)
-
-        # Selector del binario FFmpeg activo (standard vs full).
-        choice_row = QHBoxLayout()
-        choice_row.setSpacing(8)
-        choice_label = QLabel("FFmpeg in use:")
-        choice_label.setStyleSheet("font-weight: bold;")
-        self.ffmpeg_choice_combo = QComboBox()
-        self.ffmpeg_choice_combo.addItem("Standard (gyan release-full)", "standard")
-        self.ffmpeg_choice_combo.addItem("Full (BtbN, libplacebo)", "full")
-        self.ffmpeg_choice_combo.setToolTip(
-            "Choose which FFmpeg binary encodes your videos. "
-            "The choice applies to new jobs after closing this dialog."
-        )
-        self.ffmpeg_choice_combo.currentIndexChanged.connect(self._on_ffmpeg_choice_changed)
-        choice_row.addWidget(choice_label)
-        choice_row.addWidget(self.ffmpeg_choice_combo, stretch=1)
-        binaries_layout.addLayout(choice_row)
-
-        self.ffmpeg_choice_hint = QLabel("")
-        self.ffmpeg_choice_hint.setStyleSheet("color: #a0a0b0; font-size: 10px;")
-        self.ffmpeg_choice_hint.setWordWrap(True)
-        binaries_layout.addWidget(self.ffmpeg_choice_hint)
-
-        self.scroll = QScrollArea()
-        self.scroll.setWidgetResizable(True)
-        self.container = QWidget()
-        self.container_layout = QVBoxLayout(self.container)
-        self.container_layout.setSpacing(10)
-        self.container_layout.setContentsMargins(0, 0, 0, 0)
-        self.container_layout.addStretch()
-        self.scroll.setWidget(self.container)
-        binaries_layout.addWidget(self.scroll, stretch=1)
-        self.tabs.addTab(binaries_tab, "Runtimes & Binaries")
-
-        # --- Tab 2: AI Engines (modelos HuggingFace) ---
-        self.engines_tab = self._create_engines_tab()
-        self.tabs.addTab(self.engines_tab, "AI Engines")
-
-        layout.addWidget(self.tabs, stretch=1)
+        if self._engines_mode:
+            # Pane único: solo el catálogo de modelos, sin mezcla con
+            # binarios/runtimes.
+            self.engines_tab = self._create_engines_tab()
+            layout.addWidget(self.engines_tab, stretch=1)
+        else:
+            # Pane único: solo binarios y runtimes.
+            self.scroll = QScrollArea()
+            self.scroll.setWidgetResizable(True)
+            self.container = QWidget()
+            self.container_layout = QVBoxLayout(self.container)
+            self.container_layout.setSpacing(10)
+            self.container_layout.setContentsMargins(0, 0, 0, 0)
+            self.container_layout.addStretch()
+            self.scroll.setWidget(self.container)
+            layout.addWidget(self.scroll, stretch=1)
 
         bottom = QHBoxLayout()
-        self.btn_refresh = QPushButton("Refresh")
-        self.btn_refresh.setToolTip("Re-checks the FFmpeg upstream cache and redraws the Binaries tab.")
-        self.btn_refresh.clicked.connect(self._refresh)
+        if not self._engines_mode:
+            self.btn_refresh = QPushButton("Refresh")
+            self.btn_refresh.setToolTip(
+                "Re-checks the FFmpeg upstream cache and redraws the binaries list."
+            )
+            self.btn_refresh.clicked.connect(self._refresh)
         self.btn_logs = QPushButton("Open logs")
         self.btn_logs.clicked.connect(self._open_logs)
         self.btn_close = QPushButton("Close")
         self.btn_close.clicked.connect(self.accept)
-        bottom.addWidget(self.btn_refresh)
+        if not self._engines_mode:
+            bottom.addWidget(self.btn_refresh)
         bottom.addWidget(self.btn_logs)
         bottom.addStretch()
         bottom.addWidget(self.btn_close)
         layout.addLayout(bottom)
+
+        if self._engines_mode:
+            return
 
         self._populate()
 
         # Auto-check inicial en background: respeta cache de 24 h, espera
         # 1.5 s para no estorbar la animación de apertura del diálogo.
         self._schedule_upstream_check(delay_ms=1500, force=False)
-
-        # Si el llamador pidió enfocar una pestaña concreta (p.ej. el
-        # workflow widget cuando el usuario hace click en "no engines — open
-        # AI Engines Manager"), la activamos tras el build.
-        if self._initial_tab == "ai_engines" and self.tabs.count() >= 2:
-            self.tabs.setCurrentIndex(1)
 
     def _create_engines_tab(self):
         """Create the AI Engines tab, with a graceful fallback on error."""
@@ -755,7 +717,6 @@ class DependenciesDialog(QDialog):
         try:
             tab = EnginesTab(self)
             tab.install_requested.connect(self._on_engine_install)
-            tab.fsr31_download_requested.connect(self._on_fsr31_download)
             tab.convert_requested.connect(self._on_engine_convert)
             tab.backend_changed.connect(self._on_engine_backend_changed)
             tab.cancel_convert_requested.connect(self._on_engine_cancel_convert)
@@ -773,9 +734,10 @@ class DependenciesDialog(QDialog):
             w.deleteLater()
         self._row_widgets.clear()
 
-        # La pestaña 'Runtimes & Binaries' muestra solo binarios y runtimes.
-        # Las ranuras de modelos (KIND_MODEL) se gestionan por motor desde la
-        # pestaña 'AI Engines'; no se listan aquí para no duplicar categorías.
+        # El panel Dependencies muestra solo binarios y runtimes.
+        # Las ranuras de modelos (KIND_MODEL) se gestionan por motor desde
+        # el diálogo 'AI Engines'; no se listan aquí para no duplicar
+        # categorías.
         for info in dependencies.list_all():
             if info.get("kind") == dependencies.KIND_MODEL:
                 continue
@@ -784,51 +746,6 @@ class DependenciesDialog(QDialog):
             row.uninstall_requested.connect(self._on_uninstall_requested)
             self.container_layout.insertWidget(self.container_layout.count() - 1, row)
             self._row_widgets.append(row)
-
-        self._sync_ffmpeg_choice_combo()
-
-    def _sync_ffmpeg_choice_combo(self):
-        """Sincroniza el selector del binario activo con lo instalado + preferencia."""
-        if not hasattr(self, "ffmpeg_choice_combo"):
-            return
-        from src.ffmpeg.manager import get_local_ffmpeg_path
-        standard_ok = bool(get_local_ffmpeg_path() and os.path.exists(get_local_ffmpeg_path()))
-        full_ok = bool(get_local_ffmpeg_full_path() and os.path.exists(get_local_ffmpeg_full_path()))
-        current = get_active_ffmpeg_choice()
-
-        self.ffmpeg_choice_combo.blockSignals(True)
-        full_idx = self.ffmpeg_choice_combo.findData("full")
-        model = self.ffmpeg_choice_combo.model()
-        if full_idx >= 0 and model is not None:
-            item = model.item(full_idx)
-            if item is not None:
-                item.setEnabled(full_ok)
-        idx = self.ffmpeg_choice_combo.findData(current)
-        self.ffmpeg_choice_combo.setCurrentIndex(idx if idx >= 0 else 0)
-        self.ffmpeg_choice_combo.blockSignals(False)
-
-        if current == "full":
-            hint = "Using the Full build (BtbN): libplacebo (FSR 3.1) + SVT-AV1 + x264/x265."
-        else:
-            hint = "Using the Standard build (gyan release-full): x264/x265 + SVT-AV1 + libplacebo."
-        if not full_ok:
-            hint += (" Install 'FFmpeg full' from the AI Engines tab (FSR 3.1 rows) "
-                     "to enable the Full option.")
-        self.ffmpeg_choice_hint.setText(hint)
-
-    def _on_ffmpeg_choice_changed(self, _index):
-        """Persiste la elección del binario activo (standard/full)."""
-        choice = self.ffmpeg_choice_combo.currentData()
-        if not choice:
-            return
-        if choice == "full":
-            full = get_local_ffmpeg_full_path()
-            if not (full and os.path.exists(full)):
-                # No instalado: la opción debería estar deshabilitada; revertir.
-                self._sync_ffmpeg_choice_combo()
-                return
-        set_active_ffmpeg(choice)
-        self._sync_ffmpeg_choice_combo()
 
     def _schedule_upstream_check(self, delay_ms=1500, force=False):
         """(Re)programa un único check upstream.
@@ -1084,8 +1001,8 @@ class DependenciesDialog(QDialog):
     #   - lanzar el QThread apropiado o mutar el widget appropriate
     #
     # Decisión: cada acción (install / convert / toggle) REPUEBLA sólo el
-    # tab AI Engines (/ self.engines_tab._rebuild() si existiera). El tab
-    # de binarios no se toca porque su contenido no cambió.
+    # panel AI Engines (/ self.engines_tab._rebuild() si existiera). El
+    # panel de binarios no se toca porque su contenido no cambió.
     # --------------------------------------------------------------------
 
     @staticmethod
@@ -1096,11 +1013,14 @@ class DependenciesDialog(QDialog):
         return get_entry(engine_id)
 
     def _refresh_engines_tab(self):
-        """Repaints the engines tab after a state-changing action.
+        """Repaints the engines panel after a state-changing action.
+
+        No-op en modo Dependencies (sin catálogo): ``engines_tab`` es
+        None y los handlers de motores no existen.
 
         Preferred path: ``EnginesTab.repopulate()`` re-emits every row
         from disk while preserving the user's scroll position in the
-        same QScrollArea. Fallback: rebuild the tab if repopulate
+        same QScrollArea. Fallback: rebuild the panel if repopulate
         raises (for example if the layout has been corrupted).
 
         Guard ``_engines_rebuilding``: ``get_state()`` puede disparar un
@@ -1110,6 +1030,8 @@ class DependenciesDialog(QDialog):
         """
         if getattr(self, "_engines_rebuilding", False):
             return
+        if self.engines_tab is None:
+            return
         self._engines_rebuilding = True
         try:
             try:
@@ -1118,21 +1040,16 @@ class DependenciesDialog(QDialog):
             except Exception:
                 pass
 
-            try:
-                current_index = self.tabs.indexOf(self.engines_tab)
-            except Exception:
-                current_index = 1
-            self.tabs.removeTab(current_index)
+            old_tab = self.engines_tab
             self.engines_tab = EnginesTab(self)
             self.engines_tab.install_requested.connect(self._on_engine_install)
-            self.engines_tab.fsr31_download_requested.connect(self._on_fsr31_download)
             self.engines_tab.convert_requested.connect(self._on_engine_convert)
             self.engines_tab.backend_changed.connect(self._on_engine_backend_changed)
             self.engines_tab.cancel_convert_requested.connect(self._on_engine_cancel_convert)
             self.engines_tab.open_folder.connect(self._on_engine_open_folder)
             self.engines_tab.remove_requested.connect(self._on_engine_remove)
-            self.tabs.insertTab(current_index, self.engines_tab, "AI Engines")
-            self.tabs.setCurrentIndex(current_index)
+            self.layout().replaceWidget(old_tab, self.engines_tab)
+            old_tab.deleteLater()
         finally:
             self._engines_rebuilding = False
 
@@ -1240,7 +1157,7 @@ class DependenciesDialog(QDialog):
         engine = self._find_engine(engine_id) or {}
         sentinel = (engine.get("sentinel", "") or "").strip()
         repo_id = (engine.get("hf_repo_id", "") or "").strip()
-        algorithmic = not repo_id and not sentinel  # FSR: nada que descargar
+        algorithmic = not repo_id and not sentinel  # motores sin repo HF: nada que descargar
         has_weights = dir_has_weights(target_dir)
         has_sentinel = bool(sentinel) and os.path.isfile(os.path.join(target_dir, sentinel))
         if not algorithmic and not has_weights and not has_sentinel:
@@ -1253,7 +1170,7 @@ class DependenciesDialog(QDialog):
                 "Options:\n"
                 "  - Try another engine from the catalog.\n"
                 "  - Or download the .pth/.safetensors/.onnx files manually "
-                "into that folder and re-open this tab.",
+                "into that folder and re-open AI Engines.",
                 progress,
             )
             return
@@ -1376,129 +1293,6 @@ class DependenciesDialog(QDialog):
                 f"Could not install '{engine_id}':\n\n{msg}{hint}",
             )
 
-    # -----------------------------------------------------------------
-    # FSR 3.1 install flow (downloads FFmpeg full + libplacebo)
-    # -----------------------------------------------------------------
-
-    _FSR31_ENGINE_IDS = (
-        "upscale-fsr31-2x",
-        "upscale-fsr31-2x-interp",
-        "upscale-fsr31-3x",
-        "upscale-fsr31-3x-interp",
-        "upscale-fsr31-4x",
-        "upscale-fsr31-4x-interp",
-    )
-
-    def _on_fsr31_download(self, engine_id: str) -> None:
-        """Handle 'Download FFmpeg' click on any FSR 3.1 row.
-
-        All three FSR 3.1 engines share the same FFmpeg-full binary at
-        ``bin/ffmpeg-full/ffmpeg.exe``. A single download marks all three
-        rows as installed.
-        """
-        if engine_id not in self._FSR31_ENGINE_IDS:
-            return
-        if self._fsr31_worker and self._fsr31_worker.isRunning():
-            QMessageBox.information(
-                self, "Busy",
-                "A FFmpeg-full download is already in progress.",
-            )
-            return
-
-        # If the binary is already on disk AND has libplacebo, just mark
-        # all three as ready without re-downloading.
-        existing = get_local_ffmpeg_full_path()
-        if os.path.exists(existing) and has_libplacebo_support(existing):
-            self._mark_fsr31_ready()
-            QMessageBox.information(
-                self, "FSR 3.1 ready",
-                "FFmpeg full with libplacebo is already installed.\n"
-                "All FSR 3.1 engines are ready to use.",
-            )
-            return
-
-        progress = QProgressDialog(
-            "Downloading FFmpeg full (with libplacebo for FSR 3.1)...",
-            None, 0, 100, self,
-        )
-        progress.setWindowModality(Qt.WindowModality.WindowModal)
-        progress.setMinimumDuration(0)
-        progress.setAutoClose(False)
-        progress.setWindowTitle("Downloading FFmpeg full")
-
-        self._fsr31_worker = FFmpegFullDownloadWorker(parent=self)
-        self._fsr31_worker.progress.connect(progress.setValue)
-        self._fsr31_worker.finished_ok.connect(
-            lambda _path: self._on_fsr31_download_ok(progress)
-        )
-        self._fsr31_worker.failed.connect(
-            lambda msg: self._on_fsr31_download_failed(msg, progress)
-        )
-        self._fsr31_worker.start()
-
-    def _on_fsr31_download_ok(self, progress: QProgressDialog) -> None:
-        progress.close()
-        self._fsr31_worker = None
-        # Verify libplacebo before marking ready.
-        ffmpeg_full = get_local_ffmpeg_full_path()
-        if not (os.path.exists(ffmpeg_full) and has_libplacebo_support(ffmpeg_full)):
-            self._on_fsr31_download_failed(
-                "Downloaded binary does not expose libplacebo. Aborting.", progress
-            )
-            return
-        self._mark_fsr31_ready()
-        QMessageBox.information(
-            self, "FSR 3.1 ready",
-            "FFmpeg full with libplacebo installed at:\n"
-            f"{ffmpeg_full}\n\n"
-            "All FSR 3.1 engines (x2 / x3 / x4) are ready to use.",
-        )
-
-    def _on_fsr31_download_failed(self, msg: str, progress: QProgressDialog) -> None:
-        progress.close()
-        self._fsr31_worker = None
-        # Mark all three engines with the same error so the row UI shows it.
-        for eid in self._FSR31_ENGINE_IDS:
-            try:
-                engines_state_patch(
-                    eid,
-                    installed=False,
-                    last_error="FFmpeg full download failed: {}".format(msg),
-                )
-            except Exception:
-                pass
-        self._refresh_engines_tab()
-        QMessageBox.critical(
-            self, "Download FFmpeg failed",
-            "Could not download FFmpeg full (libplacebo).\n\n"
-            "{}\n\n"
-            "Hints:\n"
-            "  - Check your internet connection.\n"
-            "  - All three upstream mirrors (BtbN gpl-shared, BtbN lgpl-shared, "
-            "johnvansickle.com) failed.\n"
-            "  - You can also drop a custom build with libplacebo at:\n"
-            "    {}".format(msg, get_local_ffmpeg_full_path()),
-        )
-
-    def _mark_fsr31_ready(self) -> None:
-        """Mark all three FSR 3.1 engines as installed+enabled in engines.json."""
-        ffmpeg_full = get_local_ffmpeg_full_path()
-        for eid in self._FSR31_ENGINE_IDS:
-            try:
-                engines_state_patch(
-                    eid,
-                    installed=True,
-                    enabled=True,
-                    installed_at_iso=datetime.now(timezone.utc).isoformat(),
-                    install_path=ffmpeg_full,
-                    last_error=None,
-                )
-            except Exception:
-                pass
-        self._refresh_engines_tab()
-        # El build full ya está instalado: habilitar la opción "Full" del selector.
-        self._sync_ffmpeg_choice_combo()
-
     def _on_engine_convert(self, engine_id):
         if not engine_id:
             return
@@ -1533,15 +1327,15 @@ class DependenciesDialog(QDialog):
             parent=self,
         )
         self._onnx_worker_engine_id = engine_id
+        def _set_converting(**kwargs):
+            if self.engines_tab is not None:
+                self.engines_tab.set_engine_converting(engine_id, True, **kwargs)
+
         self._onnx_worker.progress.connect(
-            lambda p: self.engines_tab.set_engine_converting(
-                engine_id, True, progress=p
-            )
+            lambda p: _set_converting(progress=p)
         )
         self._onnx_worker.status.connect(
-            lambda s: self.engines_tab.set_engine_converting(
-                engine_id, True, status=_friendly_convert_status(s)
-            )
+            lambda s: _set_converting(status=_friendly_convert_status(s))
         )
         self._onnx_worker.finished_ok.connect(
             lambda out: self._on_engine_convert_ok(engine_id, out)
@@ -1549,9 +1343,7 @@ class DependenciesDialog(QDialog):
         self._onnx_worker.failed.connect(
             lambda msg: self._on_engine_convert_failed(engine_id, msg)
         )
-        self.engines_tab.set_engine_converting(
-            engine_id, True, status="Preparando la conversión..."
-        )
+        _set_converting(status="Preparando la conversión...")
         self._onnx_worker.start()
 
     def _on_engine_convert_ok(self, engine_id, out_path):
@@ -1577,6 +1369,8 @@ class DependenciesDialog(QDialog):
         """
         self._onnx_worker = None
         self._onnx_worker_engine_id = None
+        if self.engines_tab is None:
+            return
         self.engines_tab.set_engine_converting(engine_id, False)
         if "cancell" in (msg or "").lower():
             self.engines_tab.show_engine_convert_cancelled(engine_id)
@@ -1617,10 +1411,11 @@ class DependenciesDialog(QDialog):
         if not worker or not worker.isRunning():
             return
         worker.cancel()
-        self.engines_tab.set_engine_converting(
-            engine_id, True, status="Cancelando..."
-        )
-        self.engines_tab.set_cancel_convert_enabled(engine_id, False)
+        if self.engines_tab is not None:
+            self.engines_tab.set_engine_converting(
+                engine_id, True, status="Cancelando..."
+            )
+            self.engines_tab.set_cancel_convert_enabled(engine_id, False)
 
     def _on_engine_backend_changed(self, engine_id, backend):
         """Persiste el motor de inferencia elegido (auto/torch/onnxruntime).
@@ -1699,23 +1494,10 @@ class DependenciesDialog(QDialog):
         if not state.get("installed"):
             return
 
-        is_fsr31 = "fsr31" in engine_id
-        if is_fsr31:
-            # Borra el build FFmpeg full (libplacebo) compartido por todos
-            # los motores FSR 3.1.
-            from src.config import get_ffmpeg_full_dir
-            target_dir = get_ffmpeg_full_dir()
-            what = "FFmpeg full (libplacebo)\n  " + target_dir
-            affected = [
-                e["engine_id"] for e in CATALOG
-                if "fsr31" in e["engine_id"]
-            ]
-            extra = "\n\nEsto afectará a todos los motores FSR 3.1."
-        else:
-            target_dir = state.get("install_path") or get_engine_dir(engine_id)
-            what = "model weights\n  " + target_dir
-            affected = [engine_id]
-            extra = ""
+        target_dir = state.get("install_path") or get_engine_dir(engine_id)
+        what = "model weights\n  " + target_dir
+        affected = [engine_id]
+        extra = ""
 
         size = dependencies._safe_dir_size(target_dir)
         size_txt = f" (~{_fmt_bytes(size)})" if size else ""
@@ -1795,7 +1577,7 @@ class DependenciesDialog(QDialog):
         super().reject()
 
     def _kill_workers(self):
-        for w_attr in ("_git_worker", "_onnx_worker", "_fsr31_worker",
+        for w_attr in ("_git_worker", "_onnx_worker",
                        "_uninstall_worker", "_remove_worker", "_bench_worker",
                        "_upstream_worker", "_active_worker"):
             w = getattr(self, w_attr, None)

@@ -183,10 +183,6 @@ def get_state(engine_id: str) -> dict:
         onnx_path          = None
         inference_backend  = "auto" ("auto" | "torch" | "onnxruntime")
         last_error         = None
-
-    FSR 3.1 engines are available when the bundled FFmpeg build exposes
-    the required libplacebo filter; unlike model engines they have no
-    model directory to validate.
     """
     data = _load()
     raw = data.get("engines", {}).get(engine_id) or {}
@@ -204,35 +200,15 @@ def get_state(engine_id: str) -> dict:
     # PyTorch si no).
     if state["inference_backend"] not in ("torch", "onnxruntime"):
         state["inference_backend"] = "auto"
-    # FSR 3.1 requires libplacebo. El build por defecto (gyan release-full /
-    # johnvansickle static) ya lo trae; el binario BtbN "full" es solo un extra
-    # bleeding-edge opcional.
-    if engine_id and "fsr31" in engine_id:
-        try:
-            from src.ffmpeg.manager import get_ffmpeg_path_for_fsr31, has_libplacebo_support
-            ffmpeg_path = get_ffmpeg_path_for_fsr31()
-            if ffmpeg_path and os.path.exists(ffmpeg_path) and has_libplacebo_support(ffmpeg_path):
-                state["installed"] = True
-                state["enabled"] = True
-            else:
-                state["installed"] = False
-                state["enabled"] = False
-                state["last_error"] = "Requires an FFmpeg build with libplacebo support"
-        except Exception:
-            state["installed"] = False
-            state["enabled"] = False
-            state["last_error"] = "Cannot check libplacebo availability"
 
     # Sensor veraz contra disco: si el estado dice "instalado" pero el
     # directorio del modelo ya no existe (el usuario borró/trasladó los
     # pesos a mano, o un borrado quedó a medias), reportamos installed=False
     # y corregimos engines.json para que la UI nunca muestre un INSTALLED
-    # fantasma. FSR 3.1 se excluye: usa el binario FFmpeg full, validado
-    # arriba, y no tiene directorio de modelos.
+    # fantasma.
     if (
         engine_id
         and state.get("installed")
-        and not engine_id.startswith("upscale-fsr")
     ):
         try:
             from src.ai.registry import get_engine_dir

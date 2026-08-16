@@ -128,52 +128,6 @@ class _BannerCheckWorker(QThread):
         self.done.emit()
 
 
-def resolve_fsr3_engine(upscale_info, interp_info):
-    """Resolve the FSR 3.1 engine id / model path / mode from workflow nodes.
-
-    FSR 3.1 decouples upscaling from frame interpolation. The user activates
-    FSR in the Upscale node and/or the Interp node; the underlying engine
-    runs both features when both nodes are active:
-
-      - Upscale(FSR31) + Interp(FSR31) -> mode ``"both"``
-      - Upscale(FSR31) alone            -> mode ``"upscale"``
-      - Interp(FSR31) alone             -> mode ``"interpolate"``
-      - anything else                   -> (upscale engine id, None, "upscale")
-
-    Returns ``(engine_id, model_path, mode)``.
-    """
-    upscale_engine_id = None
-    upscale_model_path = None
-    upscale_scale_info = {}
-    if isinstance(upscale_info, dict):
-        upscale_engine_id = upscale_info.get("engine_id", "")
-        upscale_model_path = upscale_info.get("model_path")
-        upscale_scale_info = upscale_info
-    elif upscale_info:
-        upscale_engine_id = upscale_info
-
-    interp_engine_id = None
-    interp_scale_info = {}
-    if isinstance(interp_info, dict):
-        interp_engine_id = interp_info.get("engine_id", "")
-        interp_scale_info = interp_info
-    elif interp_info:
-        interp_engine_id = interp_info
-
-    fsr3_mode = "upscale"
-    fsr3_engine_id = upscale_engine_id
-    fsr3_model_path = upscale_model_path
-    if upscale_engine_id and "fsr31" in upscale_engine_id:
-        fsr3_mode = upscale_scale_info.get("mode", "upscale")
-        if interp_engine_id and "fsr31" in interp_engine_id:
-            fsr3_mode = "both"
-    elif interp_engine_id and "fsr31" in interp_engine_id:
-        fsr3_mode = "interpolate"
-        fsr3_engine_id = interp_engine_id
-        fsr3_model_path = interp_scale_info.get("model_path")
-    return fsr3_engine_id, fsr3_model_path, fsr3_mode
-
-
 class CompressionWorker(QThread):
     """Worker para ejecutar compresión o preview en segundo plano."""
 
@@ -387,25 +341,14 @@ class CompressionWorker(QThread):
             get_model_path,
             convert_pth_to_onnx_ex,
             PyTorchInferenceEngine,
-            FSR31Engine,
         )
         from src.ai.architectures import is_torch_available
 
         engines = []        # loaded AIInferenceEngine, in chain order
         labels = []         # ["Upscale (Real-ESRGAN x4)", ...]
         errors = []         # human-readable per-node failures
-        fsr31_built = False
 
         ai_map = self.ai_engines or {}
-
-        # FSR 3.1 mode resolution across both workflow nodes (see
-        # ``resolve_fsr3_engine``): Upscale(FSR31) + Interp(FSR31) -> "both",
-        # Upscale(FSR31) alone -> "upscale", Interp(FSR31) alone ->
-        # "interpolate".
-        fsr3_engine_id, fsr3_model_path, fsr3_mode = resolve_fsr3_engine(
-            ai_map.get("Upscale"),
-            ai_map.get("Interpolate"),
-        )
 
         # --- Build the chain in workflow order -------------------------
         for category, info in ai_map.items():
@@ -419,48 +362,6 @@ class CompressionWorker(QThread):
                 continue  # node active but "auto" — keep going
 
             node_label = f"{category} ({eid})"
-
-            # --- FSR engines (pure algorithmic, no model downloads) ---
-            if eid.startswith("upscale-fsr"):
-                if "fsr31" in eid:
-                    # FSR 3.1 decouples upscale (in Upscale node) from
-                    # frame generation (in Interp node); build it ONCE, with
-                    # the combined mode resolved across both nodes. The
-                    # second FSR31 node in the chain adds nothing (it is
-                    # the same engine, merged mode).
-                    if fsr31_built:
-                        continue
-                    if fsr3_engine_id:
-                        try:
-                            eng = FSR31Engine(
-                                fsr3_model_path or "",
-                                fsr3_engine_id,
-                                mode=fsr3_mode,
-                            )
-                            if eng.load():
-                                engines.append(eng)
-                                fsr31_built = True
-                                labels.append(f"{category} (FSR 3.1, mode={fsr3_mode})")
-                                status_cb(f"FSR 3.1 loaded (mode={fsr3_mode}, libplacebo)")
-                            else:
-                                errors.append(
-                                    f"{node_label}: FSR 3.1 requires FFmpeg full "
-                                    "with libplacebo support"
-                                )
-                        except Exception as exc:
-                            errors.append(f"{node_label}: FSR 3.1 failed: {exc}")
-                    continue
-                try:
-                    eng = create_inference_engine(eid, model_path or "")
-                    if eng and getattr(eng, "is_loaded", False):
-                        engines.append(eng)
-                        labels.append(f"{category} (FSR {eid})")
-                        status_cb(f"{category}: {eid} loaded")
-                    else:
-                        errors.append(f"{node_label}: engine did not load")
-                except Exception as exc:
-                    errors.append(f"{node_label}: {exc}")
-                continue
 
             # --- Library model engines (any category) -------------------
             # Strategy: prefer ONNX Runtime when it has an ACTIVE GPU
@@ -588,15 +489,15 @@ class CompressionWorker(QThread):
                     if not node_errors or "No model weights" in detail:
                         hint = (
                             "This engine has no weight files installed. Open "
-                            "Manage Dependencies → Runtimes & Binaries and click "
-                            "'Add Engine' on the model row to download them."
+                            "AI Engines Manager and click 'Add Engine' on the "
+                            "model row to download them."
                         )
                     if backend == "onnxruntime":
                         hint += (
                             "\nThis engine is set to 'ONNX Runtime' in the AI Engines "
                             "tab. The .pth is converted to .onnx automatically; if "
-                            "that failed, switch to 'Auto' or 'PyTorch' in Manage "
-                            "Dependencies → Runtimes & Binaries."
+                            "that failed, switch to 'Auto' or 'PyTorch' in the "
+                            "AI Engines Manager."
                         )
                     elif backend == "torch":
                         hint += (
@@ -606,8 +507,8 @@ class CompressionWorker(QThread):
                         hint += (
                             "\nAuto chose ONNX Runtime (fastest measured on this "
                             "machine) but it could not be loaded. Switch to "
-                            "'PyTorch' in Manage Dependencies → Runtimes & Binaries "
-                            "to force the PyTorch backend."
+                            "'PyTorch' in the AI Engines Manager to force the "
+                            "PyTorch backend."
                         )
                     raise RuntimeError(
                         f"{node_label} could not load.\nDetails: {detail}\n{hint}"
@@ -823,25 +724,33 @@ class MainWindow(QMainWindow):
 
         # Top buttons
         top_layout = QHBoxLayout()
-        self.btn_select = QPushButton("Select Videos")
-        self.btn_select.clicked.connect(self._select_video)
+        self.btn_runtimes = QPushButton("Dependencies")
+        self.btn_runtimes.setToolTip(
+            "FFmpeg, PyTorch, ONNX Runtime: download, update and uninstall "
+            "the non-AI binaries and runtimes."
+        )
+        self.btn_runtimes.clicked.connect(self._show_runtimes)
         self.btn_output = QPushButton(f"Output: ...{os.path.basename(self.output_dir)}")
         self.btn_output.clicked.connect(self._select_output)
         self.btn_hardware = QPushButton("Hardware Info")
         self.btn_hardware.clicked.connect(self._show_hardware)
         self.btn_redetect = QPushButton("Re-detect Hardware & Codecs")
         self.btn_redetect.clicked.connect(self._on_redetect_clicked)
-        self.btn_dependencies = QPushButton(" AI Engines")
-        self.btn_dependencies.setIcon(QIcon(get_asset_path("AI panel.png")))
-        self.btn_dependencies.clicked.connect(self._show_dependencies)
+        self.btn_ai_engines = QPushButton(" AI Engines")
+        self.btn_ai_engines.setIcon(QIcon(get_asset_path("AI panel.png")))
+        self.btn_ai_engines.setToolTip(
+            "AI model catalog: download, convert and remove upscale, "
+            "interpolation, denoise, colorize and face-restore engines."
+        )
+        self.btn_ai_engines.clicked.connect(self._show_dependencies)
         self.btn_preferences = QPushButton("Preferences")
         self.btn_preferences.clicked.connect(self._show_preferences)
 
-        top_layout.addWidget(self.btn_select)
+        top_layout.addWidget(self.btn_runtimes)
         top_layout.addWidget(self.btn_output)
         top_layout.addWidget(self.btn_hardware)
         top_layout.addWidget(self.btn_redetect)
-        top_layout.addWidget(self.btn_dependencies)
+        top_layout.addWidget(self.btn_ai_engines)
         top_layout.addWidget(self.btn_preferences)
         layout.addLayout(top_layout)
 
@@ -849,7 +758,7 @@ class MainWindow(QMainWindow):
         # hace que la fila colapse automaticamente.
         self.update_banner = UpdateBanner()
         self.update_banner.update_requested.connect(self._on_banner_update_clicked)
-        self.update_banner.panel_requested.connect(self._show_dependencies)
+        self.update_banner.panel_requested.connect(self._show_runtimes)
         self.update_banner.history_requested.connect(self._show_preferences_history)
         self.update_banner.dismissed.connect(self.update_banner.hide_banner)
         layout.addWidget(self.update_banner)
@@ -903,6 +812,9 @@ class MainWindow(QMainWindow):
             self._on_ai_activity_changed
         )
         self.workflow.video_dropped.connect(self._on_video_dropped)
+        # Click en la casilla Import = seleccionar videos (el botón
+        # "Select Videos" de la barra superior ya no existe).
+        self.workflow.import_clicked.connect(self._select_video)
         layout.addWidget(self.workflow)
 
         # Settings
@@ -1031,7 +943,7 @@ class MainWindow(QMainWindow):
         elif not torch_ok or not onnx_ok:
             banner.setText(
                 "AI runtimes missing: PyTorch and/or ONNX Runtime are not installed. "
-                "Open Manage Dependencies → Runtimes & Binaries to install them."
+                "Open Dependencies to install them."
             )
             banner.setStyleSheet(
                 "QLabel { background-color: #3a2c00; color: #f39c12; "
@@ -1084,8 +996,8 @@ class MainWindow(QMainWindow):
             return None
         banner = QLabel(
             "Running in a Flatpak sandbox — dragging files from the host "
-            "file manager into the app is not supported. Use the "
-            "'Select Videos' button to import videos."
+            "file manager into the app is not supported. Click the Import "
+            "step in the workflow to select videos."
         )
         banner.setWordWrap(True)
         banner.setStyleSheet(
@@ -1411,29 +1323,41 @@ class MainWindow(QMainWindow):
         dialog.exec()
 
     def _show_dependencies(self):
-        """Open the dependencies manager and land directly on AI Engines.
+        """Open the AI Engines manager (model catalog only).
 
-        The button that triggers this is labelled "AI Engines", so the
-        user expects to land on that tab without an extra click.
+        The button that triggers this is labelled "AI Engines"; the
+        non-AI binaries and runtimes (FFmpeg, PyTorch, ONNX Runtime)
+        live in the separate "Dependencies" dialog (``_show_runtimes``).
         """
         self._open_dependencies(initial_tab="ai_engines")
+
+    def _show_runtimes(self):
+        """Open the Dependencies dialog (binaries & runtimes only).
+
+        FFmpeg, PyTorch and ONNX Runtime install/update/uninstall.
+        Separate from AI Engines so the model catalog never mixes
+        with non-AI dependencies.
+        """
+        self._open_dependencies(initial_tab="binaries")
 
     def _on_manage_engines_requested(self, category):
         """Bridge for ``AIWorkflowStep.clicked_for_manage``.
 
-        Opens ``DependenciesDialog`` directly on the AI Engines tab so
-        the user lands in the right context without having to click
-        around. ``category`` is captured for future use (e.g. a future
-        iteration could pre-filter the catalog by category) but today
-        we just default to the engines tab.
+        Opens the AI Engines dialog so the user lands in the right
+        context without having to click around. ``category`` is
+        captured for future use (e.g. a future iteration could
+        pre-filter the catalog by category) but today we just default
+        to the engines dialog.
         """
         self._open_dependencies(initial_tab="ai_engines")
 
     def _open_dependencies(self, initial_tab=None, install_engine_id=None):
-        """Abre el gestor de dependencias y, si el usuario cambió el binario
-        FFmpeg activo, aplica el cambio re-detectando codecs al cerrar."""
-        from src.ffmpeg.manager import get_active_ffmpeg_choice
-        before = get_active_ffmpeg_choice()
+        """Abre el diálogo de dependencias en el modo indicado.
+
+        ``initial_tab``: "ai_engines" abre el gestor de modelos (solo
+        catálogo); "binaries" (o None) abre Dependencies con los
+        binarios y runtimes (FFmpeg, PyTorch, ONNX Runtime).
+        """
         try:
             dialog = DependenciesDialog(self, initial_tab=initial_tab)
             if install_engine_id:
@@ -1445,27 +1369,16 @@ class MainWindow(QMainWindow):
             traceback.print_exc()
             QMessageBox.critical(
                 self,
-                "AI Engines Manager error",
-                f"Could not open the AI Engines Manager:\n\n{exc}\n\n"
+                "Dependencies error",
+                f"Could not open the dependencies manager:\n\n{exc}\n\n"
                 "See bin/logs for details."
             )
-            return
-        if get_active_ffmpeg_choice() != before:
-            self._apply_ffmpeg_binary_choice()
-
-    def _apply_ffmpeg_binary_choice(self):
-        """Aplica la elección del binario FFmpeg activo y re-detecta codecs."""
-        from src.ffmpeg.manager import get_active_ffmpeg_path
-        active = get_active_ffmpeg_path()
-        if active and active != self.ffmpeg_path:
-            self.ffmpeg_path = active
-            self._on_redetect_clicked()
 
     def _on_model_selected_from_search(self, model: dict):
         """Handle model selection from the HuggingFace search dialog.
 
-        Opens the DependenciesDialog on the AI Engines tab and triggers
-        installation of the selected engine.
+        Opens the AI Engines dialog and triggers installation of the
+        selected engine.
 
         Los modelos del Hub (``is_user``) se registran aquí en
         ``user_models`` antes de abrir el diálogo: el flujo de instalación
@@ -2021,12 +1934,6 @@ class MainWindow(QMainWindow):
         update_available = info.get("update_available")
         last_checked = info.get("last_check_iso")
         last_mod_iso = (info.get("latest_fingerprint") or {}).get("last_modified_iso")
-
-        # Si el usuario tiene ffmpeg-full (libplacebo), NO mostrar el banner
-        # de update del FFmpeg estándar — el usuario ya tiene la versión mejorada.
-        if info.get("libplacebo_available"):
-            self.update_banner.hide_banner()
-            return
 
         if update_available is True:
             title = "FFmpeg update available"

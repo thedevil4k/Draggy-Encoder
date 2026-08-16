@@ -32,7 +32,6 @@ class _CategorySection(QWidget):
     """A small section header + a vertical stack of engine rows."""
 
     install_requested = Signal(str)
-    fsr31_download_requested = Signal(str)
     convert_requested = Signal(str)
     backend_changed = Signal(str, str)
     cancel_convert_requested = Signal(str)
@@ -58,7 +57,6 @@ class _CategorySection(QWidget):
                 row = EngineRow(engine, parent=self)
                 self._rows[engine.get("engine_id", "")] = row
                 row.install_requested.connect(self.install_requested.emit)
-                row.fsr31_download_requested.connect(self.fsr31_download_requested.emit)
                 row.convert_requested.connect(self.convert_requested.emit)
                 row.backend_changed.connect(self.backend_changed.emit)
                 row.cancel_convert_requested.connect(self.cancel_convert_requested.emit)
@@ -84,7 +82,6 @@ class EnginesTab(QWidget):
     """
 
     install_requested = Signal(str)            # engine_id
-    fsr31_download_requested = Signal(str)      # engine_id (FSR 3.1)
     convert_requested = Signal(str)            # engine_id
     backend_changed = Signal(str, str)         # (engine_id, "auto"|"torch"|"onnxruntime")
     cancel_convert_requested = Signal(str)     # engine_id
@@ -191,7 +188,6 @@ class EnginesTab(QWidget):
             try:
                 section = _CategorySection(cat, engines, parent=self._container)
                 section.install_requested.connect(self.install_requested.emit)
-                section.fsr31_download_requested.connect(self.fsr31_download_requested.emit)
                 section.convert_requested.connect(self.convert_requested.emit)
                 section.backend_changed.connect(self.backend_changed.emit)
                 section.cancel_convert_requested.connect(self.cancel_convert_requested.emit)

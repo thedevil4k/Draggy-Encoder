@@ -233,36 +233,6 @@ def test_benchmark_cache_invalidates_when_model_changes(isolated_engines_state, 
     assert es.get_backend_benchmarks("upscale-realesrgan-x4plus")["torch"] is None
 
 
-def test_libplacebo_probe_cached_by_binary_mtime(tmp_path, monkeypatch):
-    """has_libplacebo_support must probe ffmpeg once per (path, mtime):
-    unchanged binaries never re-spawn the subprocess, a freshly
-    downloaded FFmpeg full (new mtime) is re-probed."""
-    import src.ffmpeg.manager as man
-
-    fake_bin = tmp_path / "ffmpeg.exe"
-    fake_bin.write_bytes(b"x")
-    calls = []
-
-    class _Result:
-        stdout = "ffmpeg version 7.1 ... \n ...libplacebo...\n"
-        stderr = ""
-        returncode = 0
-
-    def fake_run(cmd, **kwargs):
-        calls.append(cmd)
-        return _Result()
-
-    monkeypatch.setattr(man.subprocess, "run", fake_run)
-
-    assert man.has_libplacebo_support(str(fake_bin)) is True
-    assert man.has_libplacebo_support(str(fake_bin)) is True
-    assert len(calls) == 1
-
-    os.utime(fake_bin, (os.path.getmtime(fake_bin) + 5,) * 2)
-    assert man.has_libplacebo_support(str(fake_bin)) is True
-    assert len(calls) == 2
-
-
 def test_legacy_fsr_engines_are_not_catalogued_or_dispatchable():
     from src.ai.inference import create_inference_engine
     from src.ai.registry import CATALOG_BY_ID
@@ -278,84 +248,6 @@ def test_legacy_fsr_engines_are_not_catalogued_or_dispatchable():
         assert eid not in CATALOG_BY_ID
         with pytest.raises(RuntimeError):
             create_inference_engine(eid, "")
-
-
-def test_fsr31_mode_routing_dispatches_correctly(monkeypatch):
-    """create_inference_engine routes FSR 3.1 engine ids to the right mode."""
-    import src.ai.inference as inf
-
-    captured = {}
-
-    class _FakeFSR31:
-        def __init__(self, model_path, engine_id, mode="both"):
-            self.model_path = model_path
-            self.engine_id = engine_id
-            self._mode = mode
-            self._loaded = True
-            captured["engine_id"] = engine_id
-            captured["mode"] = mode
-
-        def load(self):
-            return True
-
-    monkeypatch.setattr(inf, "FSR31Engine", _FakeFSR31)
-
-    for eid, expected_mode in [
-        ("upscale-fsr31-2x", "upscale"),
-        ("upscale-fsr31-2x-interp", "interpolate"),
-    ]:
-        captured.clear()
-        eng = inf.create_inference_engine(eid, "")
-        assert isinstance(eng, _FakeFSR31)
-        assert captured["mode"] == expected_mode
-
-
-def test_fsr31_catalog_split_by_category():
-    """FSR 3.1 upscale variants live in Upscale, interpolation variants in
-    Interpolate, and no '-both' entries exist (both = activate each node)."""
-    from src.ai.registry import CATALOG_BY_ID
-
-    assert CATALOG_BY_ID["upscale-fsr31-2x"]["category"] == "Upscale"
-    assert CATALOG_BY_ID["upscale-fsr31-3x"]["category"] == "Upscale"
-    assert CATALOG_BY_ID["upscale-fsr31-4x"]["category"] == "Upscale"
-
-    interp_ids = [eid for eid in CATALOG_BY_ID if eid.startswith("upscale-fsr31") and eid.endswith("-interp")]
-    assert len(interp_ids) == 3
-    for eid in interp_ids:
-        assert CATALOG_BY_ID[eid]["category"] == "Interpolate", eid
-        assert CATALOG_BY_ID[eid]["mode"] == "interpolate", eid
-
-    both_ids = [eid for eid in CATALOG_BY_ID if eid.startswith("upscale-fsr31") and eid.endswith("-both")]
-    assert both_ids == []
-
-
-def test_resolve_fsr3_engine_modes():
-    """Workflow Upscale/Interp node combination drives the FSR 3.1 mode."""
-    from src.ui.main_window import resolve_fsr3_engine
-
-    up_only = {"engine_id": "upscale-fsr31-2x", "model_path": None, "scale": 2, "mode": "upscale"}
-    up_interp = {"engine_id": "upscale-fsr31-2x-interp", "model_path": None, "scale": 2, "mode": "interpolate"}
-
-    # Upscale node alone -> upscale mode, engine from the Upscale node.
-    eid, path, mode = resolve_fsr3_engine(up_only, None)
-    assert (eid, mode) == ("upscale-fsr31-2x", "upscale")
-    assert path is None
-
-    # Interp node alone -> interpolate mode, engine from the Interp node.
-    eid, path, mode = resolve_fsr3_engine(None, up_interp)
-    assert (eid, mode) == ("upscale-fsr31-2x-interp", "interpolate")
-
-    # Both nodes active with FSR 3.1 -> "both" (one engine, both functions).
-    eid, path, mode = resolve_fsr3_engine(up_only, up_interp)
-    assert (eid, mode) == ("upscale-fsr31-2x", "both")
-
-    # Legacy string-only values keep working.
-    eid, _path, mode = resolve_fsr3_engine("upscale-fsr31-2x", "upscale-fsr31-2x-interp")
-    assert (eid, mode) == ("upscale-fsr31-2x", "both")
-
-    # Non-FSR upscaler + no interp node -> untouched engine, upscale mode.
-    eid, _path, mode = resolve_fsr3_engine({"engine_id": "upscale-realesrgan-x4plus", "model_path": "/x.pth"}, None)
-    assert (eid, mode) == ("upscale-realesrgan-x4plus", "upscale")
 
 
 def test_get_model_path_torch_picks_engine_matching_file(isolated_engines_state):
@@ -1003,35 +895,6 @@ def test_pytorch_install_command_includes_onnx_package():
     assert "https://pypi.org/simple" in cmd
 
 
-def test_active_ffmpeg_choice_preference(monkeypatch, tmp_path):
-    """La preferencia ffmpeg_binary elige full/standard y cae a standard
-    si el build full no está instalado."""
-    import src.ffmpeg.manager as m
-
-    std = tmp_path / "ffmpeg.exe"
-    std.write_bytes(b"")
-    full = tmp_path / "ffmpeg-full.exe"
-    store = {"ffmpeg_binary": "standard"}
-
-    monkeypatch.setattr("src.preferences.get", lambda k, d=None: store.get(k, d))
-    monkeypatch.setattr("src.preferences.set", lambda k, v: store.__setitem__(k, v))
-    monkeypatch.setattr(m, "get_local_ffmpeg_path", lambda: str(std))
-    monkeypatch.setattr(m, "get_local_ffmpeg_full_path", lambda: str(full) if full.exists() else str(tmp_path / "missing"))
-
-    # Por defecto: standard.
-    assert m.get_active_ffmpeg_choice() == "standard"
-    assert m.get_active_ffmpeg_path() == str(std)
-
-    # Elegir full sin tenerlo instalado -> efectivo standard (fallback).
-    assert m.set_active_ffmpeg("full") == "standard"
-    assert m.get_active_ffmpeg_path() == str(std)
-
-    # Al instalar el build full, la preferencia 'full' ya surte efecto.
-    full.write_bytes(b"")
-    assert m.get_active_ffmpeg_choice() == "full"
-    assert m.get_active_ffmpeg_path() == str(full)
-
-
 def test_hf_engine_detection_ignores_system_runtime(monkeypatch):
     """La detección de motores de IA usa el store privado, aunque exista
     torch/onnxruntime en el Python que ejecuta los tests."""
@@ -1617,7 +1480,7 @@ def test_dependencies_dialog_excludes_model_rows_from_binaries_tab(qapp):
         assert depmod.KIND_MODEL not in kinds
         assert depmod.KIND_BINARY in kinds
         assert depmod.KIND_RUNTIME in kinds
-        assert len(dialog._row_widgets) == 4
+        assert len(dialog._row_widgets) == 3
     finally:
         dialog.close()
 
@@ -1650,13 +1513,25 @@ def test_dependencies_dialog_responsive(qapp):
         qapp.processEvents()
         assert dialog.width() >= 820 and dialog.height() >= 560
 
-        # Tab switch (Engines tab) must not crash.
-        assert dialog.tabs.count() == 2
-        dialog.tabs.setCurrentIndex(1)
-        qapp.processEvents()
-        assert dialog.tabs.currentIndex() == 1
-        dialog.tabs.setCurrentIndex(0)
-        qapp.processEvents()
+        # El diálogo default es SOLO Dependencies (binarios): no tiene
+        # pestañas y no construye el catálogo de motores.
+        assert dialog.engines_tab is None
+
+        # Modo AI Engines: solo el catálogo, sin filas de binarios, y
+        # respeta el resize igual que el modo binarios.
+        engines_dialog = DependenciesDialog(initial_tab="ai_engines")
+        engines_dialog._check_timer.stop()
+        engines_dialog.show()
+        try:
+            assert engines_dialog.engines_tab is not None
+            engines_dialog.resize(1200, 800)
+            qapp.processEvents()
+            assert engines_dialog.width() == 1200 and engines_dialog.height() == 800
+            engines_dialog.resize(600, 400)
+            qapp.processEvents()
+            assert engines_dialog.width() >= 820 and engines_dialog.height() >= 560
+        finally:
+            engines_dialog.close()
     finally:
         dialog.close()
 
@@ -1751,7 +1626,7 @@ def test_engine_install_success_marks_installed(isolated_engines_state, qapp, mo
     monkeypatch.setattr(dd, "HFDownloadWorker", _FakeWorker)
     monkeypatch.setattr(dd, "QMessageBox", _NoOpQMessageBox())
 
-    dialog = dd.DependenciesDialog()
+    dialog = dd.DependenciesDialog(initial_tab="ai_engines")
     dialog._check_timer.stop()
     try:
         dialog._on_engine_install(eid)
@@ -1788,7 +1663,7 @@ def test_engine_install_without_weights_marks_failed(isolated_engines_state, qap
     monkeypatch.setattr(dd, "HFDownloadWorker", _FakeWorker)
     monkeypatch.setattr(dd, "QMessageBox", _NoOpQMessageBox())
 
-    dialog = dd.DependenciesDialog()
+    dialog = dd.DependenciesDialog(initial_tab="ai_engines")
     dialog._check_timer.stop()
     try:
         dialog._on_engine_install(eid)
@@ -1818,7 +1693,7 @@ def test_engine_install_failure_marks_failed(isolated_engines_state, qapp, monke
     monkeypatch.setattr(dd, "HFDownloadWorker", _FailWorker)
     monkeypatch.setattr(dd, "QMessageBox", _NoOpQMessageBox())
 
-    dialog = dd.DependenciesDialog()
+    dialog = dd.DependenciesDialog(initial_tab="ai_engines")
     dialog._check_timer.stop()
     try:
         dialog._on_engine_install(eid)
@@ -1849,9 +1724,9 @@ def test_hf_download_worker_cancel_contract(qapp):
 # 6. GPU NVENC rescale + compress smoke test (real encode)
 # ==--------------------------------------------------------------------==
 
-def _ffmpeg_full():
-    from src.ffmpeg.manager import get_local_ffmpeg_full_path
-    p = get_local_ffmpeg_full_path()
+def _local_ffmpeg():
+    from src.ffmpeg.manager import get_local_ffmpeg_path
+    p = get_local_ffmpeg_path()
     return p if p and os.path.exists(p) else None
 
 
@@ -1869,9 +1744,9 @@ def _has_nvenc(ffmpeg_path):
 @pytest.fixture()
 def nvenc_clip():
     """Generate a tiny test clip once; skip if NVENC is unavailable."""
-    ffmpeg = _ffmpeg_full()
+    ffmpeg = _local_ffmpeg()
     if ffmpeg is None:
-        pytest.skip("FFmpeg full build not present")
+        pytest.skip("Local FFmpeg build not present")
     if not _has_nvenc(ffmpeg):
         pytest.skip("NVENC encoder not available on this FFmpeg build/GPU")
 
@@ -1881,8 +1756,8 @@ def nvenc_clip():
         ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
         "-f", "lavfi", "-i", "testsrc=duration=1:size=640x360:rate=10",
         "-f", "lavfi", "-i", "sine=frequency=440:duration=1",
-        # The BtbN 'full' build ships NVENC (and libx264 in the gpl-shared
-        # variant), so generate the source clip with NVENC either way.
+        # The BtbN gpl build ships NVENC (and libx264), so generate the
+        # source clip with NVENC either way.
         "-c:v", "h264_nvenc", "-c:a", "aac", clip,
     ]
     rc = subprocess.run(cmd, capture_output=True, timeout=60).returncode
@@ -1913,11 +1788,11 @@ def test_compress_video_rescales_to_target_height_with_nvenc(nvenc_clip):
     assert ok is True
     assert os.path.exists(dst) and os.path.getsize(dst) > 0
 
-    # Probe the output with the ffprobe that ships next to the full ffmpeg
+    # Probe the output with the ffprobe that ships next to the local ffmpeg
     # (in a normal user install get_video_info() would work too; here the dev
     # checkout has no primary bin/ffmpeg/ffprobe, so probe directly).
     ffprobe = os.path.join(os.path.dirname(ffmpeg), "ffprobe.exe")
-    assert os.path.exists(ffprobe), "ffprobe not shipped with FFmpeg full build"
+    assert os.path.exists(ffprobe), "ffprobe not shipped with FFmpeg build"
     info = subprocess.run(
         [ffprobe, "-v", "error", "-select_streams", "v:0",
          "-show_entries", "stream=width,height,codec_name",
@@ -2200,6 +2075,38 @@ def test_workflow_maps_face_restore_node(qapp):
         step.set_active(True)
         engines = widget.get_selected_engines()
         assert "FaceRestore" in engines
+    finally:
+        widget.deleteLater()
+
+
+def test_import_step_click_emits_import_clicked(qapp):
+    """Click en la casilla Import equivale al botón "Select Videos"
+    eliminado: emite ``import_clicked`` (MainWindow abre el diálogo)."""
+    from PySide6.QtCore import Qt
+    from PySide6.QtTest import QTest
+    from src.ui.workflow_widget import WorkflowWidget
+
+    widget = WorkflowWidget()
+    widget.show()
+    qapp.processEvents()
+    fired = []
+    widget.import_clicked.connect(lambda: fired.append(1))
+    try:
+        QTest.mouseClick(
+            widget.step_import,
+            Qt.MouseButton.LeftButton,
+            pos=widget.step_import.rect().center(),
+        )
+        qapp.processEvents()
+        assert fired == [1]
+        # Un segundo click vuelve a emitir (idempotente).
+        QTest.mouseClick(
+            widget.step_import,
+            Qt.MouseButton.LeftButton,
+            pos=widget.step_import.rect().center(),
+        )
+        qapp.processEvents()
+        assert fired == [1, 1]
     finally:
         widget.deleteLater()
 
@@ -4677,7 +4584,7 @@ def test_catalog_arch_lookup_static_and_user(isolated_engines_state):
     assert CATALOG_ARCH["upscale-realesr-animevideov3"] == "srvgg"
     assert CATALOG_ARCH["upscale-omnisr-x4"] == "omnisr"
     assert CATALOG_ARCH["facerestore-gfpgan"] == "gfpgan"  # no convertible
-    # FSR algorítmicos: sin arquitectura conocida -> None
+    # Engines sin arquitectura conocida (o ya no en el catálogo) -> None
     assert get_catalog_arch("upscale-fsr31-2x") is None
     assert get_catalog_arch("") is None
     assert get_catalog_arch("no-existe-123") is None

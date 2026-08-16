@@ -154,8 +154,7 @@ def _engine_device(engine) -> str:
         return "cuda"
     if "CPUExecutionProvider" in providers:
         return "cpu"
-    # Sin _device ni _providers: engines algorítmicos (FSR 3.1) o fallback
-    # puro CPU/numpy.
+    # Sin _device ni _providers: fallback puro CPU/numpy.
     return "cpu"
 
 

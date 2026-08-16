@@ -117,10 +117,6 @@ class EngineRow(QFrame):
 
     Signals:
         install_requested(str) - engine_id to install (HF clone / git clone).
-        fsr31_download_requested(str) - engine_id; FSR 3.1 entry clicked. The
-            parent dialog handles this by downloading the FFmpeg "full" build
-            (with libplacebo) into ``bin/ffmpeg-full/`` instead of cloning a
-            model repo. Marked installed on success.
         convert_requested(str) - engine_id to convert to ONNX.
         backend_changed(str, str) - (engine_id, "auto"|"torch"|"onnxruntime")
             fired when the user switches the inference backend for this engine.
@@ -135,7 +131,6 @@ class EngineRow(QFrame):
     """
 
     install_requested = Signal(str)
-    fsr31_download_requested = Signal(str)
     convert_requested = Signal(str)
     backend_changed = Signal(str, str)
     cancel_convert_requested = Signal(str)
@@ -354,12 +349,9 @@ class EngineRow(QFrame):
                     display_backend = resolved
             except Exception:
                 pass
-        is_fsr31 = "fsr31" in eng.get("engine_id", "")
-        is_fsr = is_fsr31
-
-        engine_label = self._engine_label(installed, converted, display_backend, is_fsr31)
+        engine_label = self._engine_label(installed, converted, display_backend)
         state_lbl = QLabel(engine_label)
-        state_qss = self._state_qss(installed, converted, display_backend, is_fsr31)
+        state_qss = self._state_qss(installed, converted, display_backend)
         state_lbl.setStyleSheet(state_qss)
         state_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
         state_lbl.setMaximumWidth(180)
@@ -383,15 +375,10 @@ class EngineRow(QFrame):
         backend_idx = self.combo_backend.findData(backend)
         self.combo_backend.setCurrentIndex(backend_idx if backend_idx >= 0 else 0)
         is_backend_switchable = bool(
-            implemented and installed and not is_fsr
+            implemented and installed
         )
         self.combo_backend.setEnabled(is_backend_switchable)
-        if not is_backend_switchable:
-            self.combo_backend.setToolTip(
-                "Backend selector requires an installed model engine "
-                "(FSR engines are algorithmic and have no model backend)."
-            )
-        else:
+        if is_backend_switchable:
             self.combo_backend.setToolTip(
                 "Inference backend for this engine:\n"
                 "  Auto        - the fastest measured backend (ONNX vs PyTorch)\n"
@@ -422,20 +409,11 @@ class EngineRow(QFrame):
         right.setSpacing(6)
 
         # Primary: Add Engine / Reinstall / Open Folder
-        self.btn_install = QPushButton(self._install_label(installed, is_fsr31))
+        self.btn_install = QPushButton(self._install_label(installed))
         self.btn_install.setObjectName("primaryBtn")
         if not implemented:
             self.btn_install.setEnabled(False)
             self.btn_install.setText("Coming soon")
-        elif is_fsr31:
-            if installed:
-                self.btn_install.setEnabled(False)
-                self.btn_install.setText("Ready")
-                self.btn_install.setToolTip("FSR 3.1 is ready — FFmpeg full with libplacebo is available.")
-            else:
-                self.btn_install.setEnabled(True)
-                self.btn_install.setText("Download FFmpeg")
-                self.btn_install.setToolTip("FSR 3.1 requires FFmpeg full with libplacebo. Click to download.")
         self.btn_install.setToolTip(self._install_tooltip(eng))
         self.btn_install.clicked.connect(self._on_install_clicked)
         right.addWidget(self.btn_install)
@@ -456,10 +434,6 @@ class EngineRow(QFrame):
                 "Converting .pth weights requires PyTorch; .onnx models "
                 "only need ONNX Runtime."
             )
-        elif is_fsr:
-            self.btn_convert.setEnabled(False)
-            self.btn_convert.setText("N/A (built-in)")
-            self.btn_convert.setToolTip("FSR is algorithmic — no ONNX conversion needed.")
         elif converted:
             self.btn_convert.setEnabled(True)
             self.btn_convert.setText("Re-convert ONNX")
@@ -493,20 +467,14 @@ class EngineRow(QFrame):
         self.btn_open.clicked.connect(self._on_open_clicked)
         right.addWidget(self.btn_open)
 
-        # Remove installed weights / binary (borrar desde la app).
+        # Remove installed weights (borrar desde la app).
         can_remove = installed
         self.btn_remove = QPushButton("Remove")
         self.btn_remove.setObjectName("removeBtn")
         self.btn_remove.setEnabled(can_remove)
-        if is_fsr31:
-            self.btn_remove.setToolTip(
-                "Removes the FFmpeg full (libplacebo) build and uninstalls "
-                "this engine (affects all FSR 3.1 engines)."
-            )
-        else:
-            self.btn_remove.setToolTip(
-                "Deletes the downloaded model weights from the program folder."
-            )
+        self.btn_remove.setToolTip(
+            "Deletes the downloaded model weights from the program folder."
+        )
         self.btn_remove.clicked.connect(self._on_remove_clicked)
         right.addWidget(self.btn_remove)
 
@@ -736,31 +704,21 @@ class EngineRow(QFrame):
     # -- helpers ----------------------------------------------------------
 
     @staticmethod
-    def _engine_label(installed: bool, converted: bool, backend: str,
-                      is_fsr31: bool = False) -> str:
+    def _engine_label(installed: bool, converted: bool, backend: str) -> str:
         """Etiqueta del motor en uso: PYTORCH por defecto, ONNX si hay .onnx
         (o si el usuario forzó el backend correspondiente)."""
         if not installed:
             return "NOT INSTALLED"
-        if is_fsr31:
-            return "FSR 3.1 (GPU)"
         if backend == "torch" or (backend == "auto" and not converted):
             return "INSTALLED · PYTORCH"
         return "INSTALLED · ONNX"
 
     @staticmethod
-    def _state_qss(installed: bool, converted: bool, backend: str,
-                   is_fsr31: bool = False) -> str:
+    def _state_qss(installed: bool, converted: bool, backend: str) -> str:
         """Color del pill de estado según el motor activo."""
         if not installed:
             return (
                 "QLabel { background-color: #2c3e50; color: #a0a0b0; "
-                "border-radius: 8px; padding: 2px 8px; font-size: 10px; font-weight: bold; }"
-            )
-        if is_fsr31:
-            # FSR 3.1 (GPU via libplacebo + interpolation) - teal-green
-            return (
-                "QLabel { background-color: #16a085; color: #ffffff; "
                 "border-radius: 8px; padding: 2px 8px; font-size: 10px; font-weight: bold; }"
             )
         if backend == "torch" or (backend == "auto" and not converted):
@@ -775,9 +733,7 @@ class EngineRow(QFrame):
             "border-radius: 8px; padding: 2px 8px; font-size: 10px; font-weight: bold; }"
         )
 
-    def _install_label(self, installed: bool, is_fsr31: bool = False) -> str:
-        if is_fsr31:
-            return "Download FFmpeg" if not installed else "Ready"
+    def _install_label(self, installed: bool) -> str:
         return "Re-clone" if installed else "Add Engine"
 
     def _install_tooltip(self, eng: dict) -> str:
@@ -795,12 +751,6 @@ class EngineRow(QFrame):
 
     def _on_install_clicked(self) -> None:
         eid = self.engine.get("engine_id", "")
-        # FSR 3.1 entries route to a different signal so the parent dialog
-        # downloads the FFmpeg "full" binary instead of trying to git-clone
-        # an HF repo (which has no model weights for FSR).
-        if "fsr31" in eid and eid.startswith("upscale-fsr"):
-            self.fsr31_download_requested.emit(eid)
-            return
         self.install_requested.emit(eid)
 
     def _on_convert_clicked(self) -> None:

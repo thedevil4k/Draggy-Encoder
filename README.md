@@ -2,14 +2,14 @@
 
 **Cross-platform video compression app with AI-powered workflow pipeline.**
 
-DRAGGY ENCODER combines FFmpeg-based encoding with ONNX/PyTorch AI models for video upscaling, frame interpolation (FSR 3.1), colorization, and denoising — all in a visual drag-and-drop workflow.
+DRAGGY ENCODER combines FFmpeg-based encoding with ONNX/PyTorch AI models for video upscaling, frame interpolation (RIFE/FILM), colorization, and denoising — all in a visual drag-and-drop workflow.
 
 ## Features
 
 - GPU-accelerated AI upscaling (Real-ESRGAN, OmniSR, CUGAN, SwinIR) via ONNX Runtime (CUDA/TensorRT)
-- AMD FSR 3.1 (libplacebo upscale + frame interpolation)
+- Frame interpolation (RIFE, FILM) via PyTorch/ONNX
 - Frame-by-frame decode → AI → encode pipeline with audio passthrough
-- Auto-downloading FFmpeg (including libplacebo builds) and AI models from HuggingFace
+- Auto-downloading FFmpeg (latest BtbN gpl build) and AI models from HuggingFace
 - NVENC / AMF / QuickSync GPU encoder support
 - Two-pass EBU R128 loudness normalization (audio boost)
 - Side-by-side preview comparison with zoom + pan
@@ -43,7 +43,6 @@ DRAGGY_ENCODER/
 ├── bin/                      # Downloaded binaries (auto-generated, gitignored)
 │   ├── .session/             # Preferences & engine state
 │   ├── ffmpeg/               # FFmpeg (auto-downloaded on first run)
-│   ├── ffmpeg-full/          # FFmpeg with libplacebo (FSR 3.1)
 │   ├── runtimes/             # PyTorch + ONNX Runtime (pip install --target)
 │   ├── models/               # Downloaded AI model weights
 │   └── logs/                 # Render logs & FFmpeg logs

@@ -4,6 +4,7 @@ import os
 from PySide6.QtCore import Qt, QUrl, Signal
 from PySide6.QtGui import QPixmap
 from PySide6.QtWidgets import (
+    QApplication,
     QComboBox,
     QFrame,
     QHBoxLayout,
@@ -170,13 +171,20 @@ class ImportStep(WorkflowStep):
     También acepta drag & drop de videos desde el explorador del SO:
     suelta ficheros sobre la casilla para seleccionarlos (equivale a
     pulsar el botón importar). Emite ``video_dropped(list[str])``.
+
+    Un click simple (sin arrastre) emite ``clicked()``: MainWindow lo
+    usa para abrir el diálogo de selección de videos, de modo que el
+    botón "Select Videos" de la barra superior sobra.
     """
 
     video_dropped = Signal(list)
+    clicked = Signal()
 
     def __init__(self, icon_path, parent=None):
         super().__init__("Import", icon_path, active=True, fixed_width=150, parent=parent)
         self.setAcceptDrops(True)
+        self._press_pos = None
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
 
     def _setup_ui(self, icon_path):
         layout = QVBoxLayout(self)
@@ -214,6 +222,22 @@ class ImportStep(WorkflowStep):
 
     def set_info(self, text):
         self.info_label.setText(text)
+
+    # -- click (equivale al botón "Select Videos" eliminado) ------------
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._press_pos = event.position().toPoint()
+        super().mousePressEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton and self._press_pos is not None:
+            # Si el puntero se movió más allá de la distancia de arrastre
+            # fue un drag & drop (o un desplazamiento), no un click.
+            if (event.position().toPoint() - self._press_pos).manhattanLength() < QApplication.startDragDistance():
+                self.clicked.emit()
+        self._press_pos = None
+        super().mouseReleaseEvent(event)
 
     # -- drag & drop ----------------------------------------------------
 
@@ -514,33 +538,6 @@ class AIWorkflowStep(QFrame):
         """Populate the scale dropdown with available scale factors for this engine."""
         self.combo_scale.blockSignals(True)
         self.combo_scale.clear()
-
-        # FSR 3.1 scale is encoded in the engine_id (fsr31-2x, fsr31-3x, fsr31-4x)
-        if engine_id and engine_id.startswith("upscale-fsr"):
-            import re
-            from src.ai.registry import get_entry
-            m = re.search(r'fsr31-(\d+)x', engine_id)
-            scale = int(m.group(1)) if m else 2
-
-            # FSR 3.1 engines have a "mode" field in the catalog entry
-            # (upscale, interpolate, both). Pass it through so the pipeline
-            # knows whether to interpolate frames.
-            mode = "upscale"  # default
-            if "fsr31" in engine_id:
-                entry = get_entry(engine_id) or {}
-                mode = entry.get("mode", "upscale")
-
-            self.combo_scale.addItem(f"{scale}x", {
-                "engine_id": engine_id,
-                "model_path": None,
-                "scale": scale,
-                "mode": mode,
-            })
-            self.combo_scale.setCurrentIndex(0)
-            self.combo_scale.setEnabled(False)
-            self.combo_scale.setVisible(True)
-            self.combo_scale.blockSignals(False)
-            return
 
         # Find all model files for this engine_id.
         models = [m for m in self._all_model_files if m["engine_id"] == engine_id]
@@ -859,6 +856,9 @@ class WorkflowWidget(QWidget):
     # Emitted when the user drops video files onto the Import step.
     # Arg: list of local video paths.
     video_dropped = Signal(list)
+    # Emitted when the user clicks the Import step (replaces the removed
+    # "Select Videos" button; MainWindow opens the file dialog).
+    import_clicked = Signal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -869,6 +869,7 @@ class WorkflowWidget(QWidget):
     def _setup_steps(self):
         self.step_import = ImportStep(get_asset_path("Import.png"))
         self.step_import.video_dropped.connect(self.video_dropped.emit)
+        self.step_import.clicked.connect(self.import_clicked.emit)
         self.step_compress = WorkflowStep(
             "Compress", get_asset_path("Export.png"), active=True
         )

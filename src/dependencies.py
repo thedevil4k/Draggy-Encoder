@@ -1,6 +1,6 @@
 """Registro unificado de dependencias externas del programa.
 
-El panel de gestión muestra FFmpeg, FFmpeg full (libplacebo), los runtimes
+El panel de gestión muestra FFmpeg, los runtimes
 de IA (PyTorch/ONNX Runtime) y las ranuras de modelos por categoría. El
 sensor de estado es *honesto contra disco*: cada ``status_fn`` comprueba
 la realidad (binario, store local ``bin/runtimes/ai_modules``, motores bajo
@@ -27,7 +27,6 @@ from typing import Callable, Optional
 
 from src.config import (
     ensure_runtime_dirs,
-    get_ffmpeg_full_dir,
     get_models_dir,
 )
 from src.ffmpeg import manager as ffmpeg_manager
@@ -416,50 +415,8 @@ def _ffmpeg_status():
     }
 
 
-def _ffmpeg_full_status():
-    """Estado del binario FFmpeg 'full' (con libplacebo, FSR 3.1)."""
-    ensure_runtime_dirs()
-    from src.ffmpeg.manager import (
-        get_local_ffmpeg_full_path,
-        has_libplacebo_support,
-    )
-    path = get_local_ffmpeg_full_path()
-    exists = bool(path) and os.path.exists(path)
-    if exists and has_libplacebo_support(path):
-        status = STATUS_INSTALLED
-        detail = (
-            "FFmpeg full (libplacebo) installed in the program folder. "
-            "Optional bleeding-edge build for FSR 3.1 (the default FFmpeg "
-            "already includes libplacebo)."
-        )
-    elif exists:
-        status = STATUS_ERROR
-        detail = "FFmpeg full present but without libplacebo support."
-    else:
-        status = STATUS_MISSING
-        detail = (
-            "Not installed. Optional bleeding-edge build; the default FFmpeg "
-            "already includes libplacebo for FSR 3.1."
-        )
-    return {
-        "id": "ffmpeg_full",
-        "display_name": "FFmpeg full (libplacebo)",
-        "kind": KIND_BINARY,
-        "status": status,
-        "version": ffmpeg_manager.get_ffmpeg_version(path) or "—",
-        "install_dir": get_ffmpeg_full_dir(),
-        "source_url": "https://github.com/BtbN/FFmpeg-Builds",
-        "is_updatable": False,
-        "size_bytes": _safe_dir_size(get_ffmpeg_full_dir()),
-        "detail": detail,
-        "deletable": exists,
-        "latest_fingerprint": {},
-        "update_available": False,
-        "last_check_iso": None,
-        "upstream_error": None,
-    }
-
-
+# ---------------------------------------------------------------------------
+# Registro
 # ---------------------------------------------------------------------------
 # Registro
 # ---------------------------------------------------------------------------
@@ -477,16 +434,6 @@ REGISTRY = [
         # el tamano del binario ANTES y DESPUES de la reinstalacion, y asi
         # alimentar el mini-stats banner + el historial persistente.
         "bytes_fn": lambda: _local_ffmpeg_size_or_none(),
-    },
-    {
-        "id": "ffmpeg_full",
-        "kind": KIND_BINARY,
-        "display_name": "FFmpeg full (libplacebo)",
-        "status_fn": _ffmpeg_full_status,
-        "reinstall_fn": None,
-        "uninstall_fn": ffmpeg_manager.uninstall_full,
-        "open_label": "Open bin/ffmpeg-full folder",
-        "is_updatable": False,
     },
     {
         "id": "torch",

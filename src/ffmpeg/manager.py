@@ -12,16 +12,14 @@ logger = logging.getLogger(__name__)
 
 from src.config import (
     FFMPEG_DOWNLOAD_URLS,
-    FFMPEG_FULL_DOWNLOAD_URLS,
     ensure_runtime_dirs,
     get_bin_dir,
     get_ffmpeg_dir,
-    get_ffmpeg_full_dir,
     get_ffmpeg_executable_name,
     get_ffprobe_executable_name,
     get_logs_dir,
 )
-from src.ffmpeg.downloader import download_ffmpeg, download_ffmpeg_full
+from src.ffmpeg.downloader import download_ffmpeg
 from src.ffmpeg.upstream import (
     get_fingerprint,
     is_update_available,
@@ -43,16 +41,6 @@ def get_local_ffmpeg_path():
 def get_local_ffprobe_path():
     """Ruta al binario ffprobe dentro de la carpeta propia del programa."""
     return os.path.join(get_ffmpeg_dir(), get_ffprobe_executable_name())
-
-
-def get_local_ffmpeg_full_path():
-    """Ruta al binario ffmpeg completo (con libplacebo) dentro de la carpeta propia."""
-    return os.path.join(get_ffmpeg_full_dir(), get_ffmpeg_executable_name())
-
-
-def get_local_ffprobe_full_path():
-    """Ruta al binario ffprobe completo (con libplacebo) dentro de la carpeta propia."""
-    return os.path.join(get_ffmpeg_full_dir(), get_ffprobe_executable_name())
 
 
 def get_manifest_path():
@@ -173,52 +161,6 @@ def get_ffmpeg_version(ffmpeg_path=None):
         return None
 
 
-@lru_cache(maxsize=32)
-def _has_libplacebo_at(ffmpeg_path: str, mtime: float) -> bool:
-    """Cached probe: (binary path, mtime) identifies a unique FFmpeg build."""
-    try:
-        result = subprocess.run(
-            [ffmpeg_path, "-filters"],
-            stdin=subprocess.DEVNULL,
-            capture_output=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=15,
-            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
-        )
-        output = (result.stdout or "") + (result.stderr or "")
-        return "libplacebo" in output.lower()
-    except Exception:
-        return False
-
-
-def has_libplacebo_support(ffmpeg_path=None):
-    """Check if FFmpeg has libplacebo support (needed for FSR 3.1).
-
-    Returns True if libplacebo filter is available, False otherwise.
-
-    The probe is cached per (binary path, mtime), so rendering the AI
-    Engines tab / refreshing the workflow never re-spawns ffmpeg for
-    unchanged binaries, while a freshly downloaded FFmpeg full build
-    (new mtime) is re-probed automatically.
-    """
-    path = ffmpeg_path or get_local_ffmpeg_full_path()
-    if not path or not os.path.exists(path):
-        # Check standard FFmpeg as fallback
-        path = get_local_ffmpeg_path()
-        if not path or not os.path.exists(path):
-            return False
-    try:
-        mtime = os.path.getmtime(path)
-    except OSError:
-        mtime = 0.0
-    return _has_libplacebo_at(path, mtime)
-
-
-# ---------------------------------------------------------------------------
-# Estado público (para dependencias y UI)
-# ---------------------------------------------------------------------------
-
 def get_install_info(ffmpeg_path=None):
     """Devuelve un dict con el estado actual de la instalación de FFmpeg."""
     ffmpeg = ffmpeg_path or get_local_ffmpeg_path()
@@ -242,11 +184,6 @@ def get_install_info(ffmpeg_path=None):
     fingerprint = read_upstream_cache()
     update_available = is_update_available(manifest, fingerprint)
 
-    # Check if FFmpeg full (with libplacebo) is available
-    ffmpeg_full = get_local_ffmpeg_full_path()
-    has_full = os.path.exists(ffmpeg_full) if ffmpeg_full else False
-    libplacebo_available = has_libplacebo_support() if has_full else False
-
     return {
         "id": "ffmpeg",
         "display_name": "FFmpeg (encoder suite)",
@@ -267,116 +204,7 @@ def get_install_info(ffmpeg_path=None):
         "update_available": update_available,
         "last_check_iso": fingerprint.get("checked_at"),
         "upstream_error": fingerprint.get("last_error"),
-        # FFmpeg full (libplacebo) status
-        "ffmpeg_full_exists": has_full,
-        "ffmpeg_full_path": ffmpeg_full if has_full else None,
-        "libplacebo_available": libplacebo_available,
     }
-
-
-# ---------------------------------------------------------------------------
-# FFmpeg selection for FSR 3.1
-# ---------------------------------------------------------------------------
-
-
-FFMPEG_BINARY_PREF_KEY = "ffmpeg_binary"
-
-
-def get_active_ffmpeg_choice() -> str:
-    """Elección efectiva del binario FFmpeg (``"standard"`` | ``"full"``).
-
-    Lee la preferencia persistente. Si el usuario eligió ``"full"`` pero el
-    binario full no está instalado, cae a ``"standard"`` (fail-safe).
-    """
-    try:
-        from src.preferences import get as _prefs_get
-    except Exception:
-        _prefs_get = lambda *a, **k: "standard"
-    choice = _prefs_get(FFMPEG_BINARY_PREF_KEY, "standard")
-    if choice == "full":
-        full = get_local_ffmpeg_full_path()
-        if full and os.path.exists(full):
-            return "full"
-    return "standard"
-
-
-def get_active_ffmpeg_path():
-    """Ruta del binario FFmpeg que debe usarse para codificar.
-
-    Respeta la preferencia persistente (``ffmpeg_binary``). Cadena de fallback:
-    elección del usuario → estándar → full → ``None``.
-    """
-    choice = get_active_ffmpeg_choice()
-    if choice == "full":
-        full = get_local_ffmpeg_full_path()
-        if full and os.path.exists(full):
-            return full
-    standard = get_local_ffmpeg_path()
-    if standard and os.path.exists(standard):
-        return standard
-    full = get_local_ffmpeg_full_path()
-    if full and os.path.exists(full):
-        return full
-    return None
-
-
-def set_active_ffmpeg(choice: str) -> str:
-    """Persiste la elección del binario (``"standard"`` | ``"full"``).
-
-    Devuelve la elección efectiva tras validar/fallback (p. ej. pedir "full"
-    sin tenerlo instalado devuelve "standard").
-    """
-    choice = "full" if choice == "full" else "standard"
-    try:
-        from src.preferences import set as _prefs_set
-        _prefs_set(FFMPEG_BINARY_PREF_KEY, choice)
-    except Exception:
-        pass
-    return get_active_ffmpeg_choice()
-
-
-def get_ffmpeg_path_for_fsr31():
-    """Get the appropriate FFmpeg path for FSR 3.1 processing.
-
-    Returns the path to FFmpeg with libplacebo support if available,
-    otherwise falls back to standard FFmpeg.
-    """
-    # First try FFmpeg full (with libplacebo)
-    ffmpeg_full = get_local_ffmpeg_full_path()
-    if os.path.exists(ffmpeg_full) and has_libplacebo_support(ffmpeg_full):
-        return ffmpeg_full
-
-    # Fallback to standard FFmpeg
-    return get_local_ffmpeg_path()
-
-
-def ensure_ffmpeg_full(parent=None, progress_callback=None, abort_event=None,
-                       timeout=None):
-    """Ensure FFmpeg full (with libplacebo) is available for FSR 3.1.
-
-    Tries to download FFmpeg full if not already present.
-    Returns True if successful, False otherwise.
-    ``abort_event`` cancela la descarga; ``timeout`` acota el tiempo total.
-    """
-    ffmpeg_full = get_local_ffmpeg_full_path()
-    if os.path.exists(ffmpeg_full):
-        # Already have it, just verify libplacebo support
-        if has_libplacebo_support(ffmpeg_full):
-            return True
-
-    # Try to download FFmpeg full
-    try:
-        path = download_ffmpeg_full(
-            parent=parent, progress_callback=progress_callback,
-            abort_event=abort_event, timeout=timeout,
-        )
-        if path and os.path.exists(path):
-            return has_libplacebo_support(path)
-    except Exception as exc:
-        logger.warning("Error downloading FFmpeg full: %s", exc)
-        return False
-
-    return False
 
 
 # ---------------------------------------------------------------------------
@@ -472,7 +300,7 @@ def _migrate_legacy_layout():
         return False
 
 
-def ensure_ffmpeg(parent=None, progress_callback=None, prefer_full=False,
+def ensure_ffmpeg(parent=None, progress_callback=None,
                   abort_event=None, timeout=None):
     """Asegura que FFmpeg esté disponible dentro de la carpeta del programa.
 
@@ -481,15 +309,12 @@ def ensure_ffmpeg(parent=None, progress_callback=None, prefer_full=False,
         progress_callback: callable(percent, message) -> None. Recibe
             updates durante la descarga y la extracción. Compatible con
             callbacks de 1 argumento vía ``_emit``.
-        prefer_full: Por defecto False: usa el FFmpeg estándar (gyan release-full,
-            completo en codecs). El build BtbN "full" con libplacebo se instala
-            bajo demanda para FSR 3.1 (``ensure_ffmpeg_full``), no en el arranque.
         abort_event: threading.Event opcional para cancelar la descarga.
         timeout: presupuesto total de pared en segundos (opcional).
 
     Reglas (alineadas con el requisito del usuario):
       1. Si existe el binario local -> se usa, sin fallback al sistema.
-      2. Si no existe -> se descarga automáticamente a ``bin/ffmpeg/`` o ``bin/ffmpeg-full/``.
+      2. Si no existe -> se descarga automáticamente a ``bin/ffmpeg/``.
       3. No se consulta nunca el PATH del sistema para el flujo normal; sólo
          se expone a través de ``get_install_info()`` como diagnóstico.
 
@@ -498,46 +323,16 @@ def ensure_ffmpeg(parent=None, progress_callback=None, prefer_full=False,
     # Migración puntual del layout antiguo (bin/ffmpeg.exe -> bin/ffmpeg/ffmpeg.exe)
     _migrate_legacy_layout()
 
-    # Si prefer_full, intentar FFmpeg completo primero
-    if prefer_full:
-        local_full = get_local_ffmpeg_full_path()
-        if os.path.exists(local_full) and has_libplacebo_support(local_full):
-            _emit(progress_callback, 100, "FFmpeg full ready (cached)")
-            return local_full
-
     local = get_local_ffmpeg_path()
     if os.path.exists(local) and os.path.exists(get_local_ffprobe_path()):
         # Refrescar manifest si no existe (binario traído manualmente).
         if not os.path.exists(get_manifest_path()):
             write_manifest(_manifest_from_binary(local))
-        # Respetar la elección del usuario (standard vs full) sin redescargar.
-        active = get_active_ffmpeg_path() or local
         _emit(progress_callback, 100, "FFmpeg ready (cached)")
-        return active
+        return local
 
     ensure_runtime_dirs()
     try:
-        if prefer_full:
-            # Intentar descargar FFmpeg completo primero
-            _emit(progress_callback, 0, "Downloading FFmpeg full (with libplacebo)...")
-            try:
-                path = download_ffmpeg_full(
-                    parent=parent, progress_callback=progress_callback,
-                    abort_event=abort_event, timeout=timeout,
-                )
-                if path and os.path.exists(path):
-                    # Verify libplacebo support
-                    if has_libplacebo_support(path):
-                        _emit(progress_callback, 100, "FFmpeg full ready")
-                        return path
-                    else:
-                        # FFmpeg full downloaded but no libplacebo, fall back to standard
-                        _emit(progress_callback, 0, "FFmpeg full doesn't have libplacebo, trying standard...")
-            except Exception as exc:
-                _emit(progress_callback, 0, f"FFmpeg full download failed: {exc}, trying standard...")
-                logger.warning("FFmpeg full download failed: %s", exc)
-
-        # Fallback to standard FFmpeg
         path = download_ffmpeg(
             parent=parent, progress_callback=progress_callback,
             abort_event=abort_event, timeout=timeout,
@@ -557,8 +352,7 @@ def ensure_ffmpeg(parent=None, progress_callback=None, prefer_full=False,
     # Escribir manifest con datos de la descarga + huella upstream
     write_manifest(_build_install_manifest(path, "first-download"))
     # ``download_ffmpeg`` ya emite 100%/Ready al terminar; no re-emitimos.
-    # Respetar la elección del usuario (standard vs full) si ya hay un binario activo.
-    return get_active_ffmpeg_path() or path
+    return path
 
 
 def force_redownload(progress_callback=None, parent=None, abort_event=None,
@@ -619,32 +413,17 @@ def uninstall(parent=None):
         _rmtree_force(ffmpeg_dir)
 
 
-def uninstall_full(parent=None):
-    """Borra la instalación de FFmpeg 'full' (libplacebo, FSR 3.1)."""
-    try:
-        from src.dependencies import _rmtree_force
-    except Exception:
-        return
-    full_dir = get_ffmpeg_full_dir()
-    if os.path.isdir(full_dir):
-        _rmtree_force(full_dir)
-
-
 # ---------------------------------------------------------------------------
 # Compatibilidad con código existente
 # ---------------------------------------------------------------------------
 
 def get_ffprobe_path():
-    """Devuelve la ruta a ffprobe local; busca en ffmpeg dir, ffmpeg-full, y PATH."""
+    """Devuelve la ruta a ffprobe local; busca en el dir de ffmpeg y en PATH."""
     # 1. Intentar con el ffmpeg estándar (bin/ffmpeg/ffprobe.exe)
     local = get_local_ffprobe_path()
     if os.path.exists(local):
         return local
-    # 2. Intentar con el ffmpeg-full con libplacebo (bin/ffmpeg-full/ffprobe.exe)
-    full = get_local_ffprobe_full_path()
-    if os.path.exists(full):
-        return full
-    # 3. Último recurso: buscar en PATH del sistema
+    # 2. Último recurso: buscar en PATH del sistema
     system = find_system_ffprobe()
     if system:
         return system
