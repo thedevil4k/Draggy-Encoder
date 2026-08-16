@@ -607,6 +607,33 @@ jobs:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
+      # deploy-pages@v5 falla con un críptico "404 Failed to create
+      # deployment" si Pages no está activado o su fuente no es
+      # "GitHub Actions". Este paso comprueba ambas cosas ANTES y falla
+      # con un mensaje accionable. No se puede auto-activar con el
+      # GITHUB_TOKEN (la API lo rechaza), así que el fix es manual.
+      - name: Check GitHub Pages is enabled
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          pages_settings="https://github.com/$GITHUB_REPOSITORY/settings/pages"
+          resp="$(gh api "repos/$GITHUB_REPOSITORY/pages" 2>&1)" || {
+            echo "::error::GitHub Pages no está activado en este repositorio (la API respondió 404)." >&2
+            echo "::error::Actívalo en $pages_settings" >&2
+            echo "::error::y en 'Build and deployment > Source' elige 'GitHub Actions'." >&2
+            echo "::error::(En repos privados, Pages requiere un plan de pago.)" >&2
+            exit 1
+          }
+          build_type="$(printf '%s' "$resp" | jq -r '.build_type // empty')"
+          if [ "$build_type" != "workflow" ]; then
+            echo "::error::GitHub Pages está activado pero su fuente no es 'GitHub Actions' (build_type=$build_type)." >&2
+            echo "::error::Cámbiala en $pages_settings a 'GitHub Actions'." >&2
+            exit 1
+          fi
+          echo "GitHub Pages OK (fuente: GitHub Actions)"
+
       - name: Deploy Flatpak repository to GitHub Pages
         id: deployment
         uses: actions/deploy-pages@v5
