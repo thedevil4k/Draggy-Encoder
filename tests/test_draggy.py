@@ -1540,6 +1540,67 @@ def test_deadline_check_raises_on_timeout():
         dl._deadline_check(None, time.monotonic() - 1)
 
 
+def test_ffmpeg_download_urls_windows_has_live_mirror():
+    """El mirror Windows del FFmpeg estándar apunta al build estático BtbN
+    gpl (libplacebo + x264/x265 + SVT-AV1, en zip) con backup en gyan.dev.
+    La URL antigua de gyan (``ffmpeg-release-full.zip``) ya no existe (404)."""
+    from src.config import FFMPEG_DOWNLOAD_URLS
+
+    info = FFMPEG_DOWNLOAD_URLS["Windows"]
+    assert "ffmpeg-release-full.zip" not in info["url"]
+    assert "BtbN" in info["url"] and "win64-gpl.zip" in info["url"]
+    assert info["archive_type"] == "zip"
+    assert "essentials" in info["backup_url"]
+    assert info["backup_archive_type"] == "zip"
+
+
+def test_download_ffmpeg_falls_back_to_backup_mirror(tmp_path, monkeypatch):
+    """Si el mirror primario falla (404/red), download_ffmpeg prueba el
+    ``backup_url`` declarado en FFMPEG_DOWNLOAD_URLS antes de rendirse."""
+    import zipfile
+    import src.ffmpeg.downloader as dl
+    from src.config import FFMPEG_DOWNLOAD_URLS
+
+    win = FFMPEG_DOWNLOAD_URLS["Windows"]
+    bin_dir = tmp_path / "ffmpeg"
+    monkeypatch.setattr(dl, "get_ffmpeg_dir", lambda: str(bin_dir))
+    monkeypatch.setattr(dl, "_probe_url_metadata", lambda url: (None, False))
+    hits = []
+
+    def fake_download_file(url, archive_path, **kwargs):
+        hits.append(url)
+        if url == win["url"]:
+            raise RuntimeError("404 Client Error: Not Found")
+        with zipfile.ZipFile(archive_path, "w") as z:
+            z.writestr("ffmpeg/bin/" + dl.get_ffmpeg_executable_name(), b"x")
+            z.writestr("ffmpeg/bin/" + dl.get_ffprobe_executable_name(), b"x")
+
+    monkeypatch.setattr(dl, "_download_file", fake_download_file)
+
+    path = dl.download_ffmpeg(progress_callback=None)
+    assert path == os.path.join(str(bin_dir), dl.get_ffmpeg_executable_name())
+    assert os.path.exists(path)
+    assert os.path.exists(os.path.join(str(bin_dir), dl.get_ffprobe_executable_name()))
+    assert hits == [win["url"], win["backup_url"]]
+
+
+def test_download_ffmpeg_raises_when_all_mirrors_fail(tmp_path, monkeypatch):
+    """Si TODOS los mirrors fallan, download_ffmpeg lanza RuntimeError en
+    lugar de dejar un binario medio instalado."""
+    import src.ffmpeg.downloader as dl
+
+    monkeypatch.setattr(dl, "get_ffmpeg_dir", lambda: str(tmp_path / "ffmpeg"))
+    monkeypatch.setattr(dl, "_probe_url_metadata", lambda url: (None, False))
+
+    def boom(url, archive_path, **kwargs):
+        raise RuntimeError("upstream down")
+
+    monkeypatch.setattr(dl, "_download_file", boom)
+
+    with pytest.raises(RuntimeError, match="All FFmpeg download sources failed"):
+        dl.download_ffmpeg(progress_callback=None)
+
+
 # ==--------------------------------------------------------------------==
 # 3. KIND_MODEL rows stay out of the Binaries tab (UI)
 # ==--------------------------------------------------------------------==

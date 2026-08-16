@@ -389,9 +389,14 @@ def download_ffmpeg(progress_callback=None, parent=None, abort_event=None,
          reporte de progreso agregado.
       3. Si el probe falla, el archivo es pequeño o el upstream no
          soporta Range, fallback a single-stream legacy (la implementación
-         previa). En la práctica para gyan.dev (Windows, ~130 MB) y
+         previa). En la práctica para BtbN (Windows, ~160 MB) y
          johnvansickle.com (Linux, ~30 MB), siempre acabamos en el camino
          paralelo.
+      4. Mirrors: si el mirror primario falla (404, timeout de red,
+         extracción corrupta...), se prueba el ``backup_url`` declarado en
+         ``FFMPEG_DOWNLOAD_URLS`` antes de rendirse. La cancelación del
+         usuario y el vencimiento del timeout NO prueban el siguiente
+         mirror: se propagan.
 
     ``abort_event`` (``threading.Event``) detiene la descarga y lanza
     ``RuntimeError("cancelled by user")``; ``timeout`` (segundos, default
@@ -407,8 +412,8 @@ def download_ffmpeg(progress_callback=None, parent=None, abort_event=None,
 
     Devuelve la ruta absoluta al ejecutable ``ffmpeg`` dentro de
     ``bin/ffmpeg/`` (vía ``get_ffmpeg_dir()``). Lanza ``RuntimeError`` si
-    la plataforma no tiene URL conocida, si la extracción falla, o si no
-    se localiza el binario.
+    la plataforma no tiene URL conocida, si TODOS los mirrors fallan, si
+    la extracción falla, o si no se localiza el binario.
     """
     deadline = time.monotonic() + (
         timeout if timeout is not None else _DEFAULT_DOWNLOAD_TIMEOUT_S
@@ -418,110 +423,151 @@ def download_ffmpeg(progress_callback=None, parent=None, abort_event=None,
         raise RuntimeError("Plataforma no soportada: {}".format(system))
 
     info = FFMPEG_DOWNLOAD_URLS[system]
-    url = info["url"]
-    archive_type = info["archive_type"]
+    candidates = [
+        (info["url"], info["archive_type"], "primary"),
+    ]
+    if info.get("backup_url"):
+        candidates.append(
+            (
+                info["backup_url"],
+                info.get("backup_archive_type", info["archive_type"]),
+                "backup",
+            )
+        )
 
     bin_dir = get_ffmpeg_dir()
     os.makedirs(bin_dir, exist_ok=True)
 
+    last_error = None
+    dest_ffmpeg = None
+
     with tempfile.TemporaryDirectory() as tmpdir:
-        archive_path = os.path.join(tmpdir, "ffmpeg_download.{}".format(archive_type))
-
-        # Probe de capacidad (HEAD). En el caso típico (gyan.dev /
-        # johnvansickle.com) devuelve un total ~130 MB / ~30 MB y
-        # supports_range=True. Si devuelve None/False, fallback seguro
-        # al camino single-stream.
-        _emit(progress_callback, 0, "Connecting to upstream...")
-        size, supports_range = _probe_url_metadata(url)
-
-        if size is not None and size >= _PARALLEL_MIN_FILE_SIZE and supports_range:
-            # Camino rápido: 8 workers en paralelo con HTTP Range. Si falla
-            # (ReadTimeout, 206 mismatch por Range ignorado, excepción de
-            # socket, etc.) caemos automáticamente a single-stream para no
-            # mostrar un critical dialog al usuario por un fallo que
-            # single-stream habría capeado sin despeinarse. La cancelación
-            # del usuario y el vencimiento NO caen al fallback: se propagan.
+        for idx, (url, archive_type, label) in enumerate(candidates):
+            _deadline_check(abort_event, deadline)
+            _emit(progress_callback, 0, "Connecting to upstream ({} mirror)...".format(label))
+            archive_path = os.path.join(tmpdir, "ffmpeg_download.{}.{}".format(idx, archive_type))
             try:
-                _download_parallel(
-                    url,
-                    archive_path,
-                    total_size=size,
-                    progress_callback=progress_callback,
-                    num_workers=_PARALLEL_DEFAULT_WORKERS,
-                    abort_event=abort_event,
-                    deadline=deadline,
-                )
+                # Probe de capacidad (HEAD). En el caso típico (BtbN /
+                # johnvansickle.com) devuelve un total ~160 MB / ~30 MB y
+                # supports_range=True. Si devuelve None/False, fallback seguro
+                # al camino single-stream.
+                size, supports_range = _probe_url_metadata(url)
+
+                if size is not None and size >= _PARALLEL_MIN_FILE_SIZE and supports_range:
+                    # Camino rápido: 8 workers en paralelo con HTTP Range. Si falla
+                    # (ReadTimeout, 206 mismatch por Range ignorado, excepción de
+                    # socket, etc.) caemos automáticamente a single-stream para no
+                    # mostrar un critical dialog al usuario por un fallo que
+                    # single-stream habría capeado sin despeinarse. La cancelación
+                    # del usuario y el vencimiento NO caen al fallback: se propagan.
+                    try:
+                        _download_parallel(
+                            url,
+                            archive_path,
+                            total_size=size,
+                            progress_callback=progress_callback,
+                            num_workers=_PARALLEL_DEFAULT_WORKERS,
+                            abort_event=abort_event,
+                            deadline=deadline,
+                        )
+                    except Exception as exc:
+                        if abort_event is not None and abort_event.is_set():
+                            raise
+                        if time.monotonic() >= deadline:
+                            raise
+                        _emit(
+                            progress_callback,
+                            0,
+                            "Parallel download failed; switching to single-stream...",
+                        )
+                        # Importante: el archivo parcial queda inconsistente (un
+                        # mismatch 206 pudo haber escrito bytes en regiones del
+                        # sparse file que no corresponden a su rango). Borrar para
+                        # que single-stream empiece desde cero y el zip/tar.xz
+                        # extractor no explote por offsets corruptos.
+                        try:
+                            if os.path.exists(archive_path):
+                                os.remove(archive_path)
+                        except OSError:
+                            pass
+                        _download_file(
+                            url, archive_path,
+                            progress_callback=progress_callback,
+                            abort_event=abort_event,
+                            deadline=deadline,
+                        )
+                else:
+                    # Fallback single-stream (ficheros pequeños o sin soporte Range).
+                    _download_file(
+                        url, archive_path,
+                        progress_callback=progress_callback,
+                        abort_event=abort_event,
+                        deadline=deadline,
+                    )
+
+                _deadline_check(abort_event, deadline)
+                _emit(progress_callback, 92, "Extracting {} archive...".format(archive_type))
+                extract_dir = os.path.join(tmpdir, "ffmpeg_extracted")
+                os.makedirs(extract_dir, exist_ok=True)
+                try:
+                    if archive_type == "zip":
+                        with zipfile.ZipFile(archive_path, "r") as z:
+                            _safe_extract_zip(z, extract_dir)
+                    elif archive_type == "tar.xz":
+                        with tarfile.open(archive_path, "r:xz") as t:
+                            _safe_extract_tar(t, extract_dir)
+                except (zipfile.BadZipFile, tarfile.TarError, OSError) as exc:
+                    raise RuntimeError("Archive extraction failed: {}".format(exc)) from exc
+
+                ffmpeg_path, ffprobe_path = _find_executables(extract_dir)
+                if not ffmpeg_path:
+                    raise RuntimeError("No se encontró el ejecutable de FFmpeg tras extraer el archivo.")
+
+                _deadline_check(abort_event, deadline)
+                _emit(progress_callback, 98, "Installing binaries...")
+                dest_ffmpeg = os.path.join(bin_dir, get_ffmpeg_executable_name())
+                dest_ffprobe = os.path.join(bin_dir, get_ffprobe_executable_name())
+                shutil.copy2(ffmpeg_path, dest_ffmpeg)
+                if ffprobe_path:
+                    shutil.copy2(ffprobe_path, dest_ffprobe)
+
+                if system != "Windows":
+                    try:
+                        os.chmod(dest_ffmpeg, 0o755)
+                    except OSError:
+                        pass
+                    if os.path.exists(dest_ffprobe):
+                        try:
+                            os.chmod(dest_ffprobe, 0o755)
+                        except OSError:
+                            pass
+                break
             except Exception as exc:
+                # La cancelación del usuario y el vencimiento del timeout no
+                # prueban el siguiente mirror: se propagan.
                 if abort_event is not None and abort_event.is_set():
                     raise
                 if time.monotonic() >= deadline:
                     raise
-                _emit(
-                    progress_callback,
-                    0,
-                    "Parallel download failed; switching to single-stream...",
-                )
-                # Importante: el archivo parcial queda inconsistente (un
-                # mismatch 206 pudo haber escrito bytes en regiones del
-                # sparse file que no corresponden a su rango). Borrar para
-                # que single-stream empiece desde cero y el zip/tar.xz
-                # extractor no explote por offsets corruptos.
+                last_error = exc
+                # El parcial (si existe) queda inconsistente; borrarlo para que
+                # el siguiente mirror empiece desde cero.
                 try:
                     if os.path.exists(archive_path):
                         os.remove(archive_path)
                 except OSError:
                     pass
-                _download_file(
-                    url, archive_path,
-                    progress_callback=progress_callback,
-                    abort_event=abort_event,
-                    deadline=deadline,
+                _emit(
+                    progress_callback,
+                    0,
+                    "Download failed ({} mirror): {}; trying next mirror...".format(label, exc),
                 )
-        else:
-            # Fallback single-stream (ficheros pequeños o sin soporte Range).
-            _download_file(
-                url, archive_path,
-                progress_callback=progress_callback,
-                abort_event=abort_event,
-                deadline=deadline,
+                continue
+
+        if dest_ffmpeg is None:
+            raise RuntimeError(
+                "All FFmpeg download sources failed. Last error: {}".format(last_error)
             )
-
-        _deadline_check(abort_event, deadline)
-        _emit(progress_callback, 92, "Extracting {} archive...".format(archive_type))
-        extract_dir = os.path.join(tmpdir, "ffmpeg_extracted")
-        os.makedirs(extract_dir, exist_ok=True)
-        try:
-            if archive_type == "zip":
-                with zipfile.ZipFile(archive_path, "r") as z:
-                    _safe_extract_zip(z, extract_dir)
-            elif archive_type == "tar.xz":
-                with tarfile.open(archive_path, "r:xz") as t:
-                    _safe_extract_tar(t, extract_dir)
-        except (zipfile.BadZipFile, tarfile.TarError, OSError) as exc:
-            raise RuntimeError("Archive extraction failed: {}".format(exc)) from exc
-
-        ffmpeg_path, ffprobe_path = _find_executables(extract_dir)
-        if not ffmpeg_path:
-            raise RuntimeError("No se encontró el ejecutable de FFmpeg tras extraer el archivo.")
-
-        _deadline_check(abort_event, deadline)
-        _emit(progress_callback, 98, "Installing binaries...")
-        dest_ffmpeg = os.path.join(bin_dir, get_ffmpeg_executable_name())
-        dest_ffprobe = os.path.join(bin_dir, get_ffprobe_executable_name())
-        shutil.copy2(ffmpeg_path, dest_ffmpeg)
-        if ffprobe_path:
-            shutil.copy2(ffprobe_path, dest_ffprobe)
-
-        if system != "Windows":
-            try:
-                os.chmod(dest_ffmpeg, 0o755)
-            except OSError:
-                pass
-            if os.path.exists(dest_ffprobe):
-                try:
-                    os.chmod(dest_ffprobe, 0o755)
-                except OSError:
-                    pass
 
     _emit(progress_callback, 100, "FFmpeg ready")
     return dest_ffmpeg

@@ -233,12 +233,17 @@ RESOLUTIONS = [
 ]
 
 # URLs de descarga de FFmpeg por defecto (builds estáticas GPL).
-# gyan.dev "release-full" incluye libx264/libx265, SVT-AV1 y libplacebo, así que
-# el build por defecto ya cubre codecs modernos (incl. FSR 3.1) sin el segundo binario.
+# Windows: gyan.dev dejó de publicar builds "full" en zip (ahora solo .7z,
+# que nuestro extractor no soporta) y su build "essentials" NO incluye
+# libplacebo ni SVT-AV1. Usamos el build estático gpl de BtbN
+# (libplacebo + x264/x265 + SVT-AV1 + NVENC/AMF/CUDA, todo en ffmpeg.exe)
+# con fallback al essentials de gyan.dev si el primario falla.
 FFMPEG_DOWNLOAD_URLS = {
     "Windows": {
-        "url": "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-full.zip",
+        "url": "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl.zip",
         "archive_type": "zip",
+        "backup_url": "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip",
+        "backup_archive_type": "zip",
     },
     "Linux": {
         "url": "https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz",
