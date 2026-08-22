@@ -2058,7 +2058,7 @@ def test_face_restore_hf_repos_are_real():
 
 def test_workflow_maps_face_restore_node(qapp):
     """The workflow has a FaceRestore node wired to the catalog category,
-    and it builds fine without the icon asset (added later by the user)."""
+    and its icon loads correctly from assets."""
     from src.ui.workflow_widget import NODE_CATEGORY, WorkflowWidget
 
     assert NODE_CATEGORY["FaceRestore"][0] == "FaceRestore"
@@ -2069,8 +2069,9 @@ def test_workflow_maps_face_restore_node(qapp):
         assert "FaceRestore" in names
         step = next(s for s in widget.middle_steps if s.name == "FaceRestore")
         assert step.category == "FaceRestore"
-        # A missing icon file must not crash construction or the row layout.
-        assert step.icon_label.pixmap() is None or step.icon_label.pixmap().isNull()
+        # Icon now exists in assets/AI FaceRestore.png — verify it loads
+        pix = step.icon_label.pixmap()
+        assert pix is not None and not pix.isNull()
         # Active nodes report the category as engine key (pipeline contract).
         step.set_active(True)
         engines = widget.get_selected_engines()

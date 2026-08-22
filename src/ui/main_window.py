@@ -9,6 +9,7 @@ from PySide6.QtGui import QGuiApplication, QIcon, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
     QFileDialog,
+    QFrame,
     QHBoxLayout,
     QLabel,
     QMainWindow,
@@ -16,6 +17,8 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QProgressBar,
     QPushButton,
+    QScrollArea,
+    QSizePolicy,
     QSplitter,
     QStyle,
     QSystemTrayIcon,
@@ -696,7 +699,11 @@ class MainWindow(QMainWindow):
 
     def _setup_ui(self):
         self.setWindowTitle(f"{APP_NAME} v1")
-        self.setMinimumSize(1100, 800)
+        # Lowered from 1100×800 so the window can be used at 1024×640:
+        # thanks to the new scroll areas (top bar, workflow chain,
+        # settings panel) the layout no longer needs to force a huge
+        # minimum to avoid the clip/overlap bug in your screenshot.
+        self.setMinimumSize(1024, 640)
         # Icono de ventana explícito: la taskbar de Windows usa el icono de
         # la ventana (no el del exe). QApplication.setWindowIcon ya lo cubre
         # en la mayoría de casos, pero ser explícito evita el icono genérico
@@ -724,6 +731,7 @@ class MainWindow(QMainWindow):
 
         # Top buttons
         top_layout = QHBoxLayout()
+        top_layout.setSpacing(8)
         self.btn_runtimes = QPushButton("Dependencies")
         self.btn_runtimes.setToolTip(
             "FFmpeg, PyTorch, ONNX Runtime: download, update and uninstall "
@@ -745,6 +753,10 @@ class MainWindow(QMainWindow):
         self.btn_ai_engines.clicked.connect(self._show_dependencies)
         self.btn_preferences = QPushButton("Preferences")
         self.btn_preferences.clicked.connect(self._show_preferences)
+        for _btn in (self.btn_runtimes, self.btn_output, self.btn_hardware,
+                     self.btn_redetect, self.btn_ai_engines, self.btn_preferences):
+            _btn.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+            _btn.setMinimumWidth(0)
 
         top_layout.addWidget(self.btn_runtimes)
         top_layout.addWidget(self.btn_output)
@@ -793,7 +805,10 @@ class MainWindow(QMainWindow):
         if self.sandbox_banner is not None:
             layout.addWidget(self.sandbox_banner)
 
-        # Workflow
+        # Workflow — the chain is ~1600 px wide (Import 150 + 5×200 +
+        # Compress 90 + arrows + reorder gaps). It must never be squeezed
+        # or clipped when the window is narrow; instead a horizontal bar
+        # appears (your screenshot bug). The steps keep their fixed size.
         self.workflow = WorkflowWidget()
         # When a node has no engines installed, ``AIWorkflowStep``
         # exposes a clickable "No engines — open AI Engines Manager"
@@ -815,9 +830,30 @@ class MainWindow(QMainWindow):
         # Click en la casilla Import = seleccionar videos (el botón
         # "Select Videos" de la barra superior ya no existe).
         self.workflow.import_clicked.connect(self._select_video)
-        layout.addWidget(self.workflow)
 
-        # Settings
+        self.workflow_scroll = QScrollArea()
+        self.workflow_scroll.setObjectName("workflowScroll")
+        self.workflow_scroll.setWidgetResizable(False)
+        self.workflow_scroll.setFrameShape(QFrame.NoFrame)
+        self.workflow_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.workflow_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.workflow_scroll.setWidget(self.workflow)
+        self.workflow_scroll.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        # 150 px step height + 10+10 layout margins + 6 px bar
+        self.workflow_scroll.setMinimumHeight(184)
+        self.workflow_scroll.setMaximumHeight(188)
+        self.workflow_scroll.setStyleSheet(
+            "#workflowScroll { background: transparent; border: none; }"
+            "QScrollBar:horizontal { height: 8px; background: #16213e; border-radius: 4px; }"
+            "QScrollBar::handle:horizontal { background: #00d2d3; border-radius: 4px; }"
+            "QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal { width: 0px; }"
+        )
+        layout.addWidget(self.workflow_scroll)
+
+        # Settings — wrapped in a vertical scroll so the panel never
+        # overlaps / gets clipped when the window is short (your screenshot:
+        # the bottom half was squashed with no vertical bar). The grid keeps
+        # its ideal height; the scroll appears instead.
         self.settings_panel = SettingsPanel(
             hardware_info=self.hardware_info,
             compatible_codecs=self.compatible_codecs,
@@ -827,10 +863,29 @@ class MainWindow(QMainWindow):
         # ``remember_last_codec_device`` está activa. Idempotente:
         # no hace nada si los valores no son válidos o la pref está off.
         self._restore_last_codec_device()
-        layout.addWidget(self.settings_panel, stretch=1)
+
+        self.settings_scroll = QScrollArea()
+        self.settings_scroll.setObjectName("settingsScroll")
+        self.settings_scroll.setWidgetResizable(True)
+        self.settings_scroll.setFrameShape(QFrame.NoFrame)
+        self.settings_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.settings_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.settings_scroll.setWidget(self.settings_panel)
+        self.settings_scroll.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.settings_scroll.setStyleSheet(
+            "#settingsScroll { background: transparent; border: none; }"
+            "QScrollBar:vertical { width: 8px; background: #16213e; border-radius: 4px; }"
+            "QScrollBar::handle:vertical { background: #2c3e50; border-radius: 4px; }"
+            "QScrollBar:horizontal { height: 8px; background: #16213e; border-radius: 4px; }"
+            "QScrollBar::handle:horizontal { background: #2c3e50; border-radius: 4px; }"
+            "QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical,"
+            " QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal { height: 0px; width: 0px; }"
+        )
+        layout.addWidget(self.settings_scroll, stretch=1)
 
         # Bottom buttons
         bottom_layout = QHBoxLayout()
+        bottom_layout.setSpacing(8)
         self.btn_compress = QPushButton("Compress")
         self.btn_compress.clicked.connect(self._compress)
         self.btn_preview = QPushButton("Preview")
@@ -844,6 +899,9 @@ class MainWindow(QMainWindow):
         self.btn_abort = QPushButton("Abort")
         self.btn_abort.setEnabled(False)
         self.btn_abort.clicked.connect(self._abort)
+        for _btn in (self.btn_compress, self.btn_preview, self.btn_add_queue, self.btn_abort):
+            _btn.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+            _btn.setMinimumWidth(0)
 
         bottom_layout.addWidget(self.btn_compress)
         bottom_layout.addWidget(self.btn_preview)

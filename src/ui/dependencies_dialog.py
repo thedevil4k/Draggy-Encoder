@@ -564,6 +564,7 @@ class DependenciesDialog(QDialog):
         self._onnx_worker = None
         # Worker de borrado de motores IA.
         self._remove_worker = None
+        self._remove_progress = None
         # Pane de modelos; solo existe en modo AI Engines.
         self.engines_tab = None
         # Escuchamos el bus de estado para repintar la pestaña AI Engines
@@ -728,6 +729,11 @@ class DependenciesDialog(QDialog):
             return _EnginesTabErrorWidget(exc, self)
 
     def _populate(self):
+        # AI Engines es pane único sin lista de binarios
+        if getattr(self, "_engines_mode", False):
+            return
+        if not hasattr(self, "container") or not hasattr(self, "container_layout"):
+            return
         # Limpiar filas existentes
         for w in self._row_widgets:
             w.setParent(None)
@@ -899,7 +905,19 @@ class DependenciesDialog(QDialog):
         lines = str(msg).strip().splitlines()
         first_block = "\n".join(lines[:3]).strip() if lines else str(msg)
         low = first_block.lower()
-        if "espacio" in low or "space" in low:
+        # Mensaje específico de torch en Windows cuando falta VC++ Redist
+        if "vcruntime" in low or "msvcp" in low or "api-ms-win-crt" in low:
+            hint = (
+                "Falta Microsoft Visual C++ Redistributable.\n"
+                "Instálalo desde https://aka.ms/vs/17/release/vc_redist.x64.exe "
+                "y reintenta. Si no tienes GPU NVIDIA, prueba la variante CPU."
+            )
+        elif "dll load failed" in low or "errno 126" in low or "errno 127" in low:
+            hint = (
+                "Falló la carga de una DLL nativa (antivirus o VC++ faltante).\n"
+                "Prueba a desactivar el antivirus momentáneamente o instalar la variante CPU."
+            )
+        elif "espacio" in low or "space" in low:
             hint = "Libera espacio en disco y vuelve a intentarlo."
         elif "ssl" in low or "certificado" in low:
             hint = "Revisa los certificados SSL y el proxy de tu red."
@@ -1531,13 +1549,46 @@ class DependenciesDialog(QDialog):
         self._remove_worker.finished_ok.connect(self._on_engine_remove_ok)
         self._remove_worker.failed.connect(self._on_engine_remove_failed)
         self._remove_worker.start()
+        # Feedback inmediato para que la UI no parezca colgada mientras
+        # shutil.rmtree borra gigabytes en el hilo de fondo.
+        progress = QProgressDialog(
+            f"Borrando '{name}'...\n{target_dir}",
+            None, 0, 0, self,
+        )
+        progress.setWindowTitle("Borrando modelo")
+        progress.setWindowModality(Qt.WindowModality.WindowModal)
+        progress.setMinimumDuration(0)
+        progress.setCancelButton(None)
+        progress.setAutoClose(False)
+        progress.setAutoReset(False)
+        # Busy indicator (rango 0,0) = barra animada sin porcentaje
+        progress.setRange(0, 0)
+        progress.show()
+        # Necesario para que el diálogo se pinte antes de que el
+        # worker empiece a consumir disco/CPU
+        try:
+            from PySide6.QtWidgets import QApplication as _QApp
+            _QApp.processEvents()
+        except Exception:
+            pass
+        self._remove_progress = progress
 
     def _on_engine_remove_ok(self, engine_id):
+        # Cerrar el busy dialog primero para que el OK de abajo no quede detrás
+        try:
+            if getattr(self, "_remove_progress", None) is not None:
+                self._remove_progress.close()
+                self._remove_progress.deleteLater()
+        except Exception:
+            pass
+        self._remove_progress = None
         self._remove_worker = None
         try:
             engines_clear_benchmark(engine_id)
         except Exception:
             pass
+        # Sin susto: toast ligero en lugar de crítico? Mantenemos info modal
+        # pero es un éxito esperado, no un error.
         QMessageBox.information(
             self, "Engine removed",
             f"'{engine_id}' se ha eliminado correctamente.",
@@ -1546,6 +1597,13 @@ class DependenciesDialog(QDialog):
         self._populate()
 
     def _on_engine_remove_failed(self, engine_id, msg):
+        try:
+            if getattr(self, "_remove_progress", None) is not None:
+                self._remove_progress.close()
+                self._remove_progress.deleteLater()
+        except Exception:
+            pass
+        self._remove_progress = None
         self._remove_worker = None
         QMessageBox.critical(
             self, "Remove failed",
@@ -1577,6 +1635,14 @@ class DependenciesDialog(QDialog):
         super().reject()
 
     def _kill_workers(self):
+        # Cerrar el busy dialog de borrado si quedó abierto (diálogo cerrado a mitad)
+        try:
+            if getattr(self, "_remove_progress", None) is not None:
+                self._remove_progress.close()
+                self._remove_progress.deleteLater()
+        except Exception:
+            pass
+        self._remove_progress = None
         for w_attr in ("_git_worker", "_onnx_worker",
                        "_uninstall_worker", "_remove_worker", "_bench_worker",
                        "_upstream_worker", "_active_worker"):

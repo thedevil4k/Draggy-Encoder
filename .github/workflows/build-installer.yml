@@ -75,6 +75,35 @@ jobs:
           # src/runtimes/manager.py:_run_pip).
           .\dist\DraggyEncoder\embed-python\python.exe -m pip --version
 
+      - name: Bundle VC++ runtime for torch (fix DLL load on clean Windows)
+        shell: pwsh
+        run: |
+          # PyTorch on Windows needs vcruntime/msvcp (VC++ Redistributable).
+          # Clean Windows 10/11 images in the wild miss it; the app would then
+          # fail with "DLL load failed" after a successful pip install.
+          # Copy the DLLs next to the embed-python and next to the EXE so both
+          # the pip interpreter and the frozen app find them via
+          # os.add_dll_directory / PATH. No admin install needed.
+          $src = "C:\Windows\System32"
+          $dsts = @("dist\DraggyEncoder\embed-python", "dist\DraggyEncoder")
+          foreach ($dll in @("vcruntime140.dll","vcruntime140_1.dll","msvcp140.dll","msvcp140_1.dll","concrt140.dll")) {
+            $p = Join-Path $src $dll
+            if (Test-Path $p) {
+              foreach ($dst in $dsts) {
+                Copy-Item $p -Destination $dst -Force -ErrorAction SilentlyContinue
+                Write-Host "bundled $dll -> $dst"
+              }
+            } else {
+              Write-Host "NOTE: $dll not found at $p (skipping)"
+            }
+          }
+          # Verify that at least the two critical DLLs are now present.
+          foreach ($dll in @("vcruntime140.dll","msvcp140.dll")) {
+            if (-not (Test-Path (Join-Path "dist\DraggyEncoder\embed-python" $dll))) {
+              Write-Host "WARNING: $dll still not bundled"
+            }
+          }
+
       - name: Verify embedded Python isolation
         run: |
           # Guard against a future workflow change re-enabling imports from

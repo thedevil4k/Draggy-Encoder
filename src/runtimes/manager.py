@@ -367,6 +367,80 @@ def _can_import(module_name: str) -> bool:
         return False
 
 
+def _import_error_detail(module_name: str) -> str:
+    """Diagnóstico legible cuando ``_can_import`` falla.
+
+    Intenta importar el módulo y, si falla, devuelve el traceback completo
+    (tipo + mensaje + pila). Si el spec ni siquiera apunta al store local,
+    explica por qué. Nunca lanza: siempre devuelve una cadena.
+    """
+    import traceback as _tb
+
+    try:
+        spec = importlib.util.find_spec(module_name)
+    except Exception as exc:  # pragma: no cover - muy raro
+        return f"find_spec('{module_name}') falló: {type(exc).__name__}: {exc}\n{_tb.format_exc()}"
+
+    if spec is None:
+        return (
+            f"importlib.find_spec('{module_name}') devolvió None — "
+            f"el paquete no se encontró en sys.path.\n"
+            f"sys.path[0:3]={sys.path[:3]}\n"
+            f"store={RUNTIME_MODULES_DIR}\n"
+            f"store existe: {os.path.isdir(RUNTIME_MODULES_DIR)}"
+        )
+    if spec.origin is None:
+        # Namespace package (directorio vacío sin __init__.py) -> pip no terminó
+        try:
+            locs = getattr(spec, "submodule_search_locations", None)
+            locs = list(locs) if locs else None
+        except Exception:
+            locs = None
+        return (
+            f"spec.origin is None para '{module_name}' (namespace package, "
+            f"posible instalación incompleta/corrupta).\n"
+            f"spec.submodule_search_locations={locs}\n"
+            f"store={RUNTIME_MODULES_DIR}"
+        )
+    if not _is_path_in_store(spec.origin):
+        return (
+            f"'{module_name}' se resolvió fuera del store privado:\n"
+            f"  spec.origin={spec.origin}\n"
+            f"  store={RUNTIME_MODULES_DIR}\n"
+            f"  sys.path[0]={sys.path[0] if sys.path else '—'}"
+        )
+    # Origen correcto pero la importación falla (DLL, ABI, etc.)
+    try:
+        importlib.import_module(module_name)
+        return ""  # no debería llegar aquí: _can_import habría dado True
+    except Exception as exc:
+        tb = _tb.format_exc()
+        # Mensaje corto primero, traceback completo después (útil en
+        # 'Mostrar detalles' del diálogo de error).
+        return f"{type(exc).__name__}: {exc}\n{tb}"
+
+    return f"Importación de '{module_name}' falló por motivo desconocido."
+
+
+def _vc_redist_hint(detail: str) -> str:
+    """Hint específico de Windows cuando faltan las DLL de VC++."""
+    low = (detail or "").lower()
+    if any(k in low for k in ("vcruntime", "msvcp", "api-ms-win-crt", "142", "140")):
+        return (
+            " Parece que falta Microsoft Visual C++ Redistributable "
+            "(vcruntime140.dll / msvcp140.dll).\n"
+            " Instálalo desde https://aka.ms/vs/17/release/vc_redist.x64.exe "
+            "y vuelve a intentar instalar PyTorch.\n"
+        )
+    if "dll load failed" in low or "errno 126" in low or "errno 127" in low:
+        return (
+            " Falló la carga de una DLL nativa (posible antivirus bloqueando "
+            "torch_cpu.dll / c10.dll o falta de VC++ Redistributable). "
+            "Prueba a desactivar el antivirus momentáneamente o instalar la variante CPU.\n"
+        )
+    return ""
+
+
 def import_local_runtime(module_name: str):
     """Importa un runtime únicamente desde ``ai_modules``.
 
@@ -1428,9 +1502,26 @@ def install_pytorch(
     inject_runtime_paths()
     ensure_runtime_dlls_on_path()
     if not _can_import("torch"):
+        detail = _import_error_detail("torch")
+        hint = _vc_redist_hint(detail)
+        # Fallback automático: si la variante CUDA falló por DLL y no era CPU,
+        # reintentar con CPU puede salvar la instalación en equipos sin
+        # toolchain CUDA. No se aplica si el error es de spec/namespace (pip
+        # corrupto) чтобы evitar bucle infinito.
+        if used_variant != "cpu" and ("dll load failed" in detail.lower() or "vcruntime" in detail.lower()):
+            # No reintento recursivo aquí (evitar download gigante de nuevo
+            # sin consentimiento). Se informa al usuario para que elija CPU.
+            hint += (
+                "\nPrueba a instalar la variante CPU desde el panel "
+                "(Dependencies → PyTorch → CPU) si no tienes GPU NVIDIA."
+            )
         raise RuntimeError(
             "PyTorch installation finished but the local runtime could not "
-            "be imported. The installation may be incomplete or incompatible."
+            f"be imported. The installation may be incomplete or incompatible.{hint}\n\n"
+            f"Detalles del import:\n{detail}\n\n"
+            f"store={RUNTIME_MODULES_DIR}\n"
+            f"python={sys.version.split()[0]} ({'frozen' if getattr(sys, 'frozen', False) else 'dev'}) "
+            f"variant={used_variant}"
         )
     return used_variant
 
@@ -1465,9 +1556,15 @@ def install_onnxruntime(
     inject_runtime_paths()
     ensure_runtime_dlls_on_path()
     if not _can_import("onnxruntime"):
+        detail = _import_error_detail("onnxruntime")
+        hint = _vc_redist_hint(detail)
         raise RuntimeError(
             "ONNX Runtime installation finished but the local runtime could "
-            "not be imported. The installation may be incomplete or incompatible."
+            f"not be imported. The installation may be incomplete or incompatible.{hint}\n\n"
+            f"Detalles del import:\n{detail}\n\n"
+            f"store={RUNTIME_MODULES_DIR}\n"
+            f"python={sys.version.split()[0]} ({'frozen' if getattr(sys, 'frozen', False) else 'dev'}) "
+            f"variant={used_variant}"
         )
     return used_variant
 
@@ -1536,9 +1633,16 @@ def install_runtimes(
         if not _can_import(name)
     ]
     if missing:
+        details = "\n\n".join(
+            f"--- {name} ---\n{_import_error_detail(name)}\n{_vc_redist_hint(_import_error_detail(name))}"
+            for name in missing
+        )
         raise RuntimeError(
             "Runtime installation finished but these local packages could "
-            "not be imported: " + ", ".join(missing)
+            f"not be imported: {', '.join(missing)}\n\n{details}\n\n"
+            f"store={RUNTIME_MODULES_DIR}\n"
+            f"python={sys.version.split()[0]} ({'frozen' if getattr(sys, 'frozen', False) else 'dev'}) "
+            f"variant={used_variant}"
         )
     return used_variant
 
@@ -1741,6 +1845,17 @@ def ensure_runtime_dlls_on_path() -> None:
         pass
 
     extra = [RUNTIME_MODULES_DIR]
+    # torch/lib y onnxruntime/capi contienen las DLL nativas que
+    # CPython carga via LoadLibrary. Añadirlas explícitamente antes
+    # que `torch/__init__.py` lo haga evita condiciones de carrera
+    # cuando el store se acaba de instalar en la misma sesión.
+    for _dll_sub in (
+        os.path.join(RUNTIME_MODULES_DIR, "torch", "lib"),
+        os.path.join(RUNTIME_MODULES_DIR, "onnxruntime", "capi"),
+        os.path.join(RUNTIME_MODULES_DIR, "onnxruntime", "capi", "build"),
+    ):
+        if os.path.isdir(_dll_sub):
+            extra.append(_dll_sub)
     nvidia_dir = os.path.join(RUNTIME_MODULES_DIR, "nvidia")
     if os.path.isdir(nvidia_dir):
         for sub in os.listdir(nvidia_dir):

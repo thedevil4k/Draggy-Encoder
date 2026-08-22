@@ -881,7 +881,7 @@ class WorkflowWidget(QWidget):
             AIWorkflowStep("Interp",   get_asset_path("AI Interpolation.png")),
             AIWorkflowStep("Denoise",  get_asset_path("AI Denoise.png")),
             AIWorkflowStep("Colorize", get_asset_path("AI Colorize.png")),
-            AIWorkflowStep("FaceRestore", get_asset_path("AI Face Restore.png")),
+            AIWorkflowStep("FaceRestore", get_asset_path("AI FaceRestore.png")),
         ]
         for step in self.middle_steps:
             step.clicked_for_manage.connect(self._on_step_manage_requested)
