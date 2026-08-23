@@ -184,6 +184,7 @@ jobs:
               'github-pages',
               'DraggyEncoder-Linux-packages',
             ]);
+            const staleBefore = Date.now() - 72 * 60 * 60 * 1000;
             const artifacts = await github.paginate(
               github.rest.actions.listArtifactsForRepo,
               {
@@ -194,7 +195,12 @@ jobs:
             );
             for (const artifact of artifacts) {
               if (!names.has(artifact.name)) continue;
-              core.info(`Deleting temporary artifact ${artifact.name} (${artifact.id})`);
+              const createdAt = Date.parse(artifact.created_at || '');
+              if (!Number.isFinite(createdAt) || createdAt > staleBefore) {
+                core.info(`Keeping recent artifact ${artifact.name} (${artifact.id})`);
+                continue;
+              }
+              core.info(`Deleting stale artifact ${artifact.name} (${artifact.id})`);
               await github.rest.actions.deleteArtifact({
                 owner: context.repo.owner,
                 repo: context.repo.repo,
@@ -561,6 +567,25 @@ jobs:
             grep -Fq "$line" "$log" \
               || { echo "Falta en selftest.log: $line" >&2; exit 1; }
           done
+
+      # Este es el artifact descargable desde la página de la ejecución.
+      # upload-pages-artifact no sirve como sustituto: está reservado para
+      # deploy-pages y no contiene un paquete de salida cómodo para el usuario.
+      - name: Upload Linux packages as downloadable artifact
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: DraggyEncoder-Linux-packages
+          path: |
+            DraggyEncoder-Linux-x86_64-*.tar.gz
+            DraggyEncoder-Linux-x86_64-*.deb
+            DraggyEncoder-Linux-x86_64-*.rpm
+            DraggyEncoder-Linux-x86_64-*.AppImage
+            DraggyEncoder-Linux-x86_64-*.flatpak
+            screenshots/*.png
+          if-no-files-found: error
+          retention-days: 3
+          overwrite: true
 
       - name: Prepare Flatpak repository for GitHub Pages
         if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
