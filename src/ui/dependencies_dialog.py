@@ -45,10 +45,9 @@ from src.ai.engines_state import (
     clear_benchmark as engines_clear_benchmark,
 )
 from src.ai.fetcher import (
-    GitCloneWorker,
     HFDownloadWorker,
+    OnnxFileDownloadWorker,
     OnnxConvertWorker,
-    is_git_available,
     is_hf_hub_available,
 )
 from src.ai.registry import CATALOG, get_engine_dir
@@ -1108,81 +1107,133 @@ class DependenciesDialog(QDialog):
             if confirm != QMessageBox.StandardButton.Yes:
                 return
 
-        # Choose download strategy: prefer huggingface_hub (no git needed),
-        # fall back to git clone if huggingface_hub is not installed.
-        use_hf_hub = is_hf_hub_available()
+        # huggingface_hub es la ÚNICA vía de descarga: va embebida en el
+        # instalador (requirements-build.txt). El antiguo fallback a git clone
+        # se eliminó porque el instalador de Windows no incluye Git.
         repo_id = engine.get("hf_repo_id", "")
+        onnx_repo_id = (engine.get("onnx_repo_id") or "").strip()
+        onnx_file = (engine.get("onnx_file") or "").strip()
 
-        if use_hf_hub and repo_id:
-            # Direct download via huggingface_hub — no git required.
+        if is_hf_hub_available() and repo_id:
+            # Los motores con variante ONNX publicada (onnx_repo_id/onnx_file)
+            # pueden instalarse SIN PyTorch: se descarga el .onnx unico y el
+            # render usa ONNX Runtime directamente. Se pregunta al usuario que
+            # quiere: ONNX (rapido, recomendado) o los pesos .pth (torch).
+            use_onnx = False
+            if onnx_repo_id and onnx_file:
+                size = engine.get("onnx_size_estimate") or ""
+                size_txt = f" ({size})" if size else ""
+                box = QMessageBox(self)
+                box.setIcon(QMessageBox.Icon.Question)
+                box.setWindowTitle("Engine install")
+                box.setText(
+                    f"'{engine.get('display_name', engine_id)}' has a ready-to-use "
+                    f"ONNX variant{size_txt}.\n\n"
+                    "ONNX runs directly on ONNX Runtime — no PyTorch needed, "
+                    "faster and more reliable on most systems.\n"
+                    "PyTorch weights (.pth) keep full torch compatibility but "
+                    "require installing PyTorch (~2.5 GB) for conversion.\n\n"
+                    "Which do you want to install?"
+                )
+                btn_onnx = box.addButton(
+                    "ONNX (recommended)", QMessageBox.ButtonRole.AcceptRole
+                )
+                btn_pth = box.addButton(
+                    "PyTorch weights", QMessageBox.ButtonRole.ActionRole
+                )
+                box.addButton(QMessageBox.StandardButton.Cancel)
+                box.exec()
+                clicked = box.clickedButton()
+                if clicked is None or clicked is box.button(QMessageBox.StandardButton.Cancel):
+                    return
+                use_onnx = clicked is btn_onnx
+
+            # Direct download via huggingface_hub.
+            if use_onnx:
+                label = "Downloading ONNX model from HuggingFace..."
+            else:
+                label = f"Downloading {engine.get('display_name', engine_id)} from HuggingFace..."
             progress = QProgressDialog(
-                f"Downloading {engine.get('display_name', engine_id)} from HuggingFace...",
-                None, 0, 100, self,
+                label, None, 0, 100, self,
             )
             progress.setWindowModality(Qt.WindowModality.WindowModal)
             progress.setMinimumDuration(0)
             progress.setAutoClose(False)
 
-            self._git_worker = HFDownloadWorker(repo_id, target_dir, parent=self)
+            if use_onnx:
+                self._git_worker = OnnxFileDownloadWorker(
+                    onnx_repo_id, onnx_file, target_dir, parent=self,
+                )
+            else:
+                self._git_worker = HFDownloadWorker(repo_id, target_dir, parent=self)
             self._git_worker.progress.connect(progress.setValue)
             self._git_worker.finished_ok.connect(
-                lambda td: self._on_engine_install_ok(engine_id, td, progress)
-            )
-            self._git_worker.failed.connect(
-                lambda msg: self._on_engine_install_failed(engine_id, msg, progress)
-            )
-            self._git_worker.start()
-        elif is_git_available():
-            # Git fallback.
-            url = engine.get("hf_url", "")
-            progress = QProgressDialog(
-                f"Cloning {engine.get('display_name', engine_id)} from HuggingFace...",
-                None, 0, 100, self,
-            )
-            progress.setWindowModality(Qt.WindowModality.WindowModal)
-            progress.setMinimumDuration(0)
-            progress.setAutoClose(False)
-
-            self._git_worker = GitCloneWorker(url, target_dir, parent=self)
-            self._git_worker.progress.connect(progress.setValue)
-            self._git_worker.finished_ok.connect(
-                lambda td: self._on_engine_install_ok(engine_id, td, progress)
+                lambda td: self._on_engine_install_ok(
+                    engine_id, td, progress, is_onnx=use_onnx
+                )
             )
             self._git_worker.failed.connect(
                 lambda msg: self._on_engine_install_failed(engine_id, msg, progress)
             )
             self._git_worker.start()
         else:
-            # Neither huggingface_hub nor git available.
-            QMessageBox.warning(
-                self, "No download method available",
-                "Neither Git nor huggingface_hub is available.\n\n"
-                "Install one of:\n"
-                "  pip install huggingface_hub\n"
-                "  git (from git-scm.com)\n\n"
-                "Or manually download the model files into:\n"
-                f"  {target_dir}",
-            )
+            # Sin huggingface_hub no hay via de descarga automatica.
+            if not is_hf_hub_available():
+                QMessageBox.warning(
+                    self, "No download method available",
+                    "huggingface_hub is not available, so models cannot be "
+                    "downloaded.\n\n"
+                    "In the packaged app huggingface_hub is bundled: reinstall "
+                    "the application to restore it.\n"
+                    "In a source checkout, install it with:\n"
+                    "  pip install huggingface_hub\n\n"
+                    "Or manually download the model files into:\n"
+                    f"  {target_dir}",
+                )
+            else:
+                QMessageBox.warning(
+                    self, "No HuggingFace repository configured",
+                    f"This engine has no HuggingFace repository to download "
+                    f"from (hf_repo_id is empty).\n\n"
+                    "Download the model files manually into:\n"
+                    f"  {target_dir}",
+                )
 
-    def _on_engine_install_ok(self, engine_id, target_dir, progress):
+    def _on_engine_install_ok(self, engine_id, target_dir, progress,
+                            is_onnx=False):
         progress.close()
         self._git_worker = None
 
+        # Para una descarga ONNX el worker emite la ruta al ARCHIVO .onnx
+        # (no al directorio). El directorio de instalacion es SIEMPRE el
+        # directorio canonico del motor (get_engine_dir): el .onnx puede
+        # vivir en una subcarpeta del repo (p.ej. onnx/model.onnx) pero el
+        # estado de instalacion apunta al motor, no a su subcarpeta.
+        onnx_path = None
+        install_dir = target_dir
+        if is_onnx:
+            onnx_path = os.path.abspath(target_dir)
+            try:
+                from src.ai.registry import get_engine_dir as _get_engine_dir
+                install_dir = _get_engine_dir(engine_id)
+            except Exception:
+                install_dir = os.path.dirname(onnx_path)
+
         # Validar que la descarga produjo pesos de modelo reales. Un clone
-        # de un repo de código fuente (solo .py/README) crea el directorio
-        # pero NO es una instalación válida: el render fallaría después con
-        # "No model weights found" sin explicación.
+        # de un repo de codigo fuente (solo .py/README) crea el directorio
+        # pero NO es una instalacion valida: el render fallaria despues con
+        # "No model weights found" sin explicacion.
         engine = self._find_engine(engine_id) or {}
         sentinel = (engine.get("sentinel", "") or "").strip()
         repo_id = (engine.get("hf_repo_id", "") or "").strip()
         algorithmic = not repo_id and not sentinel  # motores sin repo HF: nada que descargar
-        has_weights = dir_has_weights(target_dir)
-        has_sentinel = bool(sentinel) and os.path.isfile(os.path.join(target_dir, sentinel))
+        has_weights = dir_has_weights(install_dir)
+        has_sentinel = bool(sentinel) and os.path.isfile(os.path.join(install_dir, sentinel))
         if not algorithmic and not has_weights and not has_sentinel:
             self._on_engine_install_failed(
                 engine_id,
                 "Download finished but no model weight files were found in:\n"
-                f"  {target_dir}\n\n"
+                f"  {install_dir}\n\n"
                 "The source is a code-only repository (source files, no "
                 "pretrained weights).\n\n"
                 "Options:\n"
@@ -1194,18 +1245,27 @@ class DependenciesDialog(QDialog):
             return
 
         try:
-            engines_mark_installed(engine_id, install_path=target_dir)
+            engines_mark_installed(engine_id, install_path=install_dir)
         except Exception:
             pass
 
+        # Descarga directa de la variante ONNX: marcar el estado ONNX para
+        # que el pill muestre "INSTALLED · ONNX" y el render use ONNX
+        # Runtime directamente sin conversion ni PyTorch.
+        if is_onnx and onnx_path and os.path.isfile(onnx_path):
+            try:
+                engines_mark_onnx(engine_id, onnx_path=onnx_path, converted=True)
+            except Exception:
+                logger.exception("Failed to mark ONNX state for %s", engine_id)
+
         # Motores de usuario (Hub): registrar arch/scale reales detectados
-        # de los pesos recién descargados + el archivo de pesos usado como
-        # sentinel. El id del motor de usuario se creó en la selección
-        # (main_window), así que aquí solo enriquecemos el registro.
+        # de los pesos recien descargados + el archivo de pesos usado como
+        # sentinel. El id del motor de usuario se creo en la seleccion
+        # (main_window), asi que aqui solo enriquecemos el registro.
         try:
             from src.ai.user_models import is_user_engine as _is_user_engine
             if _is_user_engine(engine_id):
-                self._refresh_user_model_record(engine_id, target_dir)
+                self._refresh_user_model_record(engine_id, install_dir)
         except Exception:
             logger.exception("Failed to enrich user model record for %s", engine_id)
 
@@ -1213,14 +1273,23 @@ class DependenciesDialog(QDialog):
         # de backend de la fila compare ms/frame y el ETA del render tenga
         # datos. Guard: si ya hay un benchmark en marcha no lanzar otro.
         if has_weights:
-            self._maybe_benchmark_backends(engine_id, target_dir)
+            self._maybe_benchmark_backends(engine_id, install_dir)
 
         self._refresh_engines_tab()
-        QMessageBox.information(
-            self, "Engine added",
-            f"'{engine_id}' installed successfully into:\n{target_dir}\n\n"
-            "Select it from the workflow node to use it.",
-        )
+        if is_onnx:
+            msg = (
+                f"'{engine_id}' installed with the ONNX variant into:\n"
+                f"  {install_dir}\n\n"
+                "It runs on ONNX Runtime (no PyTorch needed) — the fastest "
+                "backend for this model. You can switch to PyTorch weights "
+                "from the AI Engines tab if you prefer torch compatibility."
+            )
+        else:
+            msg = (
+                f"'{engine_id}' installed successfully into:\n{install_dir}\n\n"
+                "Select it from the workflow node to use it."
+            )
+        QMessageBox.information(self, "Engine added", msg)
 
     def _refresh_user_model_record(self, engine_id, target_dir):
         """Detecta arch/scale reales de un motor de usuario ya descargado.
@@ -1279,12 +1348,9 @@ class DependenciesDialog(QDialog):
         self._git_worker = None
         self._refresh_engines_tab()
         hint = "\n\nHints:"
-        if not is_git_available() and not is_hf_hub_available():
-            hint += "\n  - Neither Git nor huggingface_hub is available."
-            hint += "\n  - Install: pip install huggingface_hub"
-            hint += "\n  - Or install Git from git-scm.com."
-        elif not is_git_available():
-            hint += "\n  - Git is not on PATH. Install it from git-scm.com."
+        if not is_hf_hub_available():
+            hint += "\n  - huggingface_hub is not available (reinstall the app "
+            hint += "or run: pip install huggingface_hub)."
         hint += "\n  - Or drop the model files manually into:"
         hint += f"\n    {get_engine_dir(engine_id)}"
         hint += "\n    and re-open the AI Engines tab so it detects them."

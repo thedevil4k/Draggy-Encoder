@@ -30,7 +30,7 @@ pip install -r requirements.txt
 python main.py
 ```
 
-On first launch the app auto-detects your hardware, downloads FFmpeg if needed, and tests all compatible GPU/CPU codecs — no configuration required.
+On first launch the app auto-detects your hardware, downloads FFmpeg + ONNX Runtime + PyTorch if needed, and tests all compatible GPU/CPU codecs — no configuration required.
 
 ## Project Structure
 
@@ -61,7 +61,9 @@ DRAGGY_ENCODER/
 
 - Python 3.9–3.14
 - GPU recommended for AI upscaling (NVIDIA CUDA or AMD Vulkan)
-- Git (for model downloads; fallback to huggingface_hub if unavailable)
+- No Git required: model downloads use the bundled `huggingface_hub`
+  (the packaged app no longer falls back to `git clone`, since the
+  Windows installer does not ship Git).
 
 See `requirements.txt` for the full Python dependency list.
 
@@ -73,6 +75,12 @@ See `requirements.txt` for the full Python dependency list.
 - **Running an existing `.onnx` model only needs ONNX Runtime.** Models that
   already ship as `.onnx` (many HuggingFace repos do) don't require PyTorch
   at all.
+
+On the first launch the app automatically downloads FFmpeg, ONNX Runtime,
+and PyTorch — no manual setup required. ONNX models work immediately;
+PyTorch is ready for `.pth` import/conversion without extra steps.
+A failed runtime download never blocks the app from starting:
+retry from *Manage Dependencies → AI Runtimes → Install*.
 
 ## Portable builds
 
@@ -92,7 +100,7 @@ file manager. The standalone Flatpak can be installed with `flatpak install --us
 DraggyEncoder-Linux-x86_64-*.flatpak`. Installed Linux
 formats store writable data under `${XDG_DATA_HOME:-~/.local/share}/draggy-encoder`
 so `/opt` and a read-only AppImage mount are never modified. The first launch
-downloads FFmpeg and models into that user data directory.
+downloads FFmpeg, AI runtimes (ONNX Runtime + PyTorch), and models into that user data directory.
 
 All bundles include a private Python 3.13 interpreter used only to install the
 optional PyTorch and ONNX Runtime packages on demand; the large AI runtimes are

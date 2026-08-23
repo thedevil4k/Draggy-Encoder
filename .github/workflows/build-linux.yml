@@ -14,11 +14,11 @@ on:
     tags: ["v*"]
   workflow_dispatch:
 
-# Los jobs de empaquetado comparten nombres de artifacts temporales. Serializar
-# el workflow evita que dos ejecuciones borren o sobrescriban los artifacts de
-# la otra mientras GitHub recalcula la cuota.
+# Todos los workflows de empaquetado comparten la cuota de artifacts. Usar
+# el mismo grupo evita que Linux y Windows limpien/suban simultáneamente y
+# se borren el artifact temporal de Pages o la salida de la otra plataforma.
 concurrency:
-  group: draggy-linux-packaging-${{ github.repository }}
+  group: draggy-packaging-${{ github.repository }}
   cancel-in-progress: false
 
 env:
@@ -165,6 +165,8 @@ jobs:
     name: Build Linux packages
     needs: smoke-packaging
     runs-on: ubuntu-latest
+    outputs:
+      pages_artifact_uploaded: ${{ steps.upload_pages_artifact.outcome == 'success' }}
     permissions:
       actions: write
       contents: write
@@ -172,10 +174,10 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v5
 
-      # Los artifacts temporales de ejecuciones anteriores siguen contando
-      # para la cuota aunque ya no los necesite ningún job. Solo se borran
-      # nombres generados por este workflow; los assets de Releases no se
-      # tocan. La concurrencia global evita borrar los de otra ejecución.
+      # La cuota es compartida por Linux, Windows y Pages. Antes de compilar
+      # eliminamos todos los artifacts temporales conocidos de ejecuciones
+      # terminadas; los assets de Releases no se tocan. El grupo de
+      # concurrencia común evita borrar uno que esté usando el otro workflow.
       - name: Prune stale Linux packaging artifacts
         uses: actions/github-script@v8
         with:
@@ -184,7 +186,6 @@ jobs:
               'github-pages',
               'DraggyEncoder-Linux-packages',
             ]);
-            const staleBefore = Date.now() - 72 * 60 * 60 * 1000;
             const artifacts = await github.paginate(
               github.rest.actions.listArtifactsForRepo,
               {
@@ -195,17 +196,38 @@ jobs:
             );
             for (const artifact of artifacts) {
               if (!names.has(artifact.name)) continue;
-              const createdAt = Date.parse(artifact.created_at || '');
-              if (!Number.isFinite(createdAt) || createdAt > staleBefore) {
-                core.info(`Keeping recent artifact ${artifact.name} (${artifact.id})`);
-                continue;
+              const runId = artifact.workflow_run && artifact.workflow_run.id;
+              if (runId && Number(runId) === Number(context.runId)) continue;
+              if (runId) {
+                try {
+                  const run = await github.rest.actions.getWorkflowRun({
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    run_id: runId,
+                  });
+                  if (run.data.status !== 'completed') {
+                    core.info(`Keeping artifact from active run ${artifact.name} (${artifact.id})`);
+                    continue;
+                  }
+                } catch (error) {
+                  core.warning(`Could not inspect run ${runId}; keeping artifact ${artifact.id}: ${error.message}`);
+                  continue;
+                }
               }
-              core.info(`Deleting stale artifact ${artifact.name} (${artifact.id})`);
-              await github.rest.actions.deleteArtifact({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                artifact_id: artifact.id,
-              });
+              core.info(`Deleting previous packaging artifact ${artifact.name} (${artifact.id})`);
+              try {
+                await github.rest.actions.deleteArtifact({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  artifact_id: artifact.id,
+                });
+              } catch (error) {
+                if (error.status === 404) {
+                  core.info(`Artifact ${artifact.id} was already deleted`);
+                } else {
+                  throw error;
+                }
+              }
             }
 
       - name: Set up Python 3.13
@@ -568,24 +590,30 @@ jobs:
               || { echo "Falta en selftest.log: $line" >&2; exit 1; }
           done
 
-      # Este es el artifact descargable desde la página de la ejecución.
-      # upload-pages-artifact no sirve como sustituto: está reservado para
-      # deploy-pages y no contiene un paquete de salida cómodo para el usuario.
-      - name: Upload Linux packages as downloadable artifact
-        if: always()
+      # En un push se conserva solo el bundle portable. Las variantes .deb,
+      # .rpm, AppImage y .flatpak se adjuntan todas a la Release de una tag;
+      # duplicarlas aquí es lo que agotaba la cuota compartida de artifacts.
+      # En tags no se crea artifact: la Release es la descarga permanente.
+      - name: Upload Linux portable artifact
+        id: upload_linux_artifact
+        if: always() && (github.event_name == 'workflow_dispatch' || !startsWith(github.ref, 'refs/tags/v')) && hashFiles('DraggyEncoder-Linux-x86_64-*.tar.gz') != ''
         uses: actions/upload-artifact@v7
         with:
           name: DraggyEncoder-Linux-packages
-          path: |
-            DraggyEncoder-Linux-x86_64-*.tar.gz
-            DraggyEncoder-Linux-x86_64-*.deb
-            DraggyEncoder-Linux-x86_64-*.rpm
-            DraggyEncoder-Linux-x86_64-*.AppImage
-            DraggyEncoder-Linux-x86_64-*.flatpak
-            screenshots/*.png
+          path: DraggyEncoder-Linux-x86_64-*.tar.gz
           if-no-files-found: error
-          retention-days: 3
-          overwrite: true
+          retention-days: 1
+          compression-level: 0
+        # La cuota de artifacts es un servicio independiente del build.
+        # Si está agotada, el paquete sigue siendo válido y la Release (en
+        # tags) no debe quedar bloqueada por este almacenamiento temporal.
+        continue-on-error: true
+
+      - name: Report Linux artifact quota issue
+        if: steps.upload_linux_artifact.outcome == 'failure'
+        shell: bash
+        run: |
+          echo "::warning::No se pudo subir DraggyEncoder-Linux-packages porque la cuota de GitHub Actions está agotada. Ejecuta Manage GitHub Actions artifacts en modo delete, espera el recálculo de GitHub (6-12 h) y relanza el workflow."
 
       - name: Prepare Flatpak repository for GitHub Pages
         if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
@@ -593,6 +621,7 @@ jobs:
         run: touch flatpak-repo/.nojekyll
 
       - name: Upload Flatpak repository to Pages
+        id: upload_pages_artifact
         if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
         uses: actions/upload-pages-artifact@v5
         with:
@@ -602,6 +631,15 @@ jobs:
           # sin .nojekyll GitHub Pages procesaría el repo con Jekyll y
           # rompería la estructura del repo Flatpak (refs/objects/summary).
           include-hidden-files: true
+        # Pages es un destino opcional. Si la cuota de artifacts está llena,
+        # no debe convertir un paquete/release válido en un build fallido.
+        continue-on-error: true
+
+      - name: Report Pages artifact quota issue
+        if: steps.upload_pages_artifact.outcome == 'failure'
+        shell: bash
+        run: |
+          echo "::warning::No se pudo preparar el repositorio Flatpak para Pages porque la cuota de GitHub Actions está agotada. La Release se publicará; limpia artifacts y relanza para actualizar Pages."
 
       - name: Attach Linux packages to release
         if: startsWith(github.ref, 'refs/tags/v')
@@ -626,9 +664,10 @@ jobs:
   publish-flatpak-repository:
     name: Publish Flatpak repository
     needs: build-linux
-    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+    if: (startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch') && needs.build-linux.outputs.pages_artifact_uploaded == 'true'
     runs-on: ubuntu-latest
     permissions:
+      actions: write
       pages: write
       id-token: write
     environment:
@@ -665,5 +704,41 @@ jobs:
       - name: Deploy Flatpak repository to GitHub Pages
         id: deployment
         uses: actions/deploy-pages@v5
+
+      # Después de un deploy correcto el artifact github-pages ya no es
+      # necesario. Eliminarlo reduce la cuota de Actions sin tocar el sitio
+      # publicado ni los assets de Releases.
+      - name: Remove deployed Pages staging artifact
+        if: success()
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const artifacts = await github.paginate(
+              github.rest.actions.listArtifactsForRepo,
+              {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                per_page: 100,
+              },
+            );
+            for (const artifact of artifacts) {
+              if (artifact.name !== 'github-pages') continue;
+              const runId = artifact.workflow_run && artifact.workflow_run.id;
+              if (runId && Number(runId) !== Number(context.runId)) continue;
+              try {
+                await github.rest.actions.deleteArtifact({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  artifact_id: artifact.id,
+                });
+                core.info(`Removed deployed Pages artifact ${artifact.id}`);
+              } catch (error) {
+                if (error.status === 404) {
+                  core.info(`Pages artifact ${artifact.id} was already removed`);
+                } else {
+                  throw error;
+                }
+              }
+            }
 
 

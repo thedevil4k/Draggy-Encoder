@@ -86,6 +86,13 @@ def _assert_slug(engine_id) -> str:
 #   lfs_warning:      bool, True if the repo uses Git LFS (heavy files
 #                     like model.safetensors are NOT in the regular
 #                     clone). We surface a tip in the install tooltip.
+#   onnx_repo_id:     str, HuggingFace repo hosting a ready-to-use .onnx
+#                     variant ("" if none). When set, the app can download
+#                     the ONNX model directly — no PyTorch, no conversion —
+#                     so the render runs on ONNX Runtime for best speed.
+#   onnx_file:        str, exact filename of the .onnx inside onnx_repo_id
+#                     (may include a subpath such as "onnx/model.onnx").
+#   onnx_size_estimate: str, human-readable size of the ONNX variant.
 # ---------------------------------------------------------------------------
 
 CATALOG = [
@@ -104,6 +111,9 @@ CATALOG = [
         "is_implemented": True,
         "sentinel": "README.md",
         "lfs_warning": False,
+        "onnx_repo_id": "imgdesignart/realesrgan-x4-onnx",
+        "onnx_file": "onnx/model.onnx",
+        "onnx_size_estimate": "~67 MB",
     },
     {
         "engine_id": "upscale-realcugan-pro",
@@ -170,6 +180,9 @@ CATALOG = [
         "sentinel": "README.md",
         "lfs_warning": False,
         "similar_models_url": "https://openmodeldb.info/models/4x-realesr-general",
+        "onnx_repo_id": "Heliosoph/realesrgan-onnx",
+        "onnx_file": "realesr-general-x4v3.onnx",
+        "onnx_size_estimate": "~4.9 MB",
     },
     {
         "engine_id": "upscale-realesrgan-anime-6b",
@@ -218,6 +231,9 @@ CATALOG = [
         "is_implemented": True,
         "sentinel": "README.md",
         "lfs_warning": False,
+        "onnx_repo_id": "FuryTMP/RIFE_fp32",
+        "onnx_file": "RIFE_fp32.onnx",
+        "onnx_size_estimate": "~21 MB",
     },
     {
         "engine_id": "interpolate-film",

@@ -43,7 +43,6 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from src.ai.fetcher import is_git_available as _is_git_available
 from src.ai.fetcher import is_hf_hub_available as _is_hf_hub_available
 from src.ai.architectures import (
     ONNX_CONVERTIBLE_ARCHS as _ONNX_CONVERTIBLE_ARCHS,
@@ -741,10 +740,15 @@ class EngineRow(QFrame):
         if not eng.get("is_implemented"):
             bits.append("Backend integration pending — button is informational only.")
             return "\n".join(bits)
-        if not _is_git_available() and not _is_hf_hub_available():
-            bits.append("Neither Git nor huggingface_hub available. Install: pip install huggingface_hub")
-        elif not _is_git_available():
-            bits.append("Git is NOT on PATH (huggingface_hub will be used for download).")
+        if not _is_hf_hub_available():
+            bits.append("huggingface_hub is not available (reinstall the app or "
+                        "run: pip install huggingface_hub).")
+        onnx_repo = (eng.get("onnx_repo_id") or "").strip()
+        onnx_file = (eng.get("onnx_file") or "").strip()
+        if onnx_repo and onnx_file:
+            bits.append("This engine has a ready-to-use ONNX variant — Add Engine "
+                        "offers a direct .onnx download (no PyTorch needed).")
+            bits.append(f"ONNX source: {onnx_repo} / {onnx_file}")
         bits.append(f"Target: {eng.get('install_dir', '')}")
         bits.append("Download from: " + str(eng.get("hf_url", "")))
         return "\n".join(bits)

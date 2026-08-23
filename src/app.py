@@ -57,6 +57,8 @@ class StartupWorker(QThread):
     #   error            : str|None (solo para fases fatales: ffmpeg/startup)
     #   hardware_error   : str|None (warning NO fatal)
     #   codecs_error     : str|None (warning NO fatal)
+    #   runtime_error    : str|None (warning NO fatal; falló el auto-install
+    #                     del runtime IA en el primer arranque)
     startup_finished = Signal(object)
     progress = Signal(int, str)
 
@@ -66,6 +68,7 @@ class StartupWorker(QThread):
         compatible_codecs: dict = {}
         hardware_error = None
         codecs_error = None
+        runtime_error = None
         try:
             # 1. Hardware — best-effort. Un fallo aquí NO debe bloquear el
             #    arranque: el panel cae a CPU/lista vacía y avisamos después.
@@ -76,7 +79,7 @@ class StartupWorker(QThread):
                 hardware_error = str(exc)
                 logger.warning("Hardware detection error: %s", exc)
 
-            # 2. FFmpeg (descarga si falta; ocupa el rango 30-60% del diálogo)
+            # 2. FFmpeg (descarga si falta; ocupa el rango 30-55% del diálogo)
             #    Crítico: sin FFmpeg la app no puede comprimir.
             self.progress.emit(30, "Checking FFmpeg...")
             ffmpeg_path = ensure_ffmpeg(progress_callback=self._on_ffmpeg_progress)
@@ -92,15 +95,47 @@ class StartupWorker(QThread):
                 })
                 return
 
-            # 3. Test codecs — best-effort. Un fallo aquí deja la lista de
+            # 3. AI runtimes (ONNX Runtime + PyTorch) — auto-install en el
+            #    primer arranque. NO bloqueante: un fallo aquí (sin red,
+            #    antivirus, etc.) no impide abrir la app; el panel de
+            #    dependencias mostrará el runtime como missing y el
+            #    usuario podrá reintentarlo desde ahí.
+            try:
+                from src.runtimes.manager import (
+                    install_onnxruntime,
+                    install_pytorch,
+                    onnx_status,
+                    torch_status,
+                )
+                if not onnx_status().get("installed"):
+                    self.progress.emit(55, "Installing ONNX Runtime...")
+                    install_onnxruntime(
+                        "auto",
+                        progress_callback=lambda p, m, b=55, s=17: (
+                            self._map_runtime_progress(p, m, b, s)
+                        ),
+                    )
+                if not torch_status().get("installed"):
+                    self.progress.emit(72, "Installing PyTorch...")
+                    install_pytorch(
+                        "auto",
+                        progress_callback=lambda p, m, b=72, s=18: (
+                            self._map_runtime_progress(p, m, b, s)
+                        ),
+                    )
+            except Exception as exc:
+                runtime_error = str(exc)
+                logger.warning("AI runtime auto-install failed: %s", exc)
+
+            # 4. Test codecs — best-effort. Un fallo aquí deja la lista de
             #    codecs vacía (el usuario puede Re-detect más tarde) sin
             #    impedir el arranque.
-            self.progress.emit(60, "Testing codecs...")
+            self.progress.emit(90, "Testing codecs...")
             try:
                 compatible_codecs = test_all_codecs(
                     ffmpeg_path,
                     progress_callback=lambda p: self.progress.emit(
-                        60 + p // 3, "Testing codecs..."
+                        90 + p // 10, "Testing codecs..."
                     ),
                 )
             except Exception as exc:
@@ -116,6 +151,7 @@ class StartupWorker(QThread):
                 "error": None,
                 "hardware_error": hardware_error,
                 "codecs_error": codecs_error,
+                "runtime_error": runtime_error,
             })
         except Exception as exc:
             logger.exception("Startup error")
@@ -127,6 +163,7 @@ class StartupWorker(QThread):
                 "error": str(exc),
                 "hardware_error": hardware_error,
                 "codecs_error": codecs_error,
+                "runtime_error": runtime_error,
             })
 
     def _on_ffmpeg_progress(self, percent, message=""):
@@ -144,6 +181,21 @@ class StartupWorker(QThread):
             pct = 0
         scaled = 30 + (pct * 30 // 100)
         self.progress.emit(scaled, message or "Checking FFmpeg...")
+
+    def _map_runtime_progress(self, percent, message="", base=60, span=20):
+        """Map AI runtime install progress (0-100) to a dialog range.
+
+        ``install_onnxruntime``/``install_pytorch`` emiten porcentajes
+        0-100 y fases amigables (``Descargando ONNX Runtime...``). Se
+        escalan al rango ``[base, base+span]`` del diálogo de arranque
+        (ONNX Runtime ocupa 55-72%; PyTorch 72-90%).
+        """
+        try:
+            pct = max(0, min(100, int(percent or 0)))
+        except Exception:
+            pct = 0
+        scaled = base + (pct * span // 100)
+        self.progress.emit(scaled, message or "Installing AI runtime...")
 
 
 class DraggyEncoderApp:
@@ -185,6 +237,7 @@ class DraggyEncoderApp:
         error = result.get("error")
         hardware_error = result.get("hardware_error")
         codecs_error = result.get("codecs_error")
+        runtime_error = result.get("runtime_error")
 
         from PySide6.QtWidgets import QMessageBox
 
@@ -234,6 +287,17 @@ class DraggyEncoderApp:
                 f"FFmpeg was found, but the codec compatibility test failed. "
                 f"The codec list will be empty until you retry with 'Re-detect'.\n\n"
                 f"Detail: {codecs_error}",
+            )
+        if runtime_error:
+            # No fatal: la app arranca, pero los modelos IA no se podrán
+            # usar hasta que el runtime se instale desde Dependencies.
+            QMessageBox.warning(
+                None,
+                "AI Runtime Not Ready",
+                "ONNX Runtime or PyTorch could not be installed automatically "
+                "during startup, so AI models are disabled for now.\n\n"
+                "Retry from Manage Dependencies → AI Runtimes → Install.\n\n"
+                f"Detail: {runtime_error}",
             )
 
         self.window = MainWindow(ffmpeg_path, hardware_info, compatible_codecs)

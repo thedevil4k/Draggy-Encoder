@@ -11,10 +11,10 @@ on:
     tags: ["v*"]
   workflow_dispatch:
 
-# Evita que dos builds del mismo branch/tag compitan por los mismos artifacts
-# temporales y que el cleanup de una ejecución borre los de otra.
+# Todos los workflows de empaquetado comparten la cuota de artifacts. El
+# mismo grupo serializa la limpieza y la subida entre Linux y Windows.
 concurrency:
-  group: build-installer-${{ github.repository }}
+  group: draggy-packaging-${{ github.repository }}
   cancel-in-progress: false
 
 env:
@@ -30,9 +30,9 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v5
 
-      # Recupera cuota ocupada por ejecuciones anteriores antes de instalar
-      # dependencias y compilar el EXE. Solo se eliminan artifacts temporales
-      # conocidos de estos workflows; los assets de Releases no se tocan.
+      # La cuota es compartida por Linux, Windows y Pages. Eliminamos todos
+      # los artifacts temporales conocidos de ejecuciones terminadas antes de
+      # compilar; los assets de Releases no se tocan.
       - name: Prune stale packaging artifacts
         uses: actions/github-script@v8
         with:
@@ -40,7 +40,6 @@ jobs:
             const names = new Set([
               'DraggyEncoder-Installer',
             ]);
-            const staleBefore = Date.now() - 72 * 60 * 60 * 1000;
             const artifacts = await github.paginate(
               github.rest.actions.listArtifactsForRepo,
               {
@@ -51,12 +50,25 @@ jobs:
             );
             for (const artifact of artifacts) {
               if (!names.has(artifact.name)) continue;
-              const createdAt = Date.parse(artifact.created_at || '');
-              if (!Number.isFinite(createdAt) || createdAt > staleBefore) {
-                core.info(`Keeping recent artifact ${artifact.name} (${artifact.id})`);
-                continue;
+              const runId = artifact.workflow_run && artifact.workflow_run.id;
+              if (runId && Number(runId) === Number(context.runId)) continue;
+              if (runId) {
+                try {
+                  const run = await github.rest.actions.getWorkflowRun({
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    run_id: runId,
+                  });
+                  if (run.data.status !== 'completed') {
+                    core.info(`Keeping artifact from active run ${artifact.name} (${artifact.id})`);
+                    continue;
+                  }
+                } catch (error) {
+                  core.warning(`Could not inspect run ${runId}; keeping artifact ${artifact.id}: ${error.message}`);
+                  continue;
+                }
               }
-              core.info(`Deleting stale artifact ${artifact.name} (${artifact.id})`);
+              core.info(`Deleting previous packaging artifact ${artifact.name} (${artifact.id})`);
               try {
                 await github.rest.actions.deleteArtifact({
                   owner: context.repo.owner,
@@ -65,7 +77,11 @@ jobs:
                 });
               } catch (error) {
                 // Another packaging workflow may have removed it first.
-                core.warning(`Could not delete artifact ${artifact.id}: ${error.message}`);
+                if (error.status === 404) {
+                  core.info(`Artifact ${artifact.id} was already deleted`);
+                } else {
+                  throw error;
+                }
               }
             }
 
@@ -198,17 +214,27 @@ jobs:
           if ($v -like "v*") { $v = $v.Substring(1) }
           iscc "/DDRAGGY_VERSION=$v" draggy_encoder.iss
 
-      # Artifact descargable desde la página de cada ejecución. Las tags
-      # también adjuntan el mismo instalador a la Release, pero mantener esta
-      # copia corta facilita descargarlo sin abrir la Release.
+      # Las tags adjuntan el instalador a la Release. Para pushes y ejecuciones
+      # manuales mantenemos una única copia descargable de un día; así no se
+      # acumulan instaladores idénticos en la cuota de Actions.
       - name: Upload installer artifact
+        id: upload_installer_artifact
+        if: github.event_name == 'workflow_dispatch' || !startsWith(github.ref, 'refs/tags/v')
         uses: actions/upload-artifact@v7
         with:
           name: DraggyEncoder-Installer
           path: installer/*.exe
           if-no-files-found: error
-          retention-days: 3
-          overwrite: true
+          retention-days: 1
+          compression-level: 0
+        # El artifact es solo una comodidad para inspección. Una cuota llena
+        # no debe ocultar que el instalador ya se compiló correctamente.
+        continue-on-error: true
+
+      - name: Report installer artifact quota issue
+        if: steps.upload_installer_artifact.outcome == 'failure'
+        shell: pwsh
+        run: Write-Warning "No se pudo subir DraggyEncoder-Installer porque la cuota de GitHub Actions está agotada. Ejecuta Manage GitHub Actions artifacts en modo delete, espera el recálculo de GitHub (6-12 h) y relanza el workflow."
 
       - name: Attach installer to release
         if: startsWith(github.ref, 'refs/tags/v')

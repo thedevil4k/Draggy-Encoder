@@ -1587,12 +1587,67 @@ def test_preferences_dialog_about_tab(qapp):
 # ==--------------------------------------------------------------------==
 
 class _NoOpQMessageBox:
-    """Stand-in for QMessageBox that never blocks the event loop."""
+    """Stand-in for QMessageBox that never blocks the event loop.
+
+    Soporta tanto los metodos estaticos (question/information/critical/
+    warning) como el patron de dialogo instanciado que usa el flujo de
+    instalacion con variante ONNX (QMessageBox(self) + addButton + exec +
+    clickedButton). Por defecto elige "PyTorch weights" para que los tests
+    de instalacion .pth sigan cubriendo el flujo clasico; los tests que
+    quieran la rama ONNX pueden poner ``_NoOpQMessageBox.choose_onnx =
+    True``.
+    """
 
     class _Btn:
-        pass
+        def __init__(self, text=""):
+            self.text = text
 
-    StandardButton = type("StandardButton", (), {"Yes": object(), "Ok": object()})
+    StandardButton = type(
+        "StandardButton", (), {"Yes": object(), "Ok": object(), "Cancel": object()}
+    )
+    ButtonRole = type("ButtonRole", (), {"AcceptRole": 1, "ActionRole": 2})
+    Icon = type("Icon", (), {"Question": 4})
+
+    # Default: PyTorch weights (flujo clasico). Tests ONNX lo ponen a True.
+    choose_onnx = False
+
+    def __init__(self):
+        self._btn_onnx = None
+        self._btn_pth = None
+        self._btn_cancel = self._Btn("cancel")
+
+    def __call__(self, parent=None):
+        return self
+
+    def addButton(self, text_or_standard, role=None):
+        if isinstance(text_or_standard, str):
+            btn = self._Btn(text_or_standard)
+            if "ONNX" in text_or_standard:
+                self._btn_onnx = btn
+            elif "PyTorch" in text_or_standard:
+                self._btn_pth = btn
+            return btn
+        return self._btn_cancel
+
+    def button(self, standard):
+        return self._btn_cancel
+
+    def setIcon(self, *a, **k):
+        return
+
+    def setWindowTitle(self, *a, **k):
+        return
+
+    def setText(self, *a, **k):
+        return
+
+    def exec(self):
+        return
+
+    def clickedButton(self):
+        if self.choose_onnx:
+            return self._btn_onnx or self._btn_pth
+        return self._btn_pth or self._btn_onnx
 
     def question(self, *a, **k):
         return self.StandardButton.Yes
@@ -1707,6 +1762,49 @@ def test_engine_install_failure_marks_failed(isolated_engines_state, qapp, monke
         assert dialog._git_worker is None
     finally:
         dialog.close()
+
+
+def test_engine_install_onnx_variant_marks_onnx(isolated_engines_state, qapp, monkeypatch):
+    """Instalar la variante ONNX directa usa OnnxFileDownloadWorker y marca
+    el estado onnx_converted/onnx_path (el render usara ONNX Runtime sin
+    PyTorch)."""
+    from src.ui import dependencies_dialog as dd
+    from src.ai.engines_state import get_state
+    from src.ai.registry import get_engine_dir
+
+    eid = "upscale-realesrgan-x4plus"
+    target = get_engine_dir(eid)
+    os.makedirs(os.path.join(target, "onnx"), exist_ok=True)
+    onnx_path = os.path.join(target, "onnx", "model.onnx")
+    open(onnx_path, "w").close()
+
+    class _FakeOnnxWorker(dd.OnnxFileDownloadWorker):
+        def run(self):
+            self.finished_ok.emit(os.path.abspath(onnx_path))
+
+    monkeypatch.setattr(dd, "is_hf_hub_available", lambda: True)
+    monkeypatch.setattr(dd, "OnnxFileDownloadWorker", _FakeOnnxWorker)
+    monkeypatch.setattr(dd, "QMessageBox", _NoOpQMessageBox())
+    # Elegir la rama ONNX del dialogo de instalacion.
+    _NoOpQMessageBox.choose_onnx = True
+    try:
+        dialog = dd.DependenciesDialog(initial_tab="ai_engines")
+        dialog._check_timer.stop()
+        try:
+            dialog._on_engine_install(eid)
+            for _ in range(300):
+                qapp.processEvents()
+                if dialog._git_worker is None:
+                    break
+            st = get_state(eid)
+            assert st["installed"] is True, st
+            assert st["onnx_converted"] is True, st
+            assert st["onnx_path"] == os.path.abspath(onnx_path), st
+            assert dialog._git_worker is None
+        finally:
+            dialog.close()
+    finally:
+        _NoOpQMessageBox.choose_onnx = False
 
 
 def test_hf_download_worker_cancel_contract(qapp):

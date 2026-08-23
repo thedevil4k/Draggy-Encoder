@@ -2,37 +2,31 @@
 
 The philosophy:
 
-    - Prefer ``huggingface_hub.snapshot_download`` for model downloads:
-      no git required, handles LFS automatically, supports resume.
-    - Fall back to ``git clone --depth 1`` if huggingface_hub is not
-      installed and git is available.
-    - Use ``shutil.which`` to detect ``git`` and ``optimum-cli`` on
-      the user's PATH; if missing, we surface that back to the UI so
-      the dialog can offer "Install Git" or "Drop files manually".
-    - Run blocking work in ``QThread`` so the GUI stays alive. We
-      keep the threads cancellable (a flag the worker checks after
-      each chunk) so a stalled clone can be aborted; the underlying
-      ``subprocess.Popen`` is killed on cancel so a half-dead network
-      cannot orphan the OS process.
-    - Use the LF-only git progress reading that ``git`` writes to
-      stderr ("Receiving objects: 42%") to feed a real progress bar.
+    - ``huggingface_hub`` is the ONLY download path for models: it ships
+      bundled inside the packaged app (requirements-build.txt), handles
+      LFS automatically and supports resume. The old ``git clone``
+      fallback was removed because the Windows installer does not bundle
+      Git, so that path was a dead end on the packaged app.
+    - Each file is downloaded one by one (``hf_hub_download``) so
+      cancellation is honored between files.
+    - Run blocking work in ``QThread`` so the GUI stays alive. Workers
+      are cancellable (a flag checked between files) and each download
+      has its own retry loop with exponential backoff.
 
 Workers exposed here:
 
-    HFDownloadWorker   - downloads a HF repo via huggingface_hub (no git).
-    GitCloneWorker     - clones one HF repo to a target directory (fallback).
-    OnnxConvertWorker  - stub that fires ``optimum-cli`` if available,
-                         otherwise reports a helpful pip-install hint.
+    HFDownloadWorker        - downloads a HF repo via huggingface_hub.
+    OnnxFileDownloadWorker  - downloads a SINGLE .onnx file (catalog ONNX
+                              variant) without PyTorch or conversion.
+    OnnxConvertWorker       - converts PyTorch weights to ONNX with the
+                              project's own ``convert_pth_to_onnx`` helper.
 """
 
 from __future__ import annotations
 
 import logging
 import os
-import re
 import shutil
-import subprocess
-import sys
 import threading
 import time
 from typing import Optional
@@ -47,57 +41,9 @@ _log = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 
-def is_git_available() -> bool:
-    """``True`` if ``git`` resolves on PATH. Pure shutil, no subprocess."""
-    return shutil.which("git") is not None
-
-
 def is_optimum_cli_available() -> bool:
     """``True`` if ``optimum-cli`` resolves on PATH."""
     return shutil.which("optimum-cli") is not None
-
-
-def git_version() -> Optional[str]:
-    """Return raw ``git --version`` output, or None on failure."""
-    path = shutil.which("git")
-    if not path:
-        return None
-    try:
-        out = subprocess.run(
-            [path, "--version"],
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=5,
-        )
-        if out.returncode == 0:
-            return (out.stdout or "").strip().splitlines()[0]
-    except Exception:
-        pass
-    return None
-
-
-# ---------------------------------------------------------------------------
-# Git progress parsing
-# ---------------------------------------------------------------------------
-
-# git writes progress to stderr in lines like:
-#   "Receiving objects:  42% (1234/3000), 12.3 MiB | 1.20 MiB/s"
-#   "Resolving deltas: 100% (50/50), done."
-_PERCENT_RE = re.compile(r"(Receiving objects|Resolving deltas|Total):\s*(\d{1,3})%")
-
-
-def _parse_percent(line: str, last: int) -> int:
-    """Pull a percent [0,100] out of one stderr line. Falls back to ``last``."""
-    m = _PERCENT_RE.search(line)
-    if not m:
-        return last
-    try:
-        v = max(0, min(100, int(m.group(2))))
-    except Exception:
-        return last
-    return max(last, v)
 
 
 # ---------------------------------------------------------------------------
@@ -181,11 +127,14 @@ class HFDownloadWorker(QThread):
             from huggingface_hub import HfApi, hf_hub_download
         except ImportError:
             self.failed.emit(
-                "huggingface_hub is not installed.\n\n"
-                "Install with:\n"
+                "huggingface_hub is not available, so models cannot be "
+                "downloaded.\n\n"
+                "In the packaged app huggingface_hub is bundled: reinstall "
+                "the application to restore it.\n"
+                "In a source checkout, install it with:\n"
                 "  pip install huggingface_hub\n\n"
-                "Then try again. Alternatively, install Git and "
-                "it will be used as a fallback."
+                "Then try again. Alternatively, drop the model files manually "
+                "into the engine folder and re-open the AI Engines tab."
             )
             return
 
@@ -335,17 +284,30 @@ class HFDownloadWorker(QThread):
             self.failed.emit("Download produced no output directory")
 
 
-class GitCloneWorker(QThread):
-    """Async wrapper around ``git clone --depth 1 --progress``.
+# ---------------------------------------------------------------------------
+# Single-file ONNX download worker
+# ---------------------------------------------------------------------------
 
-    The worker keeps a handle to the underlying ``Popen`` so that a
-    cancel request from the dialog (``cancel()``) can call
-    ``proc.kill()`` and immediately unblock the readline loop.
+# Nombre por defecto para un archivo ONNX descargado directamente a la raíz
+# del directorio del motor. Los catálogos pueden declarar un subpath
+# (p.ej. "onnx/model.onnx"); al descargarlo se conserva la estructura del
+# repo de HF para que find_onnx_model() lo localice en cualquiera de los dos
+# sitios (raíz o subdir onnx/).
+
+
+class OnnxFileDownloadWorker(QThread):
+    """Descarga UN archivo .onnx concreto de un repo HuggingFace.
+
+    A diferencia de ``HFDownloadWorker`` (que baja el repo completo), este
+    worker descarga un unico archivo — la variante ONNX del catalogo — sin
+    necesitar PyTorch ni conversion. Reutiliza ``hf_hub_download`` (LFS +
+    resume) con la misma politica de reintentos y cancelacion que el worker
+    de repo completo.
 
     Signals:
-        status(str)       - status text the UI renders near the button.
-        progress(int)     - 0..100 progress bar updates.
-        finished_ok(str)  - target_dir on success.
+        status(str)       - status text near the progress bar.
+        progress(int)     - 0..100 progress updates.
+        finished_ok(str)  - path to the downloaded .onnx file.
         failed(str)       - error message on failure.
     """
 
@@ -354,124 +316,124 @@ class GitCloneWorker(QThread):
     finished_ok = Signal(str)
     failed = Signal(str)
 
-    # Hard cap so a totally dead network cannot hang a worker forever.
-    CLONE_TIMEOUT_S = 15 * 60
-
-    def __init__(self, url: str, target_dir: str, parent=None):
+    def __init__(self, repo_id: str, filename: str, target_dir: str,
+                 parent=None):
         super().__init__(parent)
-        self.url = url
+        self.repo_id = repo_id
+        self.filename = filename
         self.target_dir = target_dir
         self._cancel = threading.Event()
-        self._proc = None
 
     def cancel(self):
-        """Mark the clone for cancellation; kill the underlying git subprocess."""
         self._cancel.set()
-        proc = self._proc
-        if proc is not None:
-            try:
-                proc.kill()
-            except Exception:
-                pass
 
     def run(self):
         if self._cancel.is_set():
             self.failed.emit("cancelled before start")
             return
 
-        if not is_git_available():
-            self.failed.emit(
-                "Git is not on PATH. Install Git for Windows (git-scm.com) "
-                "or your distro's git package; or drop the model files "
-                "manually into the target directory shown in the row."
-            )
-            return
+        os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
 
         try:
-            os.makedirs(os.path.dirname(self.target_dir) or ".", exist_ok=True)
-        except Exception:
-            pass
-        if os.path.isdir(self.target_dir) and os.listdir(self.target_dir):
+            from huggingface_hub import hf_hub_download
+        except ImportError:
             self.failed.emit(
-                f"Target directory already exists and is not empty: "
-                f"{self.target_dir}"
+                "huggingface_hub is not available, so models cannot be "
+                "downloaded.\n\n"
+                "In the packaged app huggingface_hub is bundled: reinstall "
+                "the application to restore it.\n"
+                "In a source checkout, install it with:\n"
+                "  pip install huggingface_hub"
             )
             return
 
-        cmd = ["git", "clone", "--depth", "1", "--progress",
-               self.url, self.target_dir]
-
-        self.status.emit("starting clone...")
+        self.status.emit("Preparing ONNX download from HuggingFace...")
         self.progress.emit(0)
-        last_pct = 0
 
         try:
-            self._proc = subprocess.Popen(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                bufsize=0,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-            )
+            os.makedirs(self.target_dir, exist_ok=True)
         except Exception as exc:
-            self.failed.emit(f"Could not start git: {exc}")
-            return
+            _log.warning("makedirs failed for %s: %s", self.target_dir, exc)
+
+        self.status.emit(
+            f"Downloading {self.repo_id} / {self.filename}..."
+        )
+        self.progress.emit(5)
 
         try:
-            assert self._proc.stdout is not None
-            for line in self._proc.stdout:
-                if self._cancel.is_set():
-                    try:
-                        self._proc.kill()
-                    except Exception:
-                        pass
-                    break
-                pct = _parse_percent(line, last_pct)
-                if pct != last_pct:
-                    last_pct = pct
-                    try:
-                        self.progress.emit(int(pct))
-                    except Exception:
-                        pass
-            try:
-                self._proc.wait(timeout=self.CLONE_TIMEOUT_S)
-            except subprocess.TimeoutExpired:
-                try:
-                    self._proc.kill()
-                except Exception:
-                    pass
+            from src.personal import get_token as _get_token
+            _token = _get_token() or None
+        except Exception:
+            _token = None
+
+        if not _token:
+            self.status.emit("No HuggingFace token set — public repos only.")
+
+        MAX_RETRIES = 3
+        RETRY_DELAY_BASE = 5  # seconds
+
+        last_error = None
+        final_path = None
+        for attempt in range(MAX_RETRIES):
+            if self._cancel.is_set():
                 _cleanup_partial(self.target_dir)
-                self.failed.emit(
-                    f"git clone exceeded the {self.CLONE_TIMEOUT_S // 60} min timeout"
-                )
+                self.failed.emit("cancelled by user")
                 return
-        finally:
-            self._proc = None
+            try:
+                final_path = hf_hub_download(
+                    repo_id=self.repo_id,
+                    filename=self.filename,
+                    local_dir=self.target_dir,
+                    token=_token,
+                )
+                last_error = None
+                break
+            except Exception as exc:
+                last_error = exc
+                _log.warning(
+                    "hf_hub_download attempt %d/%d failed for %s: %s",
+                    attempt + 1, MAX_RETRIES, self.filename, exc,
+                )
+                if attempt < MAX_RETRIES - 1:
+                    delay = RETRY_DELAY_BASE * (2 ** attempt)
+                    self.status.emit(
+                        f"Retry {attempt + 2}/{MAX_RETRIES} in {delay}s..."
+                    )
+                    time.sleep(delay)
 
         if self._cancel.is_set():
             _cleanup_partial(self.target_dir)
             self.failed.emit("cancelled by user")
             return
 
-        # The captured success path is from ``proc.wait`` returncode;
-        # we already cleared self._proc so refer to its saved value.
-        # (Re-reading via shutil is not needed; the loop above already
-        # saw the last line, and finalize via a quick stat on returncode.)
-        # We must use the original rc: easiest is to re-evaluate via
-        # the just-finished process. short-circuit: if we got here
-        # without a TimeoutExpired, the loop drained stdout and wait()
-        # returned. We don't have rc directly, but a directory exists.
-        if os.path.isdir(self.target_dir):
-            self.progress.emit(100)
-            self.status.emit("clone finished")
-            self.finished_ok.emit(self.target_dir)
-        else:
+        if last_error is not None or not final_path or not os.path.exists(final_path):
             _cleanup_partial(self.target_dir)
-            self.failed.emit("git clone produced no output directory")
+            exc_str = str(last_error) if last_error else "no output file produced"
+            if "401" in exc_str or "403" in exc_str or "Access Denied" in exc_str:
+                exc_str += (
+                    "\n\nTip: This HuggingFace repo requires a token for "
+                    "LFS file downloads.\n\n"
+                    "1. Go to https://huggingface.co/settings/tokens\n"
+                    "2. Create a free token (read access is enough)\n"
+                    "3. Paste it in Preferences > Behavior > HuggingFace API Token"
+                )
+            self.failed.emit(
+                f"ONNX download failed after {MAX_RETRIES} attempts: {exc_str}"
+            )
+            return
 
+        # Eliminar cachés internos de HF dentro de target_dir (no hacen falta).
+        for cache_name in (".huggingface", ".cache"):
+            cache_path = os.path.join(self.target_dir, cache_name)
+            if os.path.isdir(cache_path):
+                try:
+                    shutil.rmtree(cache_path, ignore_errors=True)
+                except Exception:
+                    pass
 
+        self.progress.emit(100)
+        self.status.emit("download finished")
+        self.finished_ok.emit(os.path.abspath(final_path))
 # ---------------------------------------------------------------------------
 # ONNX conversion worker
 # ---------------------------------------------------------------------------
@@ -607,9 +569,5 @@ class OnnxConvertWorker(QThread):
 
 if __name__ == "__main__":
     # Quick capability probe, useful from a debug REPL.
-    print("git available:        ", is_git_available(),
-          "->", git_version() or "n/a")
     print("huggingface_hub:      ", is_hf_hub_available())
     print("optimum-cli available:", is_optimum_cli_available())
-    print("mock parse:           ",
-          _parse_percent("Receiving objects: 42% (1234/3000)", 0))
