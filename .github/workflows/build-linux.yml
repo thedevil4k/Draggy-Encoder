@@ -14,6 +14,13 @@ on:
     tags: ["v*"]
   workflow_dispatch:
 
+# Los jobs de empaquetado comparten nombres de artifacts temporales. Serializar
+# el workflow evita que dos ejecuciones borren o sobrescriban los artifacts de
+# la otra mientras GitHub recalcula la cuota.
+concurrency:
+  group: draggy-linux-packaging-${{ github.repository }}
+  cancel-in-progress: false
+
 env:
   PYTHON_VERSION: "3.13"
 
@@ -158,9 +165,42 @@ jobs:
     name: Build Linux packages
     needs: smoke-packaging
     runs-on: ubuntu-latest
+    permissions:
+      actions: write
+      contents: write
     steps:
       - name: Checkout
         uses: actions/checkout@v5
+
+      # Los artifacts temporales de ejecuciones anteriores siguen contando
+      # para la cuota aunque ya no los necesite ningún job. Solo se borran
+      # nombres generados por este workflow; los assets de Releases no se
+      # tocan. La concurrencia global evita borrar los de otra ejecución.
+      - name: Prune stale Linux packaging artifacts
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const names = new Set([
+              'github-pages',
+              'DraggyEncoder-Linux-packages',
+            ]);
+            const artifacts = await github.paginate(
+              github.rest.actions.listArtifactsForRepo,
+              {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                per_page: 100,
+              },
+            );
+            for (const artifact of artifacts) {
+              if (!names.has(artifact.name)) continue;
+              core.info(`Deleting temporary artifact ${artifact.name} (${artifact.id})`);
+              await github.rest.actions.deleteArtifact({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                artifact_id: artifact.id,
+              });
+            }
 
       - name: Set up Python 3.13
         uses: actions/setup-python@v6
@@ -175,7 +215,7 @@ jobs:
       - name: Install Linux packaging tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y rpm flatpak flatpak-builder appstream
+          sudo apt-get install -y rpm flatpak flatpak-builder appstream desktop-file-utils
 
       # PySide6/Qt necesita las bibliotecas de gráficos del sistema (EGL,
       # GL, X11) incluso para importar QtGui. Sin ellas el bundle no
@@ -312,6 +352,29 @@ jobs:
            AI upscaling, frame interpolation and related workflows.
           EOF
           dpkg-deb --build --root-owner-group "$root" "DraggyEncoder-Linux-x86_64-${version}.deb"
+
+      - name: Validate generated Debian package and AppStream integration
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          if [[ "$GITHUB_REF" != refs/tags/v* ]]; then version="1"; fi
+          deb="DraggyEncoder-Linux-x86_64-${version}.deb"
+          test -s "$deb"
+          sudo apt-get install -y "./$deb"
+          metainfo=/usr/share/metainfo/com.draggyencoder.DraggyEncoder.metainfo.xml
+          desktop=/usr/share/applications/com.draggyencoder.DraggyEncoder.desktop
+          icon=/usr/share/icons/hicolor/256x256/apps/com.draggyencoder.DraggyEncoder.png
+          test -s "$metainfo"
+          test -s "$desktop"
+          test -s "$icon"
+          desktop-file-validate "$desktop"
+          appstreamcli validate --pedantic --no-net "$metainfo"
+          sudo appstreamcli refresh --force
+          appstreamcli dump com.draggyencoder.DraggyEncoder > /tmp/draggy-appstream.txt
+          grep -q '<id>com.draggyencoder.DraggyEncoder</id>' /tmp/draggy-appstream.txt
+          grep -q 'com.draggyencoder.DraggyEncoder.desktop' /tmp/draggy-appstream.txt
+          grep -q 'com.draggyencoder.DraggyEncoder' /tmp/draggy-appstream.txt
 
       - name: Create RPM package
         shell: bash
@@ -500,30 +563,20 @@ jobs:
           done
 
       - name: Prepare Flatpak repository for GitHub Pages
+        if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
         shell: bash
         run: touch flatpak-repo/.nojekyll
 
       - name: Upload Flatpak repository to Pages
+        if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
         uses: actions/upload-pages-artifact@v5
         with:
           path: flatpak-repo
+          retention-days: 1
           # upload-pages-artifact@v5 excluye los dotfiles por defecto;
           # sin .nojekyll GitHub Pages procesaría el repo con Jekyll y
           # rompería la estructura del repo Flatpak (refs/objects/summary).
           include-hidden-files: true
-
-      - name: Upload Linux packages
-        uses: actions/upload-artifact@v7
-        with:
-          name: DraggyEncoder-Linux-packages
-          path: |
-            DraggyEncoder-Linux-x86_64-*.tar.gz
-            DraggyEncoder-Linux-x86_64-*.deb
-            DraggyEncoder-Linux-x86_64-*.rpm
-            DraggyEncoder-Linux-x86_64-*.AppImage
-            DraggyEncoder-Linux-x86_64-*.flatpak
-            screenshots/*.png
-          if-no-files-found: error
 
       - name: Attach Linux packages to release
         if: startsWith(github.ref, 'refs/tags/v')
@@ -545,60 +598,10 @@ jobs:
         with:
           files: draggy-encoder.gpg
 
-  validate-deb:
-    name: Validate Debian package and AppStream integration
-    needs: build-linux
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-    steps:
-      - name: Download Linux packages artifact
-        uses: actions/download-artifact@v7
-        with:
-          name: DraggyEncoder-Linux-packages
-          path: artifacts
-
-      - name: Install validation tools
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y appstream desktop-file-utils
-
-      - name: Install generated DEB
-        shell: bash
-        run: |
-          set -euo pipefail
-          deb="$(find artifacts -type f -name '*.deb' -print -quit)"
-          if [ -z "$deb" ]; then
-            echo "No .deb found in artifacts/. Contents:" >&2
-            ls -laR artifacts || true
-            exit 1
-          fi
-          # apt trata una ruta relativa SIN './' como NOMBRE de paquete
-          # ("E: Unable to locate package artifacts/..."). El prefijo ./ la
-          # convierte en ruta local y apt además resuelve las dependencias.
-          sudo apt-get install -y "./$deb"
-
-      - name: Validate installed AppStream component
-        shell: bash
-        run: |
-          set -euo pipefail
-          metainfo=/usr/share/metainfo/com.draggyencoder.DraggyEncoder.metainfo.xml
-          desktop=/usr/share/applications/com.draggyencoder.DraggyEncoder.desktop
-          icon=/usr/share/icons/hicolor/256x256/apps/com.draggyencoder.DraggyEncoder.png
-          test -s "$metainfo"
-          test -s "$desktop"
-          test -s "$icon"
-          desktop-file-validate "$desktop"
-          appstreamcli validate --pedantic --no-net "$metainfo"
-          sudo appstreamcli refresh --force
-          appstreamcli dump com.draggyencoder.DraggyEncoder > /tmp/draggy-appstream.txt
-          grep -q '<id>com.draggyencoder.DraggyEncoder</id>' /tmp/draggy-appstream.txt
-          grep -q 'com.draggyencoder.DraggyEncoder.desktop' /tmp/draggy-appstream.txt
-          grep -q 'com.draggyencoder.DraggyEncoder' /tmp/draggy-appstream.txt
-
   publish-flatpak-repository:
     name: Publish Flatpak repository
     needs: build-linux
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     permissions:
       pages: write

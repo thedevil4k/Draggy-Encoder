@@ -11,18 +11,60 @@ on:
     tags: ["v*"]
   workflow_dispatch:
 
+# Evita que dos builds del mismo branch/tag compitan por los mismos artifacts
+# temporales y que el cleanup de una ejecución borre los de otra.
+concurrency:
+  group: build-installer-${{ github.repository }}
+  cancel-in-progress: false
+
 env:
   PY_VERSION: "3.13.3"
 
 jobs:
   build:
     runs-on: windows-latest
+    permissions:
+      actions: write
+      contents: write
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
+
+      # Recupera cuota ocupada por ejecuciones anteriores antes de instalar
+      # dependencias y compilar el EXE. Solo se eliminan artifacts temporales
+      # conocidos de estos workflows; los assets de Releases no se tocan.
+      - name: Prune stale packaging artifacts
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const names = new Set([
+              'DraggyEncoder-Installer',
+            ]);
+            const artifacts = await github.paginate(
+              github.rest.actions.listArtifactsForRepo,
+              {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                per_page: 100,
+              },
+            );
+            for (const artifact of artifacts) {
+              if (!names.has(artifact.name)) continue;
+              core.info(`Deleting temporary artifact ${artifact.name} (${artifact.id})`);
+              try {
+                await github.rest.actions.deleteArtifact({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  artifact_id: artifact.id,
+                });
+              } catch (error) {
+                // Another packaging workflow may have removed it first.
+                core.warning(`Could not delete artifact ${artifact.id}: ${error.message}`);
+              }
+            }
 
       - name: Set up Python 3.13
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: "3.13"
 
@@ -150,15 +192,24 @@ jobs:
           if ($v -like "v*") { $v = $v.Substring(1) }
           iscc "/DDRAGGY_VERSION=$v" draggy_encoder.iss
 
-      - name: Upload installer artifact
-        uses: actions/upload-artifact@v4
+      # En push normales no creamos un artifact grande: la cuota de
+      # GitHub Actions es independiente de la compilación y puede bloquear
+      # un build correcto. En tags el instalador se adjunta directamente a
+      # la Release; workflow_dispatch conserva una subida corta para poder
+      # inspeccionar manualmente el resultado.
+      - name: Upload installer artifact for manual inspection
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@v7
         with:
           name: DraggyEncoder-Installer
           path: installer/*.exe
           if-no-files-found: error
+          retention-days: 1
+          overwrite: true
+        continue-on-error: true
 
       - name: Attach installer to release
         if: startsWith(github.ref, 'refs/tags/v')
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: installer/*.exe

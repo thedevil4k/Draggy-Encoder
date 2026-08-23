@@ -1,0 +1,244 @@
+name: Manage GitHub Actions artifacts
+
+# Herramienta manual para recuperar cuota de artifacts sin tocar releases ni
+# otros datos del repositorio. El modo predeterminado solo lista candidatos.
+
+on:
+  workflow_dispatch:
+    inputs:
+      operation:
+        description: "Operation to perform"
+        required: true
+        type: choice
+        default: list
+        options:
+          - list
+          - delete
+      older_than_hours:
+        description: "Only consider artifacts older than this many hours"
+        required: true
+        type: string
+        default: "24"
+      name_contains:
+        description: "Optional case-insensitive name filter; leave empty for all"
+        required: false
+        type: string
+        default: ""
+      confirm:
+        description: "For delete mode, type DELETE exactly"
+        required: false
+        type: string
+        default: ""
+
+# Evita dos limpiezas simultáneas que puedan inspeccionar y borrar el mismo
+# artifact a la vez.
+concurrency:
+  group: manage-artifacts-${{ github.repository }}
+  cancel-in-progress: false
+
+permissions:
+  actions: write
+  contents: read
+
+jobs:
+  manage:
+    name: List or delete old artifacts
+    runs-on: ubuntu-latest
+    steps:
+      - name: Inspect and optionally delete artifacts
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const inputs = context.payload.inputs || {};
+            const operation = String(inputs.operation || 'list').trim().toLowerCase();
+            const olderThanHours = Number(inputs.older_than_hours || '24');
+            const nameContains = String(inputs.name_contains || '').trim().toLowerCase();
+            const confirmation = String(inputs.confirm || '').trim();
+            const validOperations = new Set(['list', 'delete']);
+
+            if (!validOperations.has(operation)) {
+              throw new Error(`Invalid operation: ${operation}. Use list or delete.`);
+            }
+            if (!Number.isFinite(olderThanHours) || olderThanHours < 1 || olderThanHours > 87600) {
+              throw new Error('older_than_hours must be between 1 and 87600.');
+            }
+            if (operation === 'delete' && confirmation !== 'DELETE') {
+              throw new Error('Delete mode requires the confirmation input to be exactly DELETE.');
+            }
+
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const currentRunId = Number(context.runId);
+            const cutoff = Date.now() - olderThanHours * 60 * 60 * 1000;
+            const activeStatuses = new Set([
+              'queued',
+              'in_progress',
+              'requested',
+              'waiting',
+              'pending',
+            ]);
+            const runStateCache = new Map();
+
+            const formatBytes = (value) => {
+              let bytes = Number(value || 0);
+              const units = ['B', 'KiB', 'MiB', 'GiB', 'TiB'];
+              let unit = 0;
+              while (bytes >= 1024 && unit < units.length - 1) {
+                bytes /= 1024;
+                unit += 1;
+              }
+              return `${bytes.toFixed(unit === 0 ? 0 : 1)} ${units[unit]}`;
+            };
+
+            const getRunState = async (runId) => {
+              if (!runId) {
+                return { status: 'unknown', label: 'missing workflow run' };
+              }
+              if (runStateCache.has(runId)) {
+                return runStateCache.get(runId);
+              }
+              try {
+                const response = await github.rest.actions.getWorkflowRun({
+                  owner,
+                  repo,
+                  run_id: runId,
+                });
+                const result = {
+                  status: response.data.status || 'unknown',
+                  label: `run #${response.data.run_number || runId}`,
+                };
+                runStateCache.set(runId, result);
+                return result;
+              } catch (error) {
+                const result = {
+                  status: 'unavailable',
+                  label: `run ${runId} could not be inspected`,
+                };
+                runStateCache.set(runId, result);
+                return result;
+              }
+            };
+
+            const artifacts = await github.paginate(
+              github.rest.actions.listArtifactsForRepo,
+              {
+                owner,
+                repo,
+                per_page: 100,
+              },
+            );
+
+            const candidates = [];
+            const skipped = [];
+
+            for (const artifact of artifacts) {
+              const createdAt = Date.parse(artifact.created_at || '');
+              const runId = artifact.workflow_run && artifact.workflow_run.id;
+              const ageMatches = Number.isFinite(createdAt) && createdAt <= cutoff;
+              const nameMatches = !nameContains || artifact.name.toLowerCase().includes(nameContains);
+
+              if (!ageMatches || !nameMatches) {
+                continue;
+              }
+
+              // Nunca tocar artifacts de esta ejecución ni de una ejecución
+              // que todavía esté activa. Si no se puede consultar su run,
+              // se omite por seguridad.
+              if (runId && runId === currentRunId) {
+                skipped.push({ artifact, reason: 'current cleanup run' });
+                continue;
+              }
+              const runState = await getRunState(runId);
+              if (runState.status !== 'completed') {
+                skipped.push({ artifact, reason: runState.label });
+                continue;
+              }
+
+              candidates.push({ artifact, runId, runState });
+            }
+
+            core.info(`Repository: ${owner}/${repo}`);
+            core.info(`Operation: ${operation}`);
+            core.info(`Age threshold: ${olderThanHours} hour(s)`);
+            core.info(`Name filter: ${nameContains || '(all names)'}`);
+            core.info(`Artifacts found: ${artifacts.length}`);
+            core.info(`Matching completed artifacts: ${candidates.length}`);
+            core.info(`Protected or unavailable artifacts: ${skipped.length}`);
+
+            let candidateBytes = 0;
+            for (const { artifact, runState } of candidates) {
+              candidateBytes += Number(artifact.size_in_bytes || 0);
+              core.info([
+                `CANDIDATE id=${artifact.id}`,
+                `name=${artifact.name}`,
+                `size=${formatBytes(artifact.size_in_bytes)}`,
+                `created=${artifact.created_at}`,
+                `expired=${Boolean(artifact.expired)}`,
+                `source=${runState.label}`,
+              ].join(' | '));
+            }
+            core.info(`Candidate storage: ${formatBytes(candidateBytes)}`);
+
+            if (operation === 'list') {
+              core.notice('List mode: no artifacts were deleted. Run again with operation=delete and confirm=DELETE to remove the candidates.');
+              return;
+            }
+
+            let deleted = 0;
+            let failed = 0;
+            let skippedDuringDelete = 0;
+
+            for (const candidate of candidates) {
+              const { artifact, runId } = candidate;
+              try {
+                // Re-read each artifact immediately before deletion so a
+                // changed or newly active run is not removed after the first
+                // inventory pass.
+                const current = (await github.rest.actions.getArtifact({
+                  owner,
+                  repo,
+                  artifact_id: artifact.id,
+                })).data;
+                const currentCreatedAt = Date.parse(current.created_at || '');
+                const currentRunId = (current.workflow_run && current.workflow_run.id) || runId;
+                const currentRunState = await getRunState(currentRunId);
+                const stillMatches =
+                  current.name.toLowerCase().includes(nameContains) &&
+                  Number.isFinite(currentCreatedAt) &&
+                  currentCreatedAt <= cutoff &&
+                  currentRunState.status === 'completed';
+
+                if (!stillMatches) {
+                  skippedDuringDelete += 1;
+                  core.warning(`Skipped changed or active artifact ${artifact.id} (${artifact.name}).`);
+                  continue;
+                }
+
+                await github.rest.actions.deleteArtifact({
+                  owner,
+                  repo,
+                  artifact_id: artifact.id,
+                });
+                deleted += 1;
+                core.info(`Deleted artifact ${artifact.id}: ${artifact.name}`);
+              } catch (error) {
+                if (error.status === 404) {
+                  skippedDuringDelete += 1;
+                  core.warning(`Artifact ${artifact.id} no longer exists; skipping.`);
+                } else {
+                  failed += 1;
+                  core.error(`Could not delete artifact ${artifact.id}: ${error.message}`);
+                }
+              }
+            }
+
+            core.notice([
+              `Deleted: ${deleted}`,
+              `Skipped after recheck: ${skippedDuringDelete}`,
+              `Failed: ${failed}`,
+              `Candidate storage before deletion: ${formatBytes(candidateBytes)}`,
+            ].join(' | '));
+
+            if (failed > 0) {
+              throw new Error(`${failed} artifact deletion(s) failed. Review the log and rerun if needed.`);
+            }
