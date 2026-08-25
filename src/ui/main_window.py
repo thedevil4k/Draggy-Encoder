@@ -629,6 +629,12 @@ class MainWindow(QMainWindow):
         self.compatible_codecs = compatible_codecs
         self.input_path = None
         self.input_paths = []  # multi-selección (uno o más videos)
+        # Dos slots de worker independientes: el render principal
+        # (compress / item de cola) y el preview, que puede correr en
+        # paralelo por ser un clip corto.
+        self.worker = None
+        self.preview_worker = None
+        self._preview_task_id = None
         # Carpeta de output inicial: prefiere ``last_output_dir`` si la
         # preferencia ``auto_open_last_output`` está activa y la carpeta
         # sigue existiendo; cae al Desktop si falta o falla.
@@ -1159,6 +1165,10 @@ class MainWindow(QMainWindow):
         # Backward compat: el primer video sigue siendo ``input_path`` para
         # los flujos single (preview / compress directo / last_job).
         self.input_path = paths[0]
+        # Re-sincroniza botones: seleccionar vídeo siempre re-habilita
+        # Compress/Preview si no hay worker ocupado (cura estados
+        # atascados de rutas asíncronas que no llegaron a re-habilitar).
+        self._update_action_buttons()
         if len(paths) == 1:
             self.status_label.setText(f"Selected: {os.path.basename(paths[0])}")
         else:
@@ -1529,8 +1539,10 @@ class MainWindow(QMainWindow):
         if (
             self._close_followup_job is None
             and not self._close_followup_complete
-            and getattr(self, "worker", None) is not None
-            and self.worker.isRunning()
+            and (
+                (getattr(self, "worker", None) is not None and self.worker.isRunning())
+                or (getattr(self, "preview_worker", None) is not None and self.preview_worker.isRunning())
+            )
         ):
             ret = QMessageBox.question(
                 self,
@@ -1543,6 +1555,17 @@ class MainWindow(QMainWindow):
                 event.ignore()
                 return
             self._abort_running_worker(cleanup_partial_output=True)
+            self._cleanup_after_abort()
+
+        # Abortar también el preview si está corriendo (clip corto, sin
+        # confirmación extra — el usuario ya confirmó el cierre).
+        if (
+            getattr(self, "preview_worker", None) is not None
+            and self.preview_worker.isRunning()
+        ):
+            self._abort_running_worker(
+                cleanup_partial_output=True, worker=self.preview_worker
+            )
             self._cleanup_after_abort()
 
         # Banner FFmpeg update en vuelo: NO destruir el QThread mientras
@@ -2184,10 +2207,39 @@ class MainWindow(QMainWindow):
         )
         self._run_worker(output_path, settings, mode="compress", ai_engines=ai_engines)
 
+    def _update_action_buttons(self):
+        """Estado centralizado de los botones de acción.
+
+        - Compress: requiere vídeo y que el worker principal esté libre.
+        - Preview: requiere vídeo y que no haya OTRO preview en vuelo;
+          puede correr EN PARALELO con el render principal (clip corto)
+          para comparar el frame original vs el resultante sin esperar
+          a que termine la cola.
+        - Abort: activo si hay worker principal o preview corriendo.
+        - Add to queue: siempre clicable; su guard interno informa al
+          usuario si hay un render en curso.
+        """
+        main_running = (
+            getattr(self, "worker", None) is not None and self.worker.isRunning()
+        )
+        preview_running = (
+            getattr(self, "preview_worker", None) is not None
+            and self.preview_worker.isRunning()
+        )
+        has_input = bool(self.input_path)
+        self.btn_compress.setEnabled(has_input and not main_running)
+        self.btn_preview.setEnabled(has_input and not preview_running)
+        self.btn_abort.setEnabled(main_running or preview_running)
+
     def _preview(self):
-        # Mismo guard que en _compress: no permitir un segundo worker
-        # mientras el primero sigue corriendo.
-        if getattr(self, "worker", None) is not None and self.worker.isRunning():
+        # El preview va en su PROPIO worker: puede lanzarse incluso con
+        # un render/cola en curso (ver _run_preview_worker). Sólo se
+        # bloquea si ya hay otro preview corriendo.
+        if (
+            getattr(self, "preview_worker", None) is not None
+            and self.preview_worker.isRunning()
+        ):
+            self._on_status_message("A preview is already running.")
             return
         if not self.input_path:
             QMessageBox.warning(self, "No video", "Please select a video first.")
@@ -2207,13 +2259,166 @@ class MainWindow(QMainWindow):
             settings=settings,
             ai_engines=ai_engines,
         )
-        self._run_worker(None, settings, mode="preview", ai_engines=ai_engines)
+        self._run_preview_worker(settings, ai_engines=ai_engines)
+
+    def _run_preview_worker(self, settings, ai_engines=None):
+        """Lanza el preview en ``self.preview_worker``.
+
+        A diferencia de ``_run_worker`` (slot único del render principal),
+        el preview tiene handlers propios para no pisar el progreso, el
+        task_id ni la cola del render en curso.
+        """
+        main_running = (
+            getattr(self, "worker", None) is not None and self.worker.isRunning()
+        )
+        if main_running and ai_engines:
+            # El preview puede ejecutar la cadena IA mientras el render
+            # principal comprime en GPU: competencia puntual por VRAM.
+            # El clip es corto; se permite y se deja constancia en el log.
+            logger.info(
+                "[Draggy] Preview launched while a render is running; "
+                "AI engines may contend for GPU/VRAM."
+            )
+        import uuid
+        self._preview_task_id = str(uuid.uuid4())
+        task_name = os.path.basename(self.input_path) + " (preview)"
+        self.tasks_panel.get_or_create(self._preview_task_id, task_name)
+        self.tasks_panel._cards[self._preview_task_id].set_running()
+        try:
+            import src.task_history as task_history
+            task_history.start_task(
+                self._preview_task_id, task_name, input_path=self.input_path,
+            )
+        except Exception:
+            pass
+
+        if not main_running:
+            # Sin render en curso, el preview usa la barra principal
+            # (comportamiento clásico). Con render, sólo status + tarjeta.
+            self.progress.setValue(0)
+            self.progress.setFormat("%p%")
+            self._worker_started = time.time()
+
+        self.preview_worker = CompressionWorker(
+            self.ffmpeg_path, self.input_path, None, settings,
+            mode="preview", ai_engines=ai_engines,
+        )
+        self.preview_worker.task_id = self._preview_task_id
+        self.preview_worker.progress.connect(self._on_preview_progress)
+        self.preview_worker.status_message.connect(self._on_preview_status)
+        self.preview_worker.phase_ev.connect(self._on_preview_phase_event)
+        self.preview_worker.finished.connect(
+            self._on_preview_finished, Qt.ConnectionType.QueuedConnection
+        )
+        self.preview_worker.start()
+        self._update_action_buttons()
+
+    def _on_preview_progress(self, value):
+        """Progreso del preview: barra principal sólo si no hay render;
+        si lo hay, status para no pisar el progreso del render."""
+        main_running = (
+            getattr(self, "worker", None) is not None and self.worker.isRunning()
+        )
+        if main_running:
+            self.status_label.setText(f"Preview: {value}% (render in progress)")
+        else:
+            self._on_worker_progress(value)
+
+    def _on_preview_status(self, message):
+        self.status_label.setText(f"Preview: {message}")
+        self.tasks_panel.append_log(f"Preview: {message}")
+
+    def _on_preview_phase_event(self, ev):
+        """Fases del preview a su tarjeta + historial (sin tocar la cola)."""
+        task_id = getattr(self, "_preview_task_id", None)
+        if not task_id:
+            return
+        self.tasks_panel.update_phase_event(task_id, ev)
+        try:
+            import src.task_history as task_history
+            phase_status = {
+                "start": "pending",
+                "progress": "running",
+                "end": "done",
+                "failed": "failed",
+            }.get(ev.get("ev"), "pending")
+            task_history.update_phase(
+                task_id,
+                ev.get("id", ""),
+                label=ev.get("label", ""),
+                status=phase_status,
+                pct=int(ev.get("pct", 0) or 0),
+            )
+        except Exception:
+            pass
+
+    def _mark_preview_task_finished(self, status):
+        task_id = getattr(self, "_preview_task_id", None)
+        if task_id:
+            self.tasks_panel.mark_finished(task_id, status)
+            try:
+                import src.task_history as task_history
+                task_history.finish_task(task_id, status)
+            except Exception:
+                pass
+        self._preview_task_id = None
+
+    def _on_preview_finished(self):
+        self._update_action_buttons()
+        worker = getattr(self, "preview_worker", None)
+        if worker is None:
+            return
+        aborted = (
+            getattr(worker, "abort_event", None) is not None
+            and worker.abort_event.is_set()
+        )
+        self._mark_preview_task_finished(
+            "aborted" if aborted else ("success" if worker.success else "failed")
+        )
+        # La barra principal sólo la toca el preview si no hay render.
+        main_running = (
+            getattr(self, "worker", None) is not None and self.worker.isRunning()
+        )
+        if not main_running:
+            self.progress.setValue(100 if worker.success else 0)
+            self.progress.setFormat("%p%")
+        if aborted:
+            self.status_label.setText("Preview aborted.")
+            return
+        if (
+            not worker.success
+            or not worker.preview_original
+            or not worker.preview_compressed
+        ):
+            self.status_label.setText("Preview failed: could not generate frames.")
+            QMessageBox.critical(
+                self, "Preview Error",
+                "Could not generate preview frames. Check FFmpeg and the input video.",
+            )
+            return
+        self.status_label.setText("Preview ready.")
+        # Pixmaps construidos en el hilo principal (regla Qt).
+        original_pixmap = QPixmap()
+        compressed_pixmap = QPixmap()
+        original_pixmap.loadFromData(worker.preview_original, "JPG")
+        compressed_pixmap.loadFromData(worker.preview_compressed, "JPG")
+        if original_pixmap.isNull() or compressed_pixmap.isNull():
+            self.status_label.setText("Preview failed: could not load frames.")
+            QMessageBox.critical(self, "Preview Error", "Could not load preview frames.")
+            return
+        dialog = PreviewDialog(
+            original_pixmap,
+            compressed_pixmap,
+            "Original (left) vs Compressed (right). Use the slider to compare.",
+            self,
+        )
+        dialog.exec()
 
     def _run_worker(self, output_path, settings, mode, ai_engines=None, input_path=None,
                     queue_id=None):
-        self.btn_compress.setEnabled(False)
-        self.btn_preview.setEnabled(False)
-        self.btn_abort.setEnabled(True)
+        # Estado centralizado de botones: el preview queda disponible
+        # (en su propio worker) aunque el render principal esté corriendo.
+        self._update_action_buttons()
         self.progress.setValue(0)
         self.progress.setFormat("%p%")
         self._worker_started = time.time()
@@ -2272,6 +2477,8 @@ class MainWindow(QMainWindow):
         # hilo de la GUI. Lambda en hilo secundario fallaria silenciosamente.
         self.worker.finished.connect(self._on_worker_finished, Qt.ConnectionType.QueuedConnection)
         self.worker.start()
+        # Worker ya asignado: re-sincronizar botones (habilita Abort).
+        self._update_action_buttons()
 
     def _on_worker_progress(self, value):
         """Actualiza la barra + ETA estimado a partir del throughput medido."""
@@ -2572,9 +2779,7 @@ class MainWindow(QMainWindow):
         self._start_next_queue_item()
 
     def _on_worker_finished(self):
-        self.btn_compress.setEnabled(True)
-        self.btn_preview.setEnabled(True)
-        self.btn_abort.setEnabled(False)
+        self._update_action_buttons()
         self.progress.setFormat("%p%")
 
         worker = getattr(self, "worker", None)
@@ -2773,12 +2978,16 @@ class MainWindow(QMainWindow):
             return
         self._cleanup_after_abort()
 
-    def _abort_running_worker(self, cleanup_partial_output):
+    def _abort_running_worker(self, cleanup_partial_output, worker=None):
         """Cancel an active ``CompressionWorker`` and tidy up disk.
 
         Reused by ``_abort`` (button click) and ``closeEvent`` (window
         closing during a regular compress). Returns True if it actually
         aborted something; False if no worker was running.
+
+        ``worker`` puede pasarse explícitamente (p.ej. el preview); por
+        defecto aborta el worker principal y, si no hay, el preview en
+        vuelo.
 
         Multi-stage strategy because each path covers a different
         failure mode of the previous one:
@@ -2794,7 +3003,10 @@ class MainWindow(QMainWindow):
            flag (always succeeds unless the OS holds the handle — see
            ``_try_remove``).
         """
-        worker = getattr(self, "worker", None)
+        if worker is None:
+            worker = getattr(self, "worker", None)
+            if worker is None or not worker.isRunning():
+                worker = getattr(self, "preview_worker", None)
         if worker is None or not worker.isRunning():
             return False
         # 1) Cooperative path: ask run_ffmpeg to terminate ffmpeg.
@@ -2877,9 +3089,7 @@ class MainWindow(QMainWindow):
     def _cleanup_after_abort(self):
         """Reset UI state after the worker finished (successfully aborted)."""
         try:
-            self.btn_compress.setEnabled(bool(self.input_path))
-            self.btn_preview.setEnabled(bool(self.input_path))
-            self.btn_abort.setEnabled(False)
+            self._update_action_buttons()
         except Exception:
             pass
         try:

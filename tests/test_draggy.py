@@ -21,6 +21,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import zipfile
 
@@ -2321,7 +2322,7 @@ def test_import_step_drop_event_emits_video_dropped(qapp, tmp_path):
         widget.deleteLater()
 
 
-def test_main_window_accepts_dropped_video_paths(tmp_path, monkeypatch):
+def test_main_window_accepts_dropped_video_paths(qapp, tmp_path, monkeypatch):
     """El handler de drag & drop de MainWindow fija la selección igual que
     el diálogo: filtra inexistentes y actualiza input_paths/input_path."""
     from src.ui.main_window import MainWindow
@@ -2332,6 +2333,9 @@ def test_main_window_accepts_dropped_video_paths(tmp_path, monkeypatch):
     mw = MainWindow.__new__(MainWindow)
     mw.input_path = None
     mw.input_paths = []
+    _ui_button_stub(mw)
+    mw.worker = None
+    mw.preview_worker = None
     statuses = []
     mw.status_label = type("L", (), {"setText": lambda self, t: statuses.append(t)})()
     updates = []
@@ -2344,7 +2348,7 @@ def test_main_window_accepts_dropped_video_paths(tmp_path, monkeypatch):
     assert updates == [str(vid)]
 
 
-def test_main_window_window_level_drop_imports_videos(tmp_path):
+def test_main_window_window_level_drop_imports_videos(qapp, tmp_path):
     """Soltar un video en cualquier punto de la ventana principal (no solo
     sobre la casilla Import) lo importa igual que el drop de la casilla."""
     from PySide6.QtCore import QMimeData, QPointF, Qt, QUrl
@@ -2357,6 +2361,9 @@ def test_main_window_window_level_drop_imports_videos(tmp_path):
     mw = MainWindow.__new__(MainWindow)
     mw.input_path = None
     mw.input_paths = []
+    _ui_button_stub(mw)
+    mw.worker = None
+    mw.preview_worker = None
     statuses = []
     mw.status_label = type("L", (), {"setText": lambda self, t: statuses.append(t)})()
     updates = []
@@ -4475,6 +4482,181 @@ def test_add_to_queue_batches_multiple_videos_same_config(tmp_path, monkeypatch)
     assert items[0]["output_path"] == str(out_dir / "a_compressed.mp4")
     assert items[1]["output_path"] == str(out_dir / "b_compressed.mp4")
     assert "Queued 2 videos" in messages[-1]
+
+
+# ---------------------------------------------------------------------------
+# Preview concurrente con el render principal (cola / compress)
+# ---------------------------------------------------------------------------
+
+
+def _ui_button_stub(mw):
+    """Crea botones reales (QPushButton) en un MainWindow sin UI completa."""
+    from PySide6.QtWidgets import QPushButton
+
+    mw.btn_compress = QPushButton("Compress")
+    mw.btn_preview = QPushButton("Preview")
+    mw.btn_abort = QPushButton("Abort")
+
+
+class _FakeSupervisor:
+    def stop_all(self, grace_seconds=0, kill_seconds=0):
+        pass
+
+
+class _FakeRunningWorker:
+    """Worker falso: isRunning() controlable, sin QThread real."""
+
+    def __init__(self, running=False):
+        self._running = running
+        self.abort_event = threading.Event()
+        self.output_path = None
+        self._procs = []
+        self._proc = None
+        self.supervisor = _FakeSupervisor()
+
+    def isRunning(self):
+        return self._running
+
+    def wait(self, *a, **k):
+        return True
+
+    def terminate(self):
+        pass
+
+
+class _FakeLabel:
+    def __init__(self):
+        self.text = ""
+
+    def setText(self, t):
+        self.text = t
+
+
+def test_update_action_buttons_preview_stays_enabled_during_render(qapp):
+    """El helper de botones mantiene Preview activo durante un render
+    (worker principal corriendo) y sólo lo bloquea con otro preview."""
+    from src.ui.main_window import MainWindow
+
+    mw = MainWindow.__new__(MainWindow)
+    _ui_button_stub(mw)
+    mw.input_path = "/tmp/video.mp4"
+    mw.worker = None
+    mw.preview_worker = None
+
+    mw._update_action_buttons()
+    assert mw.btn_compress.isEnabled() is True
+    assert mw.btn_preview.isEnabled() is True
+    assert mw.btn_abort.isEnabled() is False
+
+    # Render principal en curso: Compress/Abort cambian, Preview NO se bloquea.
+    mw.worker = _FakeRunningWorker(running=True)
+    mw._update_action_buttons()
+    assert mw.btn_compress.isEnabled() is False
+    assert mw.btn_preview.isEnabled() is True
+    assert mw.btn_abort.isEnabled() is True
+
+    # Preview en vuelo: Preview se bloquea, Abort sigue activo.
+    mw.preview_worker = _FakeRunningWorker(running=True)
+    mw._update_action_buttons()
+    assert mw.btn_preview.isEnabled() is False
+    assert mw.btn_abort.isEnabled() is True
+
+    # Sin vídeo seleccionado, nada se habilita.
+    mw.input_path = None
+    mw.worker = None
+    mw.preview_worker = None
+    mw._update_action_buttons()
+    assert mw.btn_compress.isEnabled() is False
+    assert mw.btn_preview.isEnabled() is False
+    assert mw.btn_abort.isEnabled() is False
+
+
+def test_preview_launches_while_main_render_running(qapp, monkeypatch):
+    """_preview lanza el preview aunque el worker principal esté corriendo,
+    y rechaza un segundo preview concurrente."""
+    from src.ui.main_window import MainWindow
+
+    mw = MainWindow.__new__(MainWindow)
+    _ui_button_stub(mw)
+    mw.input_path = "/tmp/video.mp4"
+    mw.worker = _FakeRunningWorker(running=True)
+    mw.preview_worker = None
+    mw._maybe_ffmpeg_health_check = lambda: True
+    mw._remember_runtime_prefs = lambda s: None
+    launched = []
+    mw._run_preview_worker = (
+        lambda settings, ai_engines=None: launched.append(settings)
+    )
+    messages = []
+    mw._on_status_message = messages.append
+
+    class _SettingsPanel:
+        def get_settings(self):
+            return {"codec": "h264_nvenc"}
+
+    class _Workflow:
+        def get_pipeline(self):
+            return ["Import", "Compress"]
+
+        def get_selected_engines(self):
+            return {}
+
+    mw.settings_panel = _SettingsPanel()
+    mw.workflow = _Workflow()
+    monkeypatch.setattr("src.ui.main_window.persist_last_job", lambda **k: None)
+
+    mw._preview()
+    assert launched, "preview debería lanzarse con un render en curso"
+
+    # Segundo preview mientras el primero corre: ignorado.
+    mw.preview_worker = _FakeRunningWorker(running=True)
+    mw._preview()
+    assert len(launched) == 1
+    assert messages and "already running" in messages[-1]
+
+
+def test_accept_video_paths_resyncs_buttons(qapp, tmp_path):
+    """Seleccionar vídeo re-sincroniza los botones (cura el estado atascado
+    de rutas asíncronas que no llegaron a re-habilitar)."""
+    from src.ui.main_window import MainWindow
+
+    video = tmp_path / "video.mp4"
+    video.write_bytes(b"x")
+
+    mw = MainWindow.__new__(MainWindow)
+    _ui_button_stub(mw)
+    mw.worker = None
+    mw.preview_worker = None
+    mw.input_path = None
+    mw.input_paths = []
+    mw.status_label = _FakeLabel()
+    mw._update_original_bitrate = lambda p: None
+
+    # Estado atascado: botones deshabilitados pese a no haber worker.
+    mw.btn_compress.setEnabled(False)
+    mw.btn_preview.setEnabled(False)
+    mw.btn_abort.setEnabled(False)
+
+    mw._accept_video_paths([str(video)])
+    assert mw.btn_compress.isEnabled() is True
+    assert mw.btn_preview.isEnabled() is True
+    assert mw.btn_abort.isEnabled() is False
+
+
+def test_abort_running_worker_falls_back_to_preview():
+    """Abort sin render principal aborta el preview en vuelo."""
+    from src.ui.main_window import MainWindow
+
+    mw = MainWindow.__new__(MainWindow)
+    mw.worker = None
+    mw.preview_worker = _FakeRunningWorker(running=True)
+
+    assert mw._abort_running_worker(cleanup_partial_output=True) is True
+    assert mw.preview_worker.abort_event.is_set()
+
+    # Nada corriendo -> False (no aborta nada).
+    mw.preview_worker = _FakeRunningWorker(running=False)
+    assert mw._abort_running_worker(cleanup_partial_output=True) is False
 
 
 def test_output_path_batch_with_fixed_name_avoids_collision(tmp_path, monkeypatch):
