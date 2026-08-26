@@ -1,4 +1,7 @@
-from PySide6.QtCore import Qt, QPointF, QRectF
+import os
+import tempfile
+
+from PySide6.QtCore import Qt, QPointF, QRectF, QTimer
 from PySide6.QtGui import QColor, QFont, QPainter, QPainterPath, QPixmap
 from PySide6.QtWidgets import (
     QDialog,
@@ -9,6 +12,9 @@ from PySide6.QtWidgets import (
     QSlider,
     QVBoxLayout,
 )
+
+from src.ffmpeg.runner import extract_frame
+from src.utils.helpers import seconds_to_time
 
 
 class ComparisonWidget(QLabel):
@@ -46,6 +52,12 @@ class ComparisonWidget(QLabel):
         self.division = max(0.0, min(1.0, value))
         self.update()
         self._sync_external_slider()
+
+    def set_images(self, original, compressed):
+        """Sustituye las imágenes comparadas (p.ej. al cambiar de frame)."""
+        self.original = original
+        self.compressed = compressed
+        self.update()
 
     def set_zoom(self, zoom):
         self.zoom = max(self.MIN_ZOOM, min(self.MAX_ZOOM, float(zoom)))
@@ -315,10 +327,15 @@ class ComparisonWidget(QLabel):
 
 
 class PreviewDialog(QDialog):
-    def __init__(self, original, compressed, info_text, parent=None):
+    def __init__(self, original, compressed, info_text, parent=None, artifacts=None):
         super().__init__(parent)
         self.setWindowTitle("Compression Preview")
         self.setMinimumSize(900, 700)
+        self.artifacts = artifacts or None
+        self._regen_timer = QTimer(self)
+        self._regen_timer.setSingleShot(True)
+        self._regen_timer.setInterval(300)
+        self._regen_timer.timeout.connect(self._regenerate_frames)
         self._setup_ui(original, compressed, info_text)
 
     def _setup_ui(self, original, compressed, info_text):
@@ -339,6 +356,30 @@ class PreviewDialog(QDialog):
         self.slider.setValue(50)
         self.slider.valueChanged.connect(self.comparison.set_division)
         layout.addWidget(self.slider)
+
+        # Selector de instante: re-extrae frames del clip ya codificado
+        # (sin repetir la cadena IA) y del origen en el nuevo instante.
+        if self.artifacts:
+            duration = float(self.artifacts.get("duration", 0) or 0)
+            self.frame_slider = QSlider(Qt.Orientation.Horizontal)
+            self.frame_slider.setRange(0, max(10, int(duration * 10)))
+            self.frame_slider.setValue(
+                int(float(self.artifacts.get("time", 0)) * 10)
+            )
+            self.frame_slider.valueChanged.connect(self._on_frame_slider)
+            self.frame_time_label = QLabel("")
+            self.frame_time_label.setStyleSheet(
+                "color: #00d2d3; font-size: 11px;"
+            )
+            self.frame_time_label.setFixedWidth(120)
+            frame_row = QHBoxLayout()
+            frame_caption = QLabel("Frame")
+            frame_caption.setStyleSheet("color: #a0a0b0; font-size: 11px;")
+            frame_row.addWidget(frame_caption)
+            frame_row.addWidget(self.frame_slider, stretch=1)
+            frame_row.addWidget(self.frame_time_label)
+            layout.addLayout(frame_row)
+            self._update_frame_time_label()
 
         # Zoom + reset
         zoom_row = QHBoxLayout()
@@ -364,10 +405,17 @@ class PreviewDialog(QDialog):
         info_label.setWordWrap(True)
         layout.addWidget(info_label)
 
-        hint = QLabel(
-            "Arrastra la línea vertical para comparar. "
-            "Ctrl + rueda del ratón para hacer zoom sobre la imagen."
-        )
+        if self.artifacts:
+            hint_text = (
+                "Arrastra la línea vertical para comparar; usa el deslizador "
+                "de frame para elegir el instante. Ctrl + rueda para zoom."
+            )
+        else:
+            hint_text = (
+                "Arrastra la línea vertical para comparar. "
+                "Ctrl + rueda del ratón para hacer zoom sobre la imagen."
+            )
+        hint = QLabel(hint_text)
         hint.setStyleSheet("color: #00d2d3; font-size: 11px;")
         hint.setWordWrap(True)
         layout.addWidget(hint)
@@ -396,6 +444,55 @@ class PreviewDialog(QDialog):
 
     def _on_reset_view(self):
         self.comparison.reset_view()
+
+    # -------------------- Selector de instante --------------------
+
+    def _on_frame_slider(self, value):
+        self._update_frame_time_label()
+        # Debounce: la extracción de frames corre al soltar el deslizador
+        # (o 300 ms después del último movimiento) para no lanzar ffmpeg
+        # a cada tick.
+        self._regen_timer.start()
+
+    def _update_frame_time_label(self):
+        if not hasattr(self, "frame_slider"):
+            return
+        t = self.frame_slider.value() / 10.0
+        self.frame_time_label.setText(seconds_to_time(t))
+
+    def _regenerate_frames(self):
+        """Re-extrae el frame original (del origen) y el comprimido (del
+        clip ya codificado con la cadena IA) en el instante elegido."""
+        artifacts = self.artifacts
+        if not artifacts:
+            return
+        try:
+            ffmpeg = artifacts.get("ffmpeg")
+            source = artifacts.get("source")
+            clip = artifacts.get("compressed_clip")
+            clip_start = float(artifacts.get("clip_start", 0))
+            clip_length = float(artifacts.get("clip_length", 5))
+            t = self.frame_slider.value() / 10.0
+            out_dir = artifacts.get("dir")
+            orig_jpg = os.path.join(out_dir, f"frame_orig_{t:.1f}.jpg")
+            comp_jpg = os.path.join(out_dir, f"frame_comp_{t:.1f}.jpg")
+            # El instante dentro del clip comprimido (offset respecto al
+            # inicio del clip), recortado para no pasarse del final.
+            comp_t = max(0.0, min(t - clip_start, clip_length - 0.05))
+            if not extract_frame(ffmpeg, source, t, orig_jpg):
+                return
+            if not extract_frame(ffmpeg, clip, comp_t, comp_jpg):
+                return
+            opm = QPixmap()
+            cpm = QPixmap()
+            opm.load(orig_jpg)
+            cpm.load(comp_jpg)
+            if opm.isNull() or cpm.isNull():
+                return
+            self.comparison.set_images(opm, cpm)
+        except Exception:
+            # Fallo de extracción: mantener los frames anteriores.
+            pass
 
     def _save_image(self, pixmap):
         dest, _ = QFileDialog.getSaveFileName(

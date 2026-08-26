@@ -88,68 +88,23 @@ GitHub Actions publishes these platform-specific artifacts:
 
 - **Windows:** `DraggyEncoder-Setup-*.exe`, built with PyInstaller and Inno Setup.
 - **Linux x86_64:** `DraggyEncoder-Linux-x86_64-*.tar.gz`, portable archive.
-- **Debian/Ubuntu:** `DraggyEncoder-Linux-x86_64-*.deb`, with a desktop launcher.
-- **Fedora/RHEL/openSUSE:** `DraggyEncoder-Linux-x86_64-*.rpm`, with a desktop launcher.
 - **Linux desktop:** `DraggyEncoder-Linux-x86_64-*.AppImage`, directly executable.
-- **Flatpak:** `DraggyEncoder-Linux-x86_64-*.flatpak`, installable with Flatpak.
 
 The Linux archive is portable: extract it and run `./DraggyEncoder/DraggyEncoder`.
-The `.deb` and `.rpm` packages install a desktop entry and command
-`draggy-encoder`; the AppImage can be marked executable and launched from the
-file manager. The standalone Flatpak can be installed with `flatpak install --user
-DraggyEncoder-Linux-x86_64-*.flatpak`. Installed Linux
-formats store writable data under `${XDG_DATA_HOME:-~/.local/share}/draggy-encoder`
-so `/opt` and a read-only AppImage mount are never modified. The first launch
-downloads FFmpeg, AI runtimes (ONNX Runtime + PyTorch), and models into that user data directory.
+The AppImage can be marked executable and launched from the file manager.
+Installed Linux formats store writable data under
+`${XDG_DATA_HOME:-~/.local/share}/draggy-encoder` so `/opt` and a read-only
+AppImage mount are never modified. The first launch downloads FFmpeg, AI
+runtimes (ONNX Runtime + PyTorch), and models into that user data directory.
+
+> Flatpak (with a signed OSTree repository published to GitHub Pages) is
+> planned for a later release.
 
 All bundles include a private Python 3.13 interpreter used only to install the
 optional PyTorch and ONNX Runtime packages on demand; the large AI runtimes are
 not shipped inside the release artifact. On Linux, use a distribution with a
 recent glibc and make the executable runnable if your extraction tool did not
 preserve permissions (`chmod +x DraggyEncoder/DraggyEncoder`).
-
-### Flatpak repository and automatic updates
-
-GitHub Actions publishes a GPG-signed Flatpak OSTree repository to GitHub
-Pages. Import the project key once, then add the remote without
-`--no-gpg-verify`:
-
-```bash
-curl -fsSL https://thedevil4k.github.io/Draggy-Encoder/draggy-encoder.gpg \
-  -o draggy-encoder.gpg
-flatpak remote-add --if-not-exists --gpg-import=draggy-encoder.gpg draggy-encoder \
-  https://thedevil4k.github.io/Draggy-Encoder/
-flatpak install --user draggy-encoder com.draggyencoder.DraggyEncoder
-flatpak update
-```
-
-After the remote is added, normal `flatpak update` detects new commits from
-releases published by the project; users no longer need to download individual
-`.flatpak` files. The repository is deployed by the Linux workflow, so GitHub
-Pages must be enabled once in the repository settings with **Source: GitHub
-Actions**. The standalone `.flatpak` bundle attached to each release is signed
-with the same key, so `flatpak install` verifies it the same way.
-
-#### Setting up the signing key (maintainers)
-
-The repository is signed with a dedicated, passphrase-less GPG key stored in
-GitHub Actions secrets. To (re)create it and store it:
-
-```bash
-gpg --batch --passphrase '' --quick-gen-key \
-  'Draggy Encoder Flatpak <flatpak@draggyencoder.io>' ed25519 sign never
-FINGERPRINT=$(gpg --list-keys --with-colons --fingerprint \
-  'Draggy Encoder Flatpak <flatpak@draggyencoder.io>' | awk -F: '$1=="fpr"{print $10; exit}')
-gpg --armor --export-secret-keys "$FINGERPRINT" > flatpak-signing-key.asc
-gh secret set FLATPAK_GPG_PRIVATE_KEY --repo thedevil4k/Draggy-Encoder \
-  < flatpak-signing-key.asc
-# Opcional: fijar el fingerprint explícitamente (si no, se deriva solo).
-gh secret set FLATPAK_GPG_KEY_ID --repo thedevil4k/Draggy-Encoder --body "$FINGERPRINT"
-```
-
-`FLATPAK_GPG_KEY_ID` (the key fingerprint) is optional — the workflow derives
-it from the imported key. Without `FLATPAK_GPG_PRIVATE_KEY`, the build still
-runs but leaves the repository unsigned (forks and PRs).
 
 For source development on Linux:
 

@@ -465,13 +465,20 @@ def compress_video(ffmpeg_path, input_path, output_path, settings,
 def generate_preview(ffmpeg_path, input_path, settings, progress_callback=None,
                      status_callback=None, abort_event=None, ai_engines=None,
                      inference_engines=None, on_process=None, on_processes=None,
-                     phase_cb=None, supervisor: ProcessSupervisor | None = None):
-    """Genera un preview: codifica un clip corto y extrae un frame aleatorio.
+                     phase_cb=None, supervisor: ProcessSupervisor | None = None,
+                     preview_time=None):
+    """Genera un preview: codifica un clip corto y extrae un frame.
 
-    Devuelve una tupla ``(original_bytes, compressed_bytes)`` con los bytes de
-    dos imágenes JPEG. Los ``QPixmap`` deben construirse en el hilo principal
-    de la GUI para evitar crashes de Qt; por eso no se devuelven objetos
-    gráficos desde este worker.
+    Devuelve una tupla ``(original_bytes, compressed_bytes, artifacts)`` con
+    los bytes de dos imágenes JPEG y un diccionario de artefactos persistentes
+    (clip comprimido, ruta de origen, ffmpeg, tiempos) que el PreviewDialog
+    puede usar para re-extraer frames en otros instantes sin repetir la
+    codificación. El llamante DEBE eliminar ``artifacts["dir"]`` cuando ya
+    no necesite los artefactos.
+
+    ``preview_time`` en segundos absolutos: centra el clip de 5 s en ese
+    instante y extrae exactamente ESE frame. Si es ``None``, comportamiento
+    anterior: clip al 20 % del vídeo y frame aleatorio reproducible.
 
     ``ai_engines`` carries the same shape as in ``compress_video`` and is
     surfaced in the status line. When ``inference_engines`` is provided,
@@ -511,21 +518,42 @@ def generate_preview(ffmpeg_path, input_path, settings, progress_callback=None,
         except Exception as exc:
             logger.warning("ai_engines plumbing failed (preview): %s", exc)
 
-    # Clip corto de hasta 5 segundos desde el 20% del vídeo, pero nunca más
-    # de lo que dura el vídeo. Si falla la detección de duración usamos un
-    # clip de 5 s desde el inicio.
-    start = max(0, duration * 0.2) if duration > 0 else 0
-    end = start + min(5, max(1, duration - start))
-    # Asegurar que no nos pasamos del final del vídeo.
-    if duration > 0:
-        end = min(end, duration)
-    clip_length = max(0.1, end - start)
+    # Instante a comparar. Si el usuario pidió ``preview_time`` (segundos
+    # absolutos) centramos el clip ahí y extraemos ESE frame; si no, clip de
+    # 5 s desde el 20 % del vídeo + frame aleatorio reproducible. El parámetro
+    # tiene prioridad; si llega por settings (el camino normal desde la UI)
+    # se lee de ahí también.
+    if preview_time is None:
+        preview_time = settings.get("preview_time")
+    try:
+        t = float(preview_time) if preview_time is not None else None
+    except (TypeError, ValueError):
+        t = None
 
-    # Elegir un fotograma aleatorio dentro del clip, evitando los extremos.
-    # Se usa una semilla basada en el path para que el frame sea reproducible
-    # entre previews consecutivos del mismo archivo.
-    rng = random.Random(input_path)
-    random_frame_time = rng.uniform(0.1, max(0.2, clip_length - 0.1))
+    if t is not None:
+        # Clip de 5 s centrado en ``t``, recortado a [0, duration].
+        start = max(0.0, t - 2.5)
+        end = min(duration, t + 2.5) if duration > 0 else t + 2.5
+        if end <= start:
+            end = start + 5.0
+            if duration > 0:
+                end = min(end, duration)
+        clip_length = max(0.1, end - start)
+        # Frame exacto pedido (offset dentro del clip), nunca más allá del
+        # final real del clip.
+        frame_offset = min(max(0.0, t - start), clip_length - 0.1)
+    else:
+        start = max(0, duration * 0.2) if duration > 0 else 0
+        end = start + min(5, max(1, duration - start))
+        # Asegurar que no nos pasamos del final del vídeo.
+        if duration > 0:
+            end = min(end, duration)
+        clip_length = max(0.1, end - start)
+
+        # Frame aleatorio dentro del clip, evitando los extremos. Semilla
+        # basada en el path para reproducibilidad entre previews.
+        rng = random.Random(input_path)
+        frame_offset = rng.uniform(0.1, max(0.2, clip_length - 0.1))
 
     # Medimos loudness SOBRE EL MISMO CLIP que se va a codificar.
     loudnorm_meas = _measure_if_needed(
@@ -585,7 +613,7 @@ def generate_preview(ffmpeg_path, input_path, settings, progress_callback=None,
 
         # Elegir un fotograma seguro dentro del clip generado.
         # Nunca pidamos un tiempo mayor que la duración real del clip.
-        frame_time = min(random_frame_time, clip_length - 0.1)
+        frame_time = min(frame_offset, clip_length - 0.1)
         compressed_frame = os.path.join(tmpdir, "compressed_frame.jpg")
         ok_comp = extract_frame(
             ffmpeg_path, compressed_path, frame_time, compressed_frame,
@@ -621,9 +649,28 @@ def generate_preview(ffmpeg_path, input_path, settings, progress_callback=None,
         if not compressed_data.startswith(b"\xff\xd8") or not original_data.startswith(b"\xff\xd8"):
             raise RuntimeError("Generated frame files are not valid JPEG images.")
 
+        # Persistir el clip comprimido en un directorio independiente
+        # del tmpdir (que se elimina al salir de este bloque). El
+        # PreviewDialog puede re-extraer frames en otros instantes sin
+        # repetir la codificación.
+        artifacts_dir = tempfile.mkdtemp(prefix="draggy-preview-artifacts-")
+        persistent_clip = os.path.join(
+            artifacts_dir, f"preview_clip.{fmt}",
+        )
+        shutil.copyfile(compressed_path, persistent_clip)
+        artifacts = {
+            "dir": artifacts_dir,
+            "compressed_clip": persistent_clip,
+            "clip_start": start,
+            "clip_length": clip_length,
+            "source": input_path,
+            "ffmpeg": ffmpeg_path,
+            "duration": duration,
+            "time": original_time,
+        }
         _emit_phase(phase_cb, "progress", "preview", pct=100)
         _emit_phase(phase_cb, "end", "preview")
-        return original_data, compressed_data
+        return original_data, compressed_data, artifacts
 
 
 # ---------------------------------------------------------------------------

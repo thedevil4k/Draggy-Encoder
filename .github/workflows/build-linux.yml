@@ -2,11 +2,13 @@ name: Build Linux Bundle
 
 # Genera bundles para Linux x86_64. El bundle no incluye los runtimes de IA
 # pesados: añade un Python 3.13 relocatable para instalarlos bajo demanda.
+#
+# Distribuciones actuales: tar.gz portable + AppImage. Los paquetes .deb y
+# .rpm se retiraron para simplificar y ahorrar cuota; el Flatpak (+ repo en
+# GitHub Pages) volverá más adelante.
 
 permissions:
   contents: write
-  pages: write
-  id-token: write
 
 on:
   push:
@@ -16,7 +18,7 @@ on:
 
 # Todos los workflows de empaquetado comparten la cuota de artifacts. Usar
 # el mismo grupo evita que Linux y Windows limpien/suban simultáneamente y
-# se borren el artifact temporal de Pages o la salida de la otra plataforma.
+# se borren la salida de la otra plataforma.
 concurrency:
   group: draggy-packaging-${{ github.repository }}
   cancel-in-progress: false
@@ -28,7 +30,7 @@ jobs:
   # Prueba rápida de humo ANTES de construir: ejecuta el selftest desde
   # fuentes, captura los screenshots de AppStream y valida todos los assets
   # de empaquetado. Falla barato (1-2 min) en vez de después de un build de
-  # PyInstaller + flatpak-builder de 10+ min.
+  # PyInstaller de 10+ min.
   smoke-packaging:
     name: Smoke test packaging scripts and imports
     runs-on: ubuntu-latest
@@ -40,8 +42,8 @@ jobs:
 
       # actionlint valida la sintaxis YAML, las expresiones ${{ }} y el shell
       # de cada bloque run:. Falla aquí (en segundos) en vez de en el build
-      # largo de PyInstaller + flatpak-builder. Binario de Go autocontenido,
-      # sin dependencias del sistema.
+      # largo de PyInstaller. Binario de Go autocontenido, sin dependencias
+      # del sistema.
       - name: Lint workflows with actionlint
         shell: bash
         run: |
@@ -76,7 +78,7 @@ jobs:
             libgl1 libegl1 libfontconfig1 libxkbcommon0 libxkbcommon-x11-0 \
             libx11-6 libx11-xcb1 libxcb1 libxext6 libxrender1 libxrandr2 \
             libxi6 libdbus-1-3 libglib2.0-0 \
-            desktop-file-utils appstream
+            desktop-file-utils
 
       - name: Compile all Python sources
         run: python -m compileall -q src main.py packaging
@@ -137,36 +139,14 @@ jobs:
         run: |
           set -euo pipefail
           bash -n packaging/linux/AppRun \
-            packaging/linux/draggy-encoder-wrapper \
-            packaging/linux/flatpak-wrapper
+            packaging/linux/draggy-encoder-wrapper
           desktop-file-validate packaging/linux/draggy-encoder.desktop
           desktop-file-validate packaging/linux/appimage.desktop
-          desktop-file-validate packaging/linux/flatpak.desktop
-          # --no-net: los checks de URL (homepage/bugtracker/screenshots) requieren
-          # red y fallan antes de que exista el primer release; el CI no debe depender
-          # de que GitHub responda a HEAD de paths que aún no existen.
-          # El metainfo es una plantilla con @VERSION@ (como el .spec del RPM):
-          # se valida sustituyendo una versión de ejemplo.
-          sed "s/@VERSION@/1/g" packaging/linux/flatpak-metainfo.xml.in \
-            > /tmp/flatpak-metainfo-smoke.xml
-          appstreamcli validate --pedantic --no-net /tmp/flatpak-metainfo-smoke.xml
-          python - <<'PY'
-          import yaml
-          with open(
-              "packaging/linux/com.draggyencoder.DraggyEncoder.yml",
-              encoding="utf-8",
-          ) as fh:
-              yaml.safe_load(fh)
-          PY
-          sed "s/@VERSION@/1/g" packaging/linux/draggy-encoder.spec.in \
-            | grep -q "^Name: draggy-encoder"
 
   build-linux:
     name: Build Linux packages
     needs: smoke-packaging
     runs-on: ubuntu-latest
-    outputs:
-      pages_artifact_uploaded: ${{ steps.upload_pages_artifact.outcome == 'success' }}
     permissions:
       actions: write
       contents: write
@@ -178,13 +158,19 @@ jobs:
       # eliminamos todos los artifacts temporales conocidos de ejecuciones
       # terminadas; los assets de Releases no se tocan. El grupo de
       # concurrencia común evita borrar uno que esté usando el otro workflow.
+      #
+      # Cada workflow de empaquetado limpia TODO lo que conozca (Installer,
+      # paquetes Linux y el antiguo repo Flatpak de Pages), no solo sus
+      # propios artefactos: una sola ejecución deja la cuota al mínimo y
+      # evita que se acumulen artefactos huérfanos de la otra plataforma.
       - name: Prune stale Linux packaging artifacts
         uses: actions/github-script@v8
         with:
           script: |
             const names = new Set([
-              'github-pages',
+              'DraggyEncoder-Installer',
               'DraggyEncoder-Linux-packages',
+              'github-pages',
             ]);
             const artifacts = await github.paginate(
               github.rest.actions.listArtifactsForRepo,
@@ -240,35 +226,15 @@ jobs:
           python -m pip install --upgrade pip setuptools wheel
           python -m pip install -r requirements-build.txt
 
-      - name: Install Linux packaging tools
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y rpm flatpak flatpak-builder appstream desktop-file-utils
-
       # PySide6/Qt necesita las bibliotecas de gráficos del sistema (EGL,
       # GL, X11) incluso para importar QtGui. Sin ellas el bundle no
-      # arranca ni en --selftest. Las mismas que declara el .deb como
-      # dependencias (libgl1, libegl1, libxkbcommon...).
+      # arranca ni en --selftest.
       - name: Install Qt runtime libraries
         run: |
           sudo apt-get install -y \
             libgl1 libegl1 libfontconfig1 libxkbcommon0 libxkbcommon-x11-0 \
             libx11-6 libx11-xcb1 libxcb1 libxext6 libxrender1 libxrandr2 \
             libxi6 libdbus-1-3 libglib2.0-0
-
-      # El metainfo AppStream es una plantilla (@VERSION@, como el .spec del
-      # RPM). Se genera UNA vez aquí con la versión real de la tag para que
-      # .deb, .rpm, AppImage y Flatpak reporten la misma versión que el resto
-      # de bundles (antes quedaba fija en 0.1.0 y no coincidía con la tag).
-      - name: Inject release version into AppStream metainfo
-        shell: bash
-        run: |
-          set -euo pipefail
-          version="${GITHUB_REF_NAME#v}"
-          if [[ "$GITHUB_REF" != refs/tags/v* ]]; then version="1"; fi
-          sed "s/@VERSION@/$version/g" packaging/linux/flatpak-metainfo.xml.in \
-            > packaging/linux/flatpak-metainfo.xml
-          grep -q "release version=\"$version\"" packaging/linux/flatpak-metainfo.xml
 
       - name: Build Linux bundle with PyInstaller
         run: |
@@ -330,10 +296,10 @@ jobs:
         run: rm -rf dist/DraggyEncoder/bin dist/DraggyEncoder/personal
 
       # Los símbolos de depuración de Python/PySide6/FFmpeg no le sirven al
-      # usuario final, pero flatpak-builder los extrae y comprime .so a .so
-      # (el log gigante de "compressing debuginfo") y exporta un .Debug de
-      # cientos de MB. Stripeamos el árbol entero antes de empaquetar: bundles
-      # más pequeños y sin ese paso. Los binarios stripeados ejecutan igual.
+      # usuario final. Stripeamos el árbol entero antes de empaquetar:
+      # bundles (tar.gz y AppImage) más pequeños, lo que además reduce el
+      # consumo de la cuota de artifacts. Los binarios stripeados ejecutan
+      # igual.
       - name: Strip debug symbols from the bundle
         shell: bash
         run: |
@@ -350,89 +316,6 @@ jobs:
           if [[ "$GITHUB_REF" != refs/tags/v* ]]; then version="1"; fi
           tar -czf "DraggyEncoder-Linux-x86_64-${version}.tar.gz" -C dist DraggyEncoder
 
-      - name: Create Debian package
-        shell: bash
-        run: |
-          set -euo pipefail
-          version="${GITHUB_REF_NAME#v}"
-          if [[ "$GITHUB_REF" != refs/tags/v* ]]; then version="1"; fi
-          root=debian-root
-          rm -rf "$root"
-          mkdir -p "$root/DEBIAN" "$root/opt/draggy-encoder" "$root/usr/bin" "$root/usr/share/applications" "$root/usr/share/icons/hicolor/256x256/apps"
-          cp -a dist/DraggyEncoder/. "$root/opt/draggy-encoder/"
-          cp packaging/linux/draggy-encoder-wrapper "$root/usr/bin/draggy-encoder"
-          cp packaging/linux/draggy-encoder.desktop "$root/usr/share/applications/com.draggyencoder.DraggyEncoder.desktop"
-          mkdir -p "$root/usr/share/metainfo"
-          cp packaging/linux/flatpak-metainfo.xml "$root/usr/share/metainfo/com.draggyencoder.DraggyEncoder.metainfo.xml"
-          cp assets/Import.png "$root/usr/share/icons/hicolor/256x256/apps/draggy-encoder.png"
-          cp assets/Import.png "$root/usr/share/icons/hicolor/256x256/apps/com.draggyencoder.DraggyEncoder.png"
-          chmod 0755 "$root/usr/bin/draggy-encoder"
-          cat > "$root/DEBIAN/control" <<EOF
-          Package: draggy-encoder
-          Version: $version
-          Section: video
-          Priority: optional
-          Architecture: amd64
-          Maintainer: Draggy Encoder contributors
-          Depends: libc6 (>= 2.31), libglib2.0-0, libgl1, libegl1, libfontconfig1, libx11-6, libx11-xcb1, libxcb1, libxext6, libxrender1, libxrandr2, libxi6, libxkbcommon0, libxkbcommon-x11-0
-          Description: AI-powered video compression and upscaling
-           Draggy Encoder is a PySide6 desktop application for video encoding,
-           AI upscaling, frame interpolation and related workflows.
-          EOF
-          dpkg-deb --build --root-owner-group "$root" "DraggyEncoder-Linux-x86_64-${version}.deb"
-
-      - name: Validate generated Debian package and AppStream integration
-        shell: bash
-        run: |
-          set -euo pipefail
-          version="${GITHUB_REF_NAME#v}"
-          if [[ "$GITHUB_REF" != refs/tags/v* ]]; then version="1"; fi
-          deb="DraggyEncoder-Linux-x86_64-${version}.deb"
-          test -s "$deb"
-          sudo apt-get install -y "./$deb"
-          metainfo=/usr/share/metainfo/com.draggyencoder.DraggyEncoder.metainfo.xml
-          desktop=/usr/share/applications/com.draggyencoder.DraggyEncoder.desktop
-          icon=/usr/share/icons/hicolor/256x256/apps/com.draggyencoder.DraggyEncoder.png
-          test -s "$metainfo"
-          test -s "$desktop"
-          test -s "$icon"
-          desktop-file-validate "$desktop"
-          appstreamcli validate --pedantic --no-net "$metainfo"
-          sudo appstreamcli refresh --force
-          appstreamcli dump com.draggyencoder.DraggyEncoder > /tmp/draggy-appstream.txt
-          grep -q '<id>com.draggyencoder.DraggyEncoder</id>' /tmp/draggy-appstream.txt
-          grep -q 'com.draggyencoder.DraggyEncoder.desktop' /tmp/draggy-appstream.txt
-          grep -q 'com.draggyencoder.DraggyEncoder' /tmp/draggy-appstream.txt
-
-      - name: Create RPM package
-        shell: bash
-        run: |
-          set -euo pipefail
-          version="${GITHUB_REF_NAME#v}"
-          if [[ "$GITHUB_REF" != refs/tags/v* ]]; then version="1"; fi
-          rpm_top="$PWD/rpm-root"
-          rpm_stage="$PWD/rpm-staging/draggy-encoder-bundle"
-          rm -rf "$rpm_top" "$PWD/rpm-staging"
-          mkdir -p "$rpm_top/SOURCES" "$rpm_top/SPECS" "$rpm_stage/opt/draggy-encoder" "$rpm_stage/usr/bin" "$rpm_stage/usr/share/applications" "$rpm_stage/usr/share/icons/hicolor/256x256/apps"
-          cp -a dist/DraggyEncoder/. "$rpm_stage/opt/draggy-encoder/"
-          cp packaging/linux/draggy-encoder-wrapper "$rpm_stage/usr/bin/draggy-encoder"
-          cp packaging/linux/draggy-encoder.desktop "$rpm_stage/usr/share/applications/com.draggyencoder.DraggyEncoder.desktop"
-          mkdir -p "$rpm_stage/usr/share/metainfo"
-          cp packaging/linux/flatpak-metainfo.xml "$rpm_stage/usr/share/metainfo/com.draggyencoder.DraggyEncoder.metainfo.xml"
-          cp assets/Import.png "$rpm_stage/usr/share/icons/hicolor/256x256/apps/draggy-encoder.png"
-          cp assets/Import.png "$rpm_stage/usr/share/icons/hicolor/256x256/apps/com.draggyencoder.DraggyEncoder.png"
-          chmod 0755 "$rpm_stage/usr/bin/draggy-encoder"
-          tar -czf "$rpm_top/SOURCES/draggy-encoder-bundle.tar.gz" -C "$PWD/rpm-staging" draggy-encoder-bundle
-          sed "s/@VERSION@/$version/g" packaging/linux/draggy-encoder.spec.in > "$rpm_top/SPECS/draggy-encoder.spec"
-          rpmbuild --define "_topdir $rpm_top" -bb "$rpm_top/SPECS/draggy-encoder.spec"
-          rpm_file="$(find "$rpm_top/RPMS" -type f -name '*.rpm' -print -quit)"
-          if [ -z "$rpm_file" ]; then
-            echo "rpmbuild no generó ningún .rpm. Contenido de $rpm_top:" >&2
-            find "$rpm_top" -type f | sed 's/^/  /' >&2 || true
-            exit 1
-          fi
-          cp "$rpm_file" "DraggyEncoder-Linux-x86_64-${version}.rpm"
-
       - name: Create AppImage
         shell: bash
         run: |
@@ -447,156 +330,20 @@ jobs:
           cp packaging/linux/appimage.desktop "$appdir/com.draggyencoder.DraggyEncoder.desktop"
           cp assets/Import.png "$appdir/draggy-encoder.png"
           cp assets/Import.png "$appdir/com.draggyencoder.DraggyEncoder.png"
-          cp packaging/linux/flatpak-metainfo.xml "$appdir/com.draggyencoder.DraggyEncoder.metainfo.xml"
           chmod 0755 "$appdir/AppRun" "$appdir/DraggyEncoder/DraggyEncoder"
           curl -fL --retry 3 https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage -o /tmp/appimagetool.AppImage
           chmod +x /tmp/appimagetool.AppImage
           ARCH=x86_64 APPIMAGE_EXTRACT_AND_RUN=1 /tmp/appimagetool.AppImage "$appdir" "DraggyEncoder-Linux-x86_64-${version}.AppImage"
 
-      # Firma GPG del repositorio OSTree (opcional). Si FLATPAK_GPG_PRIVATE_KEY
-      # está configurado (clave privada armored, sin passphrase) se importa a
-      # un GNUPGHOME temporal y los pasos de Flatpak firman repo + bundle; la
-      # clave pública se publica junto al repo para que los usuarios puedan
-      # quitar --no-gpg-verify. Sin el secreto (p.ej. en forks) el build
-      # sigue funcionando SIN firmar.
-      - name: Import Flatpak GPG signing key
-        shell: bash
-        env:
-          FLATPAK_GPG_PRIVATE_KEY: ${{ secrets.FLATPAK_GPG_PRIVATE_KEY }}
-          FLATPAK_GPG_KEY_ID: ${{ secrets.FLATPAK_GPG_KEY_ID }}
-        run: |
-          set -euo pipefail
-          if [[ -z "${FLATPAK_GPG_PRIVATE_KEY:-}" ]]; then
-            echo "FLATPAK_GPG_PRIVATE_KEY no configurado: el repositorio quedará SIN firmar."
-            echo "FLATPAK_SIGN=0" >> "$GITHUB_ENV"
-            exit 0
-          fi
-          gnupg_home="$RUNNER_TEMP/gnupg"
-          rm -rf "$gnupg_home"
-          mkdir -p "$gnupg_home"
-          chmod 700 "$gnupg_home"
-          printf '%s\n' "$FLATPAK_GPG_PRIVATE_KEY" | gpg --batch --homedir "$gnupg_home" --import
-
-          if [[ -n "${FLATPAK_GPG_KEY_ID:-}" ]]; then
-            keyid="$FLATPAK_GPG_KEY_ID"
-          else
-            keyid="$(gpg --batch --homedir "$gnupg_home" --with-colons --fingerprint --list-secret-keys 2>/dev/null | awk -F: '$1 == "fpr" { print $10; exit }')"
-          fi
-          test -n "$keyid"
-
-          # Confianza última: gpgme/ostree rechazan firmas de claves con
-          # trust "unknown"; así la verificación del bundle en el smoke test
-          # y en `flatpak install` funciona sin prompt.
-          printf '%s:6:\n' "$keyid" | gpg --batch --homedir "$gnupg_home" --import-ownertrust
-
-          {
-            echo "FLATPAK_SIGN=1"
-            echo "FLATPAK_GPG_KEY_ID=$keyid"
-            echo "GNUPGHOME=$gnupg_home"
-          } >> "$GITHUB_ENV"
-          echo "Clave de firma Flatpak: $keyid"
-
-      - name: Create Flatpak bundle
-        shell: bash
-        run: |
-          set -euo pipefail
-          version="${GITHUB_REF_NAME#v}"
-          if [[ "$GITHUB_REF" != refs/tags/v* ]]; then version="1"; fi
-          sign_args=()
-          if [[ "${FLATPAK_SIGN:-0}" == "1" ]]; then
-            sign_args+=(--gpg-sign="$FLATPAK_GPG_KEY_ID")
-          fi
-          rm -rf flatpak-staging flatpak-build flatpak-repo flatpak-manifest.yml
-          mkdir -p flatpak-staging/DraggyEncoder
-          cp -a dist/DraggyEncoder/. flatpak-staging/DraggyEncoder/
-          cp packaging/linux/flatpak-wrapper flatpak-staging/flatpak-wrapper
-          cp packaging/linux/flatpak.desktop flatpak-staging/flatpak.desktop
-          cp assets/Import.png flatpak-staging/draggy-encoder.png
-          cp packaging/linux/flatpak-metainfo.xml flatpak-staging/com.draggyencoder.DraggyEncoder.metainfo.xml
-          chmod 0755 flatpak-staging/flatpak-wrapper flatpak-staging/DraggyEncoder/DraggyEncoder
-          appstreamcli validate --pedantic --no-net flatpak-staging/com.draggyencoder.DraggyEncoder.metainfo.xml
-          cp packaging/linux/com.draggyencoder.DraggyEncoder.yml flatpak-manifest.yml
-          # Lint del manifiesto antes del build caro: --show-manifest fuerza a
-          # flatpak-builder a parsear y resolver el manifiesto sin construir,
-          # fallando rápido con un error claro ante un error de sintaxis.
-          flatpak-builder --show-manifest flatpak-manifest.yml > /dev/null
-          flatpak remote-add --if-not-exists --user flathub https://flathub.org/repo/flathub.flatpakrepo
-          flatpak install --user --noninteractive flathub org.freedesktop.Sdk//24.08 org.freedesktop.Platform//24.08
-          # Exportamos a una rama estable ("stable") para que `flatpak update`
-          # detecte nuevas builds. ``build-bundle`` debe pedir la MISMA rama
-          # que exportó ``flatpak-builder`` (por defecto es "master", y pedir
-          # "$version" daba: Refspec 'app/.../x86_64/<version>' not found).
-          # El número de versión vive en el metainfo (<releases>) y en el
-          # nombre del .flatpak, no en la rama OSTree.
-          # NOTA: flatpak-builder NO tiene una opción --no-debuginfo. El paso
-          # "Strip debug symbols from the bundle" (anterior) ya elimina los
-          # símbolos de los .so, así que el export .Debug queda vacío sin
-          # necesidad de ningún flag.
-          flatpak-builder --user --disable-rofiles-fuse --force-clean --default-branch=stable "${sign_args[@]}" --repo=flatpak-repo flatpak-build flatpak-manifest.yml
-          if [[ "${FLATPAK_SIGN:-0}" == "1" ]]; then
-            # Firma el summary del repo para que `flatpak remote-add` sin
-            # --no-gpg-verify pueda verificar descargas y updates.
-            flatpak build-update-repo --gpg-sign="$FLATPAK_GPG_KEY_ID" flatpak-repo
-          fi
-          flatpak build-bundle "${sign_args[@]}" --runtime-repo=https://flathub.org/repo/flathub.flatpakrepo flatpak-repo "DraggyEncoder-Linux-x86_64-${version}.flatpak" com.draggyencoder.DraggyEncoder stable
-          if [[ "${FLATPAK_SIGN:-0}" == "1" ]]; then
-            # Publicar la clave pública junto al repo (Pages) para que los
-            # usuarios puedan importarla; también se adjunta al release.
-            gpg --batch --homedir "$GNUPGHOME" --armor --export "$FLATPAK_GPG_KEY_ID" > flatpak-repo/draggy-encoder.gpg
-            cp flatpak-repo/draggy-encoder.gpg draggy-encoder.gpg
-            test -s flatpak-repo/summary.sig
-          fi
-
-      # Instala el .flatpak recién construido y ejecuta el selftest DENTRO
-      # del sandbox. El selftest del bundle directo (paso anterior) corre en
-      # el runner con las Qt libs del sistema; este detecta regresiones de
-      # empaquetado que solo se ven en el entorno Flatpak (runtime sin GL,
-      # imports rotos, wrapper roto, data dir no escribible, etc.).
-      - name: Smoke test the Flatpak bundle (install + --selftest)
-        shell: bash
-        run: |
-          set -euo pipefail
-          version="${GITHUB_REF_NAME#v}"
-          if [[ "$GITHUB_REF" != refs/tags/v* ]]; then version="1"; fi
-          bundle="DraggyEncoder-Linux-x86_64-${version}.flatpak"
-          test -s "$bundle"
-
-          flatpak install --user --noninteractive "$bundle"
-
-          # Qt offscreen necesita libEGL/libGL; el rasterizador software
-          # (llvmpipe) vive en la extensión GL del runtime, no en la base.
-          flatpak install --user --noninteractive flathub org.freedesktop.Platform.GL.default//24.08
-
-          # Forzamos un data dir legible desde el host (el flatpak-wrapper
-          # respeta DRAGGY_DATA_DIR) para poder revisar selftest.log después.
-          datadir="$RUNNER_TEMP/flatpak-selftest-data"
-          rm -rf "$datadir"
-          mkdir -p "$datadir"
-          flatpak run \
-            --env=QT_QPA_PLATFORM=offscreen \
-            --env=LIBGL_ALWAYS_SOFTWARE=1 \
-            --env=DRAGGY_DATA_DIR="$datadir" \
-            com.draggyencoder.DraggyEncoder --selftest
-
-          log="$datadir/bin/logs/selftest.log"
-          test -s "$log"
-          cat "$log"
-          grep -Fq "SELFTEST PASS" "$log"
-          for line in \
-            "OK   QApplication offscreen" \
-            "OK   MainWindow offscreen" \
-            "OK   DependenciesDialog offscreen"; do
-            grep -Fq "$line" "$log" \
-              || { echo "Falta en selftest.log: $line" >&2; exit 1; }
-          done
-
-      # En un push se conserva solo el bundle portable. Las variantes .deb,
-      # .rpm, AppImage y .flatpak se adjuntan todas a la Release de una tag;
-      # duplicarlas aquí es lo que agotaba la cuota compartida de artifacts.
-      # En tags no se crea artifact: la Release es la descarga permanente.
+      # Los pushes suben SOLO el instalador de Windows (ver build-installer.yml):
+      # la cuota de artifacts es de 500 MB en el plan Free y el medidor de
+      # GitHub tarda 6-12 h en recalcularse, así que dos o tres pushes seguidos
+      # subiendo además el tar.gz agotaban la cuota y la subida fallaba. El
+      # tar.gz portable se sube en ejecuciones manuales (workflow_dispatch); en
+      # tags no se crea artifact: la Release es la descarga permanente.
       - name: Upload Linux portable artifact
         id: upload_linux_artifact
-        if: always() && (github.event_name == 'workflow_dispatch' || !startsWith(github.ref, 'refs/tags/v')) && hashFiles('DraggyEncoder-Linux-x86_64-*.tar.gz') != ''
+        if: always() && github.event_name == 'workflow_dispatch' && hashFiles('DraggyEncoder-Linux-x86_64-*.tar.gz') != ''
         uses: actions/upload-artifact@v7
         with:
           name: DraggyEncoder-Linux-packages
@@ -615,130 +362,11 @@ jobs:
         run: |
           echo "::warning::No se pudo subir DraggyEncoder-Linux-packages porque la cuota de GitHub Actions está agotada. Ejecuta Manage GitHub Actions artifacts en modo delete, espera el recálculo de GitHub (6-12 h) y relanza el workflow."
 
-      - name: Prepare Flatpak repository for GitHub Pages
-        if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
-        shell: bash
-        run: touch flatpak-repo/.nojekyll
-
-      - name: Upload Flatpak repository to Pages
-        id: upload_pages_artifact
-        if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
-        uses: actions/upload-pages-artifact@v5
-        with:
-          path: flatpak-repo
-          retention-days: 1
-          # upload-pages-artifact@v5 excluye los dotfiles por defecto;
-          # sin .nojekyll GitHub Pages procesaría el repo con Jekyll y
-          # rompería la estructura del repo Flatpak (refs/objects/summary).
-          include-hidden-files: true
-        # Pages es un destino opcional. Si la cuota de artifacts está llena,
-        # no debe convertir un paquete/release válido en un build fallido.
-        continue-on-error: true
-
-      - name: Report Pages artifact quota issue
-        if: steps.upload_pages_artifact.outcome == 'failure'
-        shell: bash
-        run: |
-          echo "::warning::No se pudo preparar el repositorio Flatpak para Pages porque la cuota de GitHub Actions está agotada. La Release se publicará; limpia artifacts y relanza para actualizar Pages."
-
       - name: Attach Linux packages to release
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v3
         with:
           files: |
             DraggyEncoder-Linux-x86_64-*.tar.gz
-            DraggyEncoder-Linux-x86_64-*.deb
-            DraggyEncoder-Linux-x86_64-*.rpm
             DraggyEncoder-Linux-x86_64-*.AppImage
-            DraggyEncoder-Linux-x86_64-*.flatpak
             screenshots/*.png
-
-      # La clave pública se publica también junto al .flatpak en el release,
-      # además de en el repo OSTree de Pages.
-      - name: Attach Flatpak GPG signing key to release
-        if: startsWith(github.ref, 'refs/tags/v') && env.FLATPAK_SIGN == '1'
-        uses: softprops/action-gh-release@v3
-        with:
-          files: draggy-encoder.gpg
-
-  publish-flatpak-repository:
-    name: Publish Flatpak repository
-    needs: build-linux
-    if: (startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch') && needs.build-linux.outputs.pages_artifact_uploaded == 'true'
-    runs-on: ubuntu-latest
-    permissions:
-      actions: write
-      pages: write
-      id-token: write
-    environment:
-      name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
-    steps:
-      # deploy-pages@v5 falla con un críptico "404 Failed to create
-      # deployment" si Pages no está activado o su fuente no es
-      # "GitHub Actions". Este paso comprueba ambas cosas ANTES y falla
-      # con un mensaje accionable. No se puede auto-activar con el
-      # GITHUB_TOKEN (la API lo rechaza), así que el fix es manual.
-      - name: Check GitHub Pages is enabled
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          pages_settings="https://github.com/$GITHUB_REPOSITORY/settings/pages"
-          resp="$(gh api "repos/$GITHUB_REPOSITORY/pages" 2>&1)" || {
-            echo "::error::GitHub Pages no está activado en este repositorio (la API respondió 404)." >&2
-            echo "::error::Actívalo en $pages_settings" >&2
-            echo "::error::y en 'Build and deployment > Source' elige 'GitHub Actions'." >&2
-            echo "::error::(En repos privados, Pages requiere un plan de pago.)" >&2
-            exit 1
-          }
-          build_type="$(printf '%s' "$resp" | jq -r '.build_type // empty')"
-          if [ "$build_type" != "workflow" ]; then
-            echo "::error::GitHub Pages está activado pero su fuente no es 'GitHub Actions' (build_type=$build_type)." >&2
-            echo "::error::Cámbiala en $pages_settings a 'GitHub Actions'." >&2
-            exit 1
-          fi
-          echo "GitHub Pages OK (fuente: GitHub Actions)"
-
-      - name: Deploy Flatpak repository to GitHub Pages
-        id: deployment
-        uses: actions/deploy-pages@v5
-
-      # Después de un deploy correcto el artifact github-pages ya no es
-      # necesario. Eliminarlo reduce la cuota de Actions sin tocar el sitio
-      # publicado ni los assets de Releases.
-      - name: Remove deployed Pages staging artifact
-        if: success()
-        uses: actions/github-script@v8
-        with:
-          script: |
-            const artifacts = await github.paginate(
-              github.rest.actions.listArtifactsForRepo,
-              {
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                per_page: 100,
-              },
-            );
-            for (const artifact of artifacts) {
-              if (artifact.name !== 'github-pages') continue;
-              const runId = artifact.workflow_run && artifact.workflow_run.id;
-              if (runId && Number(runId) !== Number(context.runId)) continue;
-              try {
-                await github.rest.actions.deleteArtifact({
-                  owner: context.repo.owner,
-                  repo: context.repo.repo,
-                  artifact_id: artifact.id,
-                });
-                core.info(`Removed deployed Pages artifact ${artifact.id}`);
-              } catch (error) {
-                if (error.status === 404) {
-                  core.info(`Pages artifact ${artifact.id} was already removed`);
-                } else {
-                  throw error;
-                }
-              }
-            }
-
-

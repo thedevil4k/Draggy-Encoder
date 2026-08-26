@@ -3832,7 +3832,7 @@ def test_generate_preview_runs_the_real_ai_chain(nvenc_clip):
 
     ffmpeg, src, tmp = nvenc_clip
     engine = _FakeEngine("preview-engine", 1)
-    original, processed = generate_preview(
+    original, processed, artifacts = generate_preview(
         ffmpeg,
         src,
         {
@@ -3849,6 +3849,115 @@ def test_generate_preview_runs_the_real_ai_chain(nvenc_clip):
     assert original.startswith(b"\xff\xd8")
     assert processed.startswith(b"\xff\xd8")
     assert engine.order_log, "the preview never called the AI engine"
+    # Artefactos persistentes para el selector de frame del diálogo.
+    assert artifacts
+    assert os.path.isfile(artifacts["compressed_clip"])
+    assert artifacts["source"] == src
+    assert artifacts["duration"] > 0
+    assert 0 <= artifacts["time"] <= artifacts["duration"]
+    shutil.rmtree(artifacts["dir"], ignore_errors=True)
+
+
+def test_generate_preview_honors_preview_time(nvenc_clip):
+    """preview_time centra el clip y extrae EXACTAMENTE ese frame en vez
+    del frame aleatorio por defecto."""
+    from src.processing.pipeline import generate_preview
+
+    ffmpeg, src, tmp = nvenc_clip
+    target = 0.7  # dentro del clip de 1 s
+    original, processed, artifacts = generate_preview(
+        ffmpeg,
+        src,
+        {
+            "audio": "noaudio",
+            "format": "mp4",
+            "codec": "h264_nvenc",
+            "preset": "p5",
+            "bitrate": "800",
+            "pixel_format": "yuv420p",
+            "resolution": "original",
+            "preview_time": target,
+        },
+    )
+    assert original.startswith(b"\xff\xd8")
+    assert processed.startswith(b"\xff\xd8")
+    # El instante comparado es el pedido, no un frame aleatorio.
+    assert abs(artifacts["time"] - target) < 0.2
+    # El clip de 5 s está centrado (recortado) en el instante pedido.
+    assert abs((artifacts["clip_start"] + artifacts["clip_length"] / 2) - target) < 1.0
+    shutil.rmtree(artifacts["dir"], ignore_errors=True)
+
+
+def test_cleanup_preview_artifacts_removes_dir(tmp_path):
+    """_cleanup_preview_artifacts elimina el directorio de artefactos tras
+    cerrar el diálogo; tolerante a None y a directorios inexistentes."""
+    from src.ui.main_window import _cleanup_preview_artifacts
+
+    d = tmp_path / "artifacts"
+    d.mkdir()
+    (d / "clip.mp4").write_bytes(b"x")
+    artifacts = {"dir": str(d), "compressed_clip": str(d / "clip.mp4")}
+    _cleanup_preview_artifacts(artifacts)
+    assert not d.exists()
+
+    _cleanup_preview_artifacts(None)
+    _cleanup_preview_artifacts({"dir": str(tmp_path / "nope")})
+
+
+def test_preview_time_field_parsed_into_settings(qapp, monkeypatch):
+    """El campo 'Frame at' de la barra inferior se parsea a segundos en
+    settings['preview_time']; un valor inválido no bloquea el preview."""
+    from PySide6.QtWidgets import QLineEdit
+    from src.ui.main_window import MainWindow
+
+    mw = MainWindow.__new__(MainWindow)
+    _ui_button_stub(mw)
+    mw.input_path = "/tmp/video.mp4"
+    mw.worker = None
+    mw.preview_worker = None
+    mw._maybe_ffmpeg_health_check = lambda: True
+    mw._remember_runtime_prefs = lambda s: None
+    launched = []
+    mw._run_preview_worker = (
+        lambda settings, ai_engines=None: launched.append(settings)
+    )
+    messages = []
+    mw._on_status_message = messages.append
+
+    class _SettingsPanel:
+        def get_settings(self):
+            return {"codec": "h264_nvenc"}
+
+    class _Workflow:
+        def get_pipeline(self):
+            return ["Import", "Compress"]
+
+        def get_selected_engines(self):
+            return {}
+
+    mw.settings_panel = _SettingsPanel()
+    mw.workflow = _Workflow()
+    monkeypatch.setattr("src.ui.main_window.persist_last_job", lambda **k: None)
+
+    # Valor válido HH:MM:SS -> 90 segundos.
+    mw.preview_time_edit = QLineEdit("00:01:30")
+    mw._preview()
+    assert launched, "el preview debería haberse lanzado"
+    assert launched[0].get("preview_time") == 90.0
+
+    # Vacío -> sin preview_time (comportamiento aleatorio por defecto).
+    launched.clear()
+    mw.preview_time_edit = QLineEdit("")
+    mw._preview()
+    assert "preview_time" not in launched[0]
+
+    # Valor inválido -> se ignora con aviso, no bloquea.
+    launched.clear()
+    mw.preview_time_edit = QLineEdit("not-a-time")
+    mw._preview()
+    assert launched
+    assert "preview_time" not in launched[0]
+    assert messages and "ignored" in messages[-1]
 
 
 def test_compress_video_with_ai_chain_order_and_scale(nvenc_clip):
@@ -4581,6 +4690,7 @@ def test_preview_launches_while_main_render_running(qapp, monkeypatch):
     mw.input_path = "/tmp/video.mp4"
     mw.worker = _FakeRunningWorker(running=True)
     mw.preview_worker = None
+    mw.preview_time_edit = type("E", (), {"text": lambda self: "", "setText": lambda self, t: None})()
     mw._maybe_ffmpeg_health_check = lambda: True
     mw._remember_runtime_prefs = lambda s: None
     launched = []

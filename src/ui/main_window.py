@@ -1,7 +1,8 @@
 import logging
 import os
-import threading
+import shutil
 import tempfile
+import threading
 import time
 
 from PySide6.QtCore import QThread, QTimer, Qt, Signal
@@ -12,6 +13,7 @@ from PySide6.QtWidgets import (
     QFrame,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QMainWindow,
     QMenu,
     QMessageBox,
@@ -59,9 +61,27 @@ from src.ui.preferences_dialog import (
     _format_duration as _fmt_dur,
 )
 from src.ui.workflow_widget import WorkflowWidget, video_paths_from_mime
-from src.utils.helpers import is_windows_elevated, detect_linux_container
+from src.utils.helpers import is_windows_elevated, detect_linux_container, parse_time_to_seconds
 
 logger = logging.getLogger(__name__)
+
+
+def _cleanup_preview_artifacts(artifacts):
+    """Borra el directorio de artefactos del preview tras cerrar el diálogo.
+
+    ``generate_preview`` persiste el clip comprimido en un ``mkdtemp`` para
+    que el PreviewDialog pueda re-extraer frames sin recodificar. Este helper
+    elimina ese directorio de forma best-effort (los artefactos viven en el
+    directorio temporal del sistema; un fallo sólo deja basura temporal).
+    """
+    if not artifacts:
+        return
+    try:
+        artifacts_dir = artifacts.get("dir")
+        if artifacts_dir and os.path.isdir(artifacts_dir):
+            shutil.rmtree(artifacts_dir, ignore_errors=True)
+    except Exception:
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -167,6 +187,7 @@ class CompressionWorker(QThread):
         self.error_message = ""
         self.preview_original = None
         self.preview_compressed = None
+        self.preview_artifacts = None
         self._procs = []
         self.supervisor = ProcessSupervisor()
 
@@ -255,7 +276,7 @@ class CompressionWorker(QThread):
                     )
                 else:
                     status_cb("AI preview: rendering the selected chain...")
-                    self.preview_original, self.preview_compressed = generate_preview(
+                    self.preview_original, self.preview_compressed, self.preview_artifacts = generate_preview(
                         self.ffmpeg_path,
                         self.input_path,
                         self.settings,
@@ -287,7 +308,7 @@ class CompressionWorker(QThread):
                     supervisor=self.supervisor,
                 )
             elif self.mode == "preview":
-                self.preview_original, self.preview_compressed = generate_preview(
+                self.preview_original, self.preview_compressed, self.preview_artifacts = generate_preview(
                     self.ffmpeg_path,
                     self.input_path,
                     self.settings,
@@ -896,6 +917,18 @@ class MainWindow(QMainWindow):
         self.btn_compress.clicked.connect(self._compress)
         self.btn_preview = QPushButton("Preview")
         self.btn_preview.clicked.connect(self._preview)
+        # Campo opcional: instante exacto a comparar en el preview
+        # (HH:MM:SS o MM:SS o segundos). Vacío = frame aleatorio.
+        self.preview_time_label = QLabel("Frame at")
+        self.preview_time_label.setStyleSheet("color: #a0a0b0; font-size: 11px;")
+        self.preview_time_edit = QLineEdit()
+        self.preview_time_edit.setPlaceholderText("auto")
+        self.preview_time_edit.setToolTip(
+            "Preview frame instant (HH:MM:SS, MM:SS or seconds).\n"
+            "Empty = random frame. You can still scrub the time in the dialog."
+        )
+        self.preview_time_edit.setFixedWidth(90)
+        self.preview_time_edit.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.btn_add_queue = QPushButton("Add to queue")
         self.btn_add_queue.setToolTip(
             "Queue this render (video + AI chain + settings).\n"
@@ -911,6 +944,8 @@ class MainWindow(QMainWindow):
 
         bottom_layout.addWidget(self.btn_compress)
         bottom_layout.addWidget(self.btn_preview)
+        bottom_layout.addWidget(self.preview_time_label)
+        bottom_layout.addWidget(self.preview_time_edit)
         bottom_layout.addWidget(self.btn_add_queue)
         bottom_layout.addWidget(self.btn_abort)
         layout.addLayout(bottom_layout)
@@ -2249,6 +2284,17 @@ class MainWindow(QMainWindow):
         settings = self.settings_panel.get_settings()
         settings["pipeline_order"] = self.workflow.get_pipeline()
         self._remember_runtime_prefs(settings)
+        # Instante exacto opcional del campo "Frame at". Vacío = aleatorio.
+        # Se valida aquí; un valor inválido no bloquea el preview (cae a
+        # aleatorio) pero sí avisa para que el usuario corrija el formato.
+        preview_time_text = self.preview_time_edit.text().strip()
+        if preview_time_text:
+            try:
+                settings["preview_time"] = parse_time_to_seconds(preview_time_text)
+            except Exception:
+                self._on_status_message(
+                    "Preview frame time ignored (use HH:MM:SS, MM:SS or seconds)."
+                )
         # Idem: la preview también cuenta como "último job" para que el
         # proposal ofrezca re-ejecutarla tras updates.
         ai_engines = self.workflow.get_selected_engines()
@@ -2379,11 +2425,13 @@ class MainWindow(QMainWindow):
         main_running = (
             getattr(self, "worker", None) is not None and self.worker.isRunning()
         )
+        artifacts = getattr(worker, "preview_artifacts", None)
         if not main_running:
             self.progress.setValue(100 if worker.success else 0)
             self.progress.setFormat("%p%")
         if aborted:
             self.status_label.setText("Preview aborted.")
+            _cleanup_preview_artifacts(artifacts)
             return
         if (
             not worker.success
@@ -2395,6 +2443,7 @@ class MainWindow(QMainWindow):
                 self, "Preview Error",
                 "Could not generate preview frames. Check FFmpeg and the input video.",
             )
+            _cleanup_preview_artifacts(artifacts)
             return
         self.status_label.setText("Preview ready.")
         # Pixmaps construidos en el hilo principal (regla Qt).
@@ -2405,14 +2454,17 @@ class MainWindow(QMainWindow):
         if original_pixmap.isNull() or compressed_pixmap.isNull():
             self.status_label.setText("Preview failed: could not load frames.")
             QMessageBox.critical(self, "Preview Error", "Could not load preview frames.")
+            _cleanup_preview_artifacts(artifacts)
             return
         dialog = PreviewDialog(
             original_pixmap,
             compressed_pixmap,
             "Original (left) vs Compressed (right). Use the slider to compare.",
             self,
+            artifacts=artifacts,
         )
         dialog.exec()
+        _cleanup_preview_artifacts(artifacts)
 
     def _run_worker(self, output_path, settings, mode, ai_engines=None, input_path=None,
                     queue_id=None):
@@ -2845,12 +2897,15 @@ class MainWindow(QMainWindow):
                         opm.loadFromData(worker.preview_original, "JPG")
                         cpm.loadFromData(worker.preview_compressed, "JPG")
                         if not opm.isNull() and not cpm.isNull():
+                            artifacts = getattr(worker, "preview_artifacts", None)
                             dlg = PreviewDialog(
                                 opm, cpm,
                                 "Original (left) vs Compressed (right). Use the slider to compare.",
                                 self,
+                                artifacts=artifacts,
                             )
                             dlg.exec()
+                            _cleanup_preview_artifacts(artifacts)
                 except Exception:
                     pass
 
@@ -2955,13 +3010,16 @@ class MainWindow(QMainWindow):
                 self.status_label.setText("Preview failed: could not load frames.")
                 QMessageBox.critical(self, "Preview Error", "Could not load preview frames.")
                 return
+            artifacts = getattr(worker, "preview_artifacts", None)
             dialog = PreviewDialog(
                 original_pixmap,
                 compressed_pixmap,
                 "Original (left) vs Compressed (right). Use the slider to compare.",
                 self,
+                artifacts=artifacts,
             )
             dialog.exec()
+            _cleanup_preview_artifacts(artifacts)
 
     def _abort(self):
         """User clicked the Abort button.

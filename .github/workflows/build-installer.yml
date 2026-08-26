@@ -33,12 +33,20 @@ jobs:
       # La cuota es compartida por Linux, Windows y Pages. Eliminamos todos
       # los artifacts temporales conocidos de ejecuciones terminadas antes de
       # compilar; los assets de Releases no se tocan.
+      #
+      # Cada workflow de empaquetado limpia TODO lo que conozca (Installer,
+      # paquetes Linux y repo Flatpak de Pages), no solo sus propios
+      # artefactos: una sola ejecución deja la cuota al mínimo y evita que se
+      # acumulen artefactos huérfanos de la otra plataforma. Los assets de
+      # Releases y el github-pages de la ejecución actual nunca se tocan.
       - name: Prune stale packaging artifacts
         uses: actions/github-script@v8
         with:
           script: |
             const names = new Set([
               'DraggyEncoder-Installer',
+              'DraggyEncoder-Linux-packages',
+              'github-pages',
             ]);
             const artifacts = await github.paginate(
               github.rest.actions.listArtifactsForRepo,

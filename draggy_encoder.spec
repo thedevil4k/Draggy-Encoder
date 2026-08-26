@@ -11,9 +11,9 @@ Windows o runtime-python/bin/python3.13 en Linux; ver
 src/runtimes/manager.py:_pip_python).
 
 El directorio de salida (dist/DraggyEncoder) se copia completo por el
-instalador o se empaqueta como tar.gz, .deb y AppImage en Linux. Los bundles
+instalador o se empaqueta como tar.gz y AppImage en Linux. Los bundles
 portables escriben sus datos de sesión (bin/, personal/) junto al ejecutable;
-los lanzadores de .deb/AppImage redirigen esos datos al perfil del usuario.
+los lanzadores de AppImage redirigen esos datos al perfil del usuario.
 """
 
 # Los imports de torch/onnxruntime/safetensors en el código son perezosos
