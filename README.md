@@ -92,6 +92,20 @@ GitHub Actions publishes these platform-specific artifacts:
 
 The Linux archive is portable: extract it and run `./DraggyEncoder/DraggyEncoder`.
 The AppImage can be marked executable and launched from the file manager.
+
+### Downloads — latest build
+
+After every push to `main`, the rolling **Latest build** release is updated, so
+these links always point to the newest build without waiting for a version tag:
+
+- **Windows installer** (Inno Setup):
+  [DraggyEncoder-Setup-1.exe](https://github.com/thedevil4k/Draggy-Encoder/releases/latest/download/DraggyEncoder-Setup-1.exe)
+- **Linux AppImage**:
+  [DraggyEncoder-Linux-x86_64-1.AppImage](https://github.com/thedevil4k/Draggy-Encoder/releases/latest/download/DraggyEncoder-Linux-x86_64-1.AppImage)
+
+The portable Linux `tar.gz` is attached to tagged releases (`v*`) and to manual
+workflow runs (`workflow_dispatch`).
+
 Installed Linux formats store writable data under
 `${XDG_DATA_HOME:-~/.local/share}/draggy-encoder` so `/opt` and a read-only
 AppImage mount are never modified. The first launch downloads FFmpeg, AI
