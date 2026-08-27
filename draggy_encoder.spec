@@ -1,5 +1,7 @@
 # -*- mode: python ; coding: utf-8 -*-
 import os
+import sys
+import importlib.util
 
 """Spec de PyInstaller para Draggy Encoder (Windows/Linux, ventana sin consola).
 
@@ -39,14 +41,42 @@ excludes = [
     "boto3", "botocore", "s3transfer",
     "google", "authlib", "cryptography",
     "gradio", "duckdb", "pyarrow",
+    # Pesados/irrelevantes que el barrido de stdlib de abajo encontraría
+    "test", "idlelib", "turtledemo", "turtle",
 ]
+
+# El bundle es el ANFITRIÓN de los runtimes de IA: torch/onnxruntime (y su
+# árbol: numpy, sympy, networkx...) se instalan a demanda en
+# bin/runtimes/ai_modules y se importan DESDE este proceso congelado (ver
+# src/runtimes/manager.py). Esos paquetes importan módulos de la stdlib que
+# el análisis estático de NUESTRO código nunca ve, y el fallo solo aparece
+# en el equipo del usuario al importar el runtime ya instalado. Caso real:
+# torch >= 2.9 importa `timeit` desde torch._strobelight -> "No module named
+# 'timeit'" y toda la IA queda desactivada con la instalación completa.
+#
+# Solución: incluir la stdlib pública completa (unos MB) para que cualquier
+# import diferido de los runtimes resuelva. Lo excluido explícitamente
+# (tkinter, test, ...) y los módulos privados de la stdlib no vuelven por
+# esta vía; los privados que hacen falta los arrastra el análisis de cada
+# módulo público incluido.
+_STDLIB_SKIP = {
+    "__main__", "antigravity", "this", "site", "sitecustomize", "usercustomize",
+}
+stdlib_hiddenimports = sorted(
+    name
+    for name in sys.stdlib_module_names
+    if not name.startswith("_")
+    and name not in _STDLIB_SKIP
+    and name not in set(excludes)
+    and importlib.util.find_spec(name) is not None
+)
 
 a = Analysis(
     ["main.py"],
     pathex=[],
     binaries=[],
     datas=[("assets", "assets")],
-    hiddenimports=[],
+    hiddenimports=stdlib_hiddenimports,
     hookspath=[],
     runtime_hooks=[],
     excludes=excludes,

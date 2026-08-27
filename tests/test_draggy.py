@@ -875,7 +875,10 @@ def test_runtime_version_is_read_only_from_private_store(tmp_path, monkeypatch):
     dist = os.path.join(store, "torch-9.9.9.dist-info")
     os.makedirs(dist)
     with open(os.path.join(dist, "METADATA"), "w", encoding="utf-8") as fh:
-        fh.write("Metadata-Version: 2.1\\nName: torch\\nVersion: 9.9.9\\n")
+        # Salto de línea REAL (\n): importlib.metadata parsea el METADATA
+        # como mensaje email; con '\\n' literal toda la línea sería un solo
+        # header "Metadata-Version" y Name/Version no existirían.
+        fh.write("Metadata-Version: 2.1\nName: torch\nVersion: 9.9.9\n")
     assert rm._version_of("torch") == "9.9.9"
 
 
@@ -5234,16 +5237,26 @@ class _FakeORT:
 def test_onnx_input_channels_ok_three_state_semantics(monkeypatch):
     """El probe devuelve True (3ch), False (fijo != 3) o None (no se pudo
     verificar: onnxruntime ausente). None NO debe borrar archivos."""
-    import sys
+    import src.ai.inference as inference
     from src.ai.inference import _onnx_input_channels_ok
 
-    monkeypatch.setitem(sys.modules, "onnxruntime", _FakeORT((1, 3, 64, 64)))
+    # El probe obtiene ORT a través de la frontera import_local_runtime
+    # (solo módulos del store privado), que rechaza lo que llegue por
+    # sys.modules: el fake se inyecta en la frontera, no en sys.modules.
+    monkeypatch.setattr(
+        inference, "import_local_runtime", lambda name: _FakeORT((1, 3, 64, 64))
+    )
     assert _onnx_input_channels_ok("x.onnx") is True
 
-    monkeypatch.setitem(sys.modules, "onnxruntime", _FakeORT((1, 12, 64, 64)))
+    monkeypatch.setattr(
+        inference, "import_local_runtime", lambda name: _FakeORT((1, 12, 64, 64))
+    )
     assert _onnx_input_channels_ok("x.onnx") is False
 
-    monkeypatch.setitem(sys.modules, "onnxruntime", None)
+    def _sin_runtime(name):
+        raise ImportError("onnxruntime is not installed in the private store")
+
+    monkeypatch.setattr(inference, "import_local_runtime", _sin_runtime)
     assert _onnx_input_channels_ok("x.onnx") is None
 
 
@@ -5269,14 +5282,23 @@ def test_convert_pth_to_onnx_ex_keeps_unverifiable_existing_onnx(tmp_path, monke
 def test_convert_pth_to_onnx_ex_removes_proven_bad_existing_onnx(tmp_path, monkeypatch):
     """Solo cuando el probe PRUEBA que el .onnx es de canales != 3 se borra
     (y si torch no está, la reconversión falla sin dejar archivos)."""
-    import sys
+    import src.ai.inference as inference
     from src.ai.inference import convert_pth_to_onnx_ex
 
     pth = tmp_path / "model.pth"
     pth.write_bytes(b"x")
     onnx = tmp_path / "model.onnx"
     onnx.write_bytes(b"x")
-    monkeypatch.setitem(sys.modules, "onnxruntime", _FakeORT((1, 12, 64, 64)))
+
+    # ORT (fake) prueba canales != 3 -> borra el .onnx y re-convierte; torch
+    # no está en el store de este entorno de test, así que la reconversión
+    # falla sin dejar archivos.
+    def _fake_runtime(name):
+        if name == "onnxruntime":
+            return _FakeORT((1, 12, 64, 64))
+        raise ImportError(f"{name} is not installed in the private store")
+
+    monkeypatch.setattr(inference, "import_local_runtime", _fake_runtime)
 
     path, err = convert_pth_to_onnx_ex(str(pth))
     assert path is None
@@ -6233,7 +6255,10 @@ def test_ai_rendered_bitrate_is_hidden_without_active_ai_and_shown_when_active()
     workflow.middle_steps[1].active = True
     MainWindow._update_ai_rendered_bitrate(obj)
     assert settings.value.startswith("AI Rendered bitrate:")
-    assert "4,000" in settings.value
+    # Interp activo duplica los FPS: la estimación dobla el bitrate base
+    # (4.000 -> ~8.000) aunque Upscale siga inactivo, y lo etiqueta.
+    assert "8,000" in settings.value
+    assert "2x FPS" in settings.value
 
 
 def test_run_ffmpeg_reports_machine_progress_incrementally(monkeypatch):

@@ -207,6 +207,24 @@ def run_selftest() -> int:
             report(f"  FAIL import {mod}:")
             report("  " + traceback.format_exc().strip().replace("\n", "\n  "))
 
+    # El bundle es el anfitrión de los runtimes instalados a demanda
+    # (torch/onnxruntime y su árbol de dependencias, ver
+    # draggy_encoder.spec): esos paquetes importan stdlib que nuestro código
+    # no usa y, si el spec se la deja fuera, torch no importa en el equipo
+    # del usuario aunque pip haya instalado todo (caso real: "No module
+    # named 'timeit'" desde torch._strobelight). Esta sonda falla alto en CI
+    # si el spec deja caer de nuevo un módulo necesario.
+    for mod in ("timeit", "struct", "zoneinfo", "cProfile", "optparse",
+                "pickletools", "graphlib", "wave", "trace", "modulefinder",
+                "pstats"):
+        try:
+            importlib.import_module(mod)
+            report(f"  OK   stdlib {mod}")
+        except Exception:
+            ok = False
+            report(f"  FAIL stdlib {mod}:")
+            report("  " + traceback.format_exc().strip().replace("\n", "\n  "))
+
     # Validar Qt offscreen, MainWindow y DependenciesDialog con el mismo
     # bucle que capture_screenshots.py (run_ui_checks en src/qt_check.py):
     # es la comprobación más fuerte que el simple import y detecta la falta
