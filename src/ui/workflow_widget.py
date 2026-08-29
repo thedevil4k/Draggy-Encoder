@@ -720,6 +720,30 @@ class AIWorkflowStep(QFrame):
 
             for mp in sorted(model_paths):
                 fname = os.path.basename(mp)
+                # Skip non-weight files (README.md, etc.)
+                if not fname.lower().endswith(tuple(_WEIGHT_EXTS)):
+                    continue
+
+                # Check channel count for .pth/.pt/.safetensors files.
+                # Models with != 3 input channels are incompatible with the
+                # BGR pipeline and will always fail to load. Skip them from
+                # the dropdown so the user can't select them.
+                _skip = False
+                if fname.lower().endswith((".pth", ".pt", ".safetensors")):
+                    try:
+                        from src.ai.inference import _pth_channel_count
+                        _ch = _pth_channel_count(mp)
+                        if _ch is not None and _ch != 3:
+                            logger.debug(
+                                "Skipping incompatible model %s (%d channels)",
+                                fname, _ch,
+                            )
+                            _skip = True
+                    except Exception:
+                        pass
+                if _skip:
+                    continue
+
                 # Extract scale from filename: x2, x3, x4, x8, 4x, 2x, etc.
                 # Cubre nombres reales del ecosistema: "x4plus", "x4v3",
                 # "realesr-animevideov3-x4", "4x-UltraSharp", "Real_CUGAN_x2".

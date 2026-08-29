@@ -114,6 +114,32 @@ def load_checkpoint_state_dict(path: str):
         return torch.load(path, map_location="cpu", weights_only=False)
 
 
+def _pth_channel_count(pth_path: str) -> Optional[int]:
+    """Peek at the first Conv2d input channels of a .pth checkpoint.
+
+    Returns the channel count, or None if it can't be determined.
+    This is a lightweight check — it loads the state_dict but doesn't
+    build the model. Used by the workflow widget to skip incompatible
+    models (e.g. 12-channel RRDBNet) that would always fail to load.
+    """
+    try:
+        torch = import_local_runtime("torch")
+        sd = load_checkpoint_state_dict(pth_path)
+        if not isinstance(sd, dict):
+            return None
+        # Unwrap common checkpoint wrappers (params_ema, params, state_dict)
+        for wrapper_key in ("params_ema", "params", "state_dict"):
+            if wrapper_key in sd and isinstance(sd[wrapper_key], dict):
+                sd = sd[wrapper_key]
+                break
+        for key in ("conv_first.weight", "body.0.weight", "input.weight"):
+            if key in sd:
+                return int(sd[key].shape[1])
+        return 3  # default assumption
+    except Exception:
+        return None
+
+
 class AIInferenceEngine:
     """Clase base abstracta para motores de inferencia.
 
@@ -958,6 +984,39 @@ def convert_pth_to_onnx_ex(pth_path: str) -> tuple[Optional[str], str]:
 
 # Extensiones de pesos PyTorch que el pipeline puede cargar directamente.
 _TORCH_WEIGHT_EXTS = (".safetensors", ".bin", ".pth", ".pt")
+
+
+def list_weight_files(model_dir: str, recursive: bool = True) -> list[str]:
+    """List all weight files (.pth, .pt, .safetensors, .bin) in a directory.
+
+    Returns paths sorted by depth (shallow first) then alphabetically.
+    Used by the fallback logic to try alternative weight files when
+    the first choice has incompatible channel count.
+    """
+    if not model_dir or not os.path.isdir(model_dir):
+        return []
+    results: list[tuple[int, str]] = []
+    if recursive:
+        try:
+            for root, dirs, files in os.walk(model_dir):
+                dirs[:] = [d for d in dirs if not d.startswith(".") and d != "__pycache__"]
+                depth = root[len(model_dir):].count(os.sep)
+                for fname in files:
+                    if fname.lower().endswith(_TORCH_WEIGHT_EXTS):
+                        results.append((depth, os.path.join(root, fname)))
+        except OSError:
+            pass
+    else:
+        try:
+            results = [
+                (0, os.path.join(model_dir, fname))
+                for fname in os.listdir(model_dir)
+                if fname.lower().endswith(_TORCH_WEIGHT_EXTS)
+            ]
+        except OSError:
+            pass
+    results.sort(key=lambda c: (c[0], c[1].lower()))
+    return [path for _, path in results]
 
 
 def pick_weight_file(model_dir: str, engine_id: str,

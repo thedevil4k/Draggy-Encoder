@@ -507,6 +507,40 @@ class CompressionWorker(QThread):
                                 "Backend forced to PyTorch but PyTorch is not installed."
                             )
 
+                # --- Fallback: try other weight files in the same directory ---
+                # When the selected weight file fails (e.g. 12-channel model),
+                # scan the engine directory for other .pth/.safetensors files
+                # and try each one until one loads successfully.
+                if inference_engine is None or not getattr(inference_engine, "is_loaded", False):
+                    if pth_path and is_torch_available():
+                        from src.ai.inference import list_weight_files, _pth_channel_count
+                        engine_dir = os.path.dirname(pth_path)
+                        for alt_path in list_weight_files(engine_dir, recursive=False):
+                            if alt_path == pth_path:
+                                continue
+                            # Skip files with wrong channel count
+                            _ch = _pth_channel_count(alt_path)
+                            if _ch is not None and _ch != 3:
+                                logger.debug(
+                                    "Fallback: skipping %s (%d channels)",
+                                    os.path.basename(alt_path), _ch,
+                                )
+                                continue
+                            try:
+                                inference_engine = create_inference_engine("torch", alt_path)
+                                if inference_engine and getattr(inference_engine, "is_loaded", False):
+                                    logger.info(
+                                        "Fallback: loaded %s instead of %s",
+                                        os.path.basename(alt_path), os.path.basename(pth_path),
+                                    )
+                                    break
+                                inference_engine = None
+                            except Exception as exc:
+                                logger.debug(
+                                    "Fallback: %s failed: %s", os.path.basename(alt_path), exc,
+                                )
+                                inference_engine = None
+
                 if inference_engine is None or not getattr(inference_engine, "is_loaded", False):
                     detail = " | ".join(node_errors) if node_errors else "No model weights found."
                     hint = ""
@@ -2438,10 +2472,11 @@ class MainWindow(QMainWindow):
             or not worker.preview_original
             or not worker.preview_compressed
         ):
+            error_detail = worker.error_message or "Could not generate preview frames. Check FFmpeg and the input video."
             self.status_label.setText("Preview failed: could not generate frames.")
             QMessageBox.critical(
                 self, "Preview Error",
-                "Could not generate preview frames. Check FFmpeg and the input video.",
+                error_detail,
             )
             _cleanup_preview_artifacts(artifacts)
             return
@@ -2992,10 +3027,11 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "Done", "Video compressed successfully.")
         elif mode == "preview":
             if not worker.preview_original or not worker.preview_compressed:
+                error_detail = worker.error_message or "Could not generate preview frames. Check FFmpeg and the input video."
                 self.status_label.setText("Preview failed: could not generate frames.")
                 QMessageBox.critical(
                     self, "Preview Error",
-                    "Could not generate preview frames. Check FFmpeg and the input video.",
+                    error_detail,
                 )
                 return
             self.status_label.setText("Preview ready.")
