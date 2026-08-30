@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import logging
 import os
 import queue
 import re
@@ -33,6 +34,8 @@ from src.config import ensure_runtime_dirs, get_bin_dir
 
 
 RUNTIME_MODULES_DIR = os.path.join(get_bin_dir(), "runtimes", "ai_modules")
+
+logger = logging.getLogger(__name__)
 
 # Variables que pueden hacer que pip vea otro intérprete, otro entorno
 # virtual o una configuración global del usuario. El proceso de instalación
@@ -342,6 +345,37 @@ def _is_path_in_store(path: str | None) -> bool:
     return normalized == store or normalized.startswith(store + os.sep)
 
 
+def _purge_stale_module_modules(module_name: str) -> int:
+    """Borra ``module`` y todos sus submódulos de ``sys.modules``.
+
+    Tras un import que falla a mitad de ejecución, Python expulsa el módulo
+    raíz de ``sys.modules`` pero CONSERVA los submódulos ya cargados. Un
+    re-import posterior re-ejecuta el ``__init__`` del paquete y, al
+    reutilizar esos submódulos huérfanos, NO re-adjunta los atributos al
+    paquete (p. ej. ``torch.autograd``) y re-registra estado global de las
+    extensiones C: el segundo import revienta con errores SECUNDARIOS falsos
+    ("partially initialized module 'torch' ... has no attribute 'autograd'
+    (most likely due to a circular import)", "Only a single TORCH_LIBRARY
+    can be used to register the namespace triton") que ocultan la causa
+    original. Purgar del todo fuerza una ejecución limpia y reproducible.
+    """
+    prefix = module_name + "."
+    stale = [key for key in sys.modules if key == module_name or key.startswith(prefix)]
+    for key in stale:
+        try:
+            del sys.modules[key]
+        except KeyError:  # pragma: no cover - carrera teórica
+            pass
+    return len(stale)
+
+
+def _store_has_package_dir(module_name: str) -> bool:
+    """True si el store contiene el paquete (``<module>/__init__.py``)."""
+    return os.path.isfile(
+        os.path.join(RUNTIME_MODULES_DIR, module_name, "__init__.py")
+    )
+
+
 def _can_import(module_name: str) -> bool:
     """True si el módulo importa de verdad DESDE el store local.
 
@@ -354,6 +388,13 @@ def _can_import(module_name: str) -> bool:
     local se importa como namespace package (``spec.origin is None``): daría
     un falso INSTALLED. Solo cuenta si existe un origin real (paquete
     completo) DENTRO del store.
+
+    Autocuración: si el import falla (DLL bloqueada un instante por el
+    antivirus, fallo transitorio, etc.), el paquete queda medio cargado y
+    TODO re-import posterior en este proceso revienta con errores falsos de
+    circular import (ver ``_purge_stale_module_modules``). Aquí purgamos y
+    reintentamos una vez; si el reintento también falla, purgamos de nuevo
+    para no dejar el proceso envenenado para el siguiente intento.
     """
     try:
         spec = importlib.util.find_spec(module_name)
@@ -361,10 +402,19 @@ def _can_import(module_name: str) -> bool:
             return False
         if not _is_path_in_store(spec.origin):
             return False
+    except Exception:
+        return False
+    try:
         importlib.import_module(module_name)
         return True
     except Exception:
-        return False
+        _purge_stale_module_modules(module_name)
+        try:
+            importlib.import_module(module_name)
+            return True
+        except Exception:
+            _purge_stale_module_modules(module_name)
+            return False
 
 
 def _import_error_detail(module_name: str) -> str:
@@ -420,6 +470,152 @@ def _import_error_detail(module_name: str) -> str:
         return f"{type(exc).__name__}: {exc}\n{tb}"
 
     return f"Importación de '{module_name}' falló por motivo desconocido."
+
+
+# ---------------------------------------------------------------------------
+# Subprocess store-import validation (proceso limpio, sys.modules vacío)
+# ---------------------------------------------------------------------------
+
+
+# Sonda que ejecuta el subproceso: importa el módulo con el store como
+# primer ``sys.path`` y VERIFICA que el paquete cargado vive dentro del
+# store (misma regla "caracol" que ``_can_import``: un torch del venv o del
+# sistema no cuenta aunque importe sin problemas).
+_IMPORT_PROBE_SOURCE = (
+    "import importlib, os, sys\n"
+    "sys.path.insert(0, sys.argv[1])\n"
+    "try:\n"
+    "    module = importlib.import_module(sys.argv[2])\n"
+    "except BaseException:\n"
+    "    import traceback\n"
+    "    traceback.print_exc()\n"
+    "    sys.exit(3)\n"
+    "origin = os.path.abspath(getattr(module, '__file__', '') or '')\n"
+    "store = os.path.abspath(sys.argv[1])\n"
+    "ok = os.path.normcase(origin).startswith(os.path.normcase(store) + os.sep)\n"
+    "print('DRAGGY-IMPORT-OK' if ok else 'DRAGGY-IMPORT-FOREIGN')\n"
+    "sys.exit(0 if ok else 4)\n"
+)
+
+
+def _can_probe_subprocess() -> bool:
+    """True si existe un intérprete apto para la sonda en subproceso.
+
+    Frozen: el Python privado del instalador (embed-python). Dev: el propio
+    ``sys.executable`` vale, porque la sonda verifica el origen y un torch
+    del venv no da falso positivo.
+    """
+    if not getattr(sys, "frozen", False):
+        return True
+    return get_embed_python_path() is not None
+
+
+def _validate_store_import_subprocess(
+    module_name: str, timeout: float = 180.0
+) -> tuple[bool, str]:
+    """Valida en un subproceso LIMPIO que ``module_name`` importe del store.
+
+    Un import in-process hereda el estado del proceso: ``sys.modules`` con
+    submódulos huérfanos de intentos previos y DLLs ya cargadas. El
+    subproceso no hereda nada, así que su resultado es el veredicto sobre
+    el STORE (no sobre el proceso actual) y su traceback es la causa real.
+
+    Devuelve ``(ok, detalle)``; ``detalle`` es el stderr/stdout del
+    subproceso (causa legible) o la explicación de por qué no se sondeó.
+    """
+    python = get_embed_python_path()
+    if python is None:
+        if getattr(sys, "frozen", False):
+            return False, (
+                "No se encontró el Python privado (embed-python) junto al "
+                "ejecutable: no se puede validar el runtime en un subproceso. "
+                "Reinstala la aplicación."
+            )
+        python = sys.executable
+    try:
+        proc = subprocess.run(
+            [python, "-c", _IMPORT_PROBE_SOURCE, RUNTIME_MODULES_DIR, module_name],
+            capture_output=True, text=True, timeout=timeout,
+            env=_isolated_pip_env(),
+        )
+    except subprocess.TimeoutExpired:
+        return False, (
+            f"La sonda de import de '{module_name}' agotó {int(timeout)}s "
+            "(el import se colgó; posible antivirus examinando las DLL "
+            "recién extraídas o disco muy lento)."
+        )
+    except OSError as exc:
+        return False, f"No se pudo ejecutar la sonda de import ({python}): {exc}"
+    if proc.returncode == 0 and "DRAGGY-IMPORT-OK" in (proc.stdout or ""):
+        return True, ""
+    output = ((proc.stdout or "") + (proc.stderr or "")).strip()
+    detail = output or f"(sin salida; exit code {proc.returncode})"
+    return False, detail
+
+
+_SUBPROBE_CACHE: dict[str, tuple[tuple, bool, str]] = {}
+
+
+def _store_probe_signature(module_name: str) -> tuple:
+    """Firma barata del paquete en el store para invalidar la caché."""
+    init_py = os.path.join(RUNTIME_MODULES_DIR, module_name, "__init__.py")
+    try:
+        stat = os.stat(init_py)
+        return (stat.st_mtime_ns, stat.st_size)
+    except OSError:
+        return (0, 0)
+
+
+def _invalidate_store_probe_cache(module_name: str | None = None) -> None:
+    """Invalida la caché de la sonda (tras (re)instalar o borrar el store)."""
+    if module_name is None:
+        _SUBPROBE_CACHE.clear()
+    else:
+        _SUBPROBE_CACHE.pop(module_name, None)
+
+
+def _subprocess_import_ok(module_name: str) -> tuple[bool, str]:
+    """``_validate_store_import_subprocess`` con caché por firma del store.
+
+    La sonda cuesta segundos (importa torch de verdad); cachear por
+    (mtime, tamaño) del ``__init__.py`` evita repetirla en cada refresco
+    de estado mientras el paquete no cambie.
+    """
+    signature = _store_probe_signature(module_name)
+    cached = _SUBPROBE_CACHE.get(module_name)
+    if cached is not None and cached[0] == signature:
+        return cached[1], cached[2]
+    ok, detail = _validate_store_import_subprocess(module_name)
+    _SUBPROBE_CACHE[module_name] = (signature, ok, detail)
+    return ok, detail
+
+
+def _post_install_import_check(module_name: str) -> tuple[bool, str]:
+    """Veredicto tras instalar: el subproceso manda, el in-process da contexto.
+
+    - Subproceso OK  -> el store es válido: instalado (aunque el proceso
+      actual tarde más en importarlo; ``_can_import`` ya purga y reintenta).
+    - Subproceso KO  -> el store no importa de verdad: el detalle es el
+      stderr real del paquete, no un artefacto de re-import.
+    - Sin subproceso -> fallback in-process con el detalle de siempre.
+    """
+    if _can_import(module_name):
+        return True, ""
+    if _can_probe_subprocess():
+        ok, detail = _validate_store_import_subprocess(module_name)
+        if ok:
+            if not _can_import(module_name):
+                logger.warning(
+                    "%s importa en subproceso pero no in-process: store "
+                    "válido, no se reinstala", module_name
+                )
+            return True, ""
+        in_process = _import_error_detail(module_name)
+        return False, (
+            f"{detail}\n\n"
+            f"--- Diagnóstico del proceso actual (contexto) ---\n{in_process}"
+        )
+    return False, _import_error_detail(module_name)
 
 
 def _vc_redist_hint(detail: str) -> str:
@@ -562,6 +758,19 @@ def _resolve_variant(variant: str) -> str:
     return "cpu"
 
 
+# Set PyTorch conocido-bueno (pin defensivo). Para subir de versión:
+# actualizar los tres a la pareja publicada en
+# https://download.pytorch.org/whl/<variant> (los wheels llevan sufijo local
+# +cuXXX; el pin público los selecciona igual). PEP 440: un especificador
+# público (sin segmento local) casa con el wheel con sufijo local, así que
+# ``torch==2.13.0`` selecciona ``torch-2.13.0+cu126`` del índice. Sin pin,
+# el resolver puede mezclar sets inconsistentes (una torchvision nueva que
+# fuerza un torch más viejo, etc.) y dejar un store que no importa.
+_TORCH_PIN = "torch==2.13.0"
+_TORCHVISION_PIN = "torchvision==0.28.0"
+_TORCHAUDIO_PIN = "torchaudio==2.11.0"
+
+
 def _build_pytorch_command(variant: str) -> list[str]:
     """Construye el comando pip para instalar torch/torchvision/torchaudio."""
     variant = _resolve_variant(variant)
@@ -589,7 +798,7 @@ def _build_pytorch_command(variant: str) -> list[str]:
         "--upgrade",
         "--index-url", index_url,
         "--extra-index-url", "https://pypi.org/simple",
-        "torch", "torchvision", "torchaudio", "onnx", "onnxscript",
+        _TORCH_PIN, _TORCHVISION_PIN, _TORCHAUDIO_PIN, "onnx", "onnxscript",
     ]
 
 
@@ -1497,17 +1706,18 @@ def install_pytorch(
     # Purga posterior: pip --target deja dist-infos huérfanos de la versión
     # previa que mantendrían el store 'incompatible' (guard de versión).
     _purge_foreign_version_wheels()
+    _invalidate_store_probe_cache("torch")
     if progress_callback:
         progress_callback(100, "PyTorch listo")
     inject_runtime_paths()
     ensure_runtime_dlls_on_path()
-    if not _can_import("torch"):
-        detail = _import_error_detail("torch")
+    ok, detail = _post_install_import_check("torch")
+    if not ok:
         hint = _vc_redist_hint(detail)
         # Fallback automático: si la variante CUDA falló por DLL y no era CPU,
         # reintentar con CPU puede salvar la instalación en equipos sin
         # toolchain CUDA. No se aplica si el error es de spec/namespace (pip
-        # corrupto) чтобы evitar bucle infinito.
+        # corrupto) para evitar bucle infinito.
         if used_variant != "cpu" and ("dll load failed" in detail.lower() or "vcruntime" in detail.lower()):
             # No reintento recursivo aquí (evitar download gigante de nuevo
             # sin consentimiento). Se informa al usuario para que elija CPU.
@@ -1551,12 +1761,13 @@ def install_onnxruntime(
         abort_event=abort_event, timeout=timeout,
     )
     _purge_foreign_version_wheels()
+    _invalidate_store_probe_cache("onnxruntime")
     if progress_callback:
         progress_callback(100, "ONNX Runtime listo")
     inject_runtime_paths()
     ensure_runtime_dlls_on_path()
-    if not _can_import("onnxruntime"):
-        detail = _import_error_detail("onnxruntime")
+    ok, detail = _post_install_import_check("onnxruntime")
+    if not ok:
         hint = _vc_redist_hint(detail)
         raise RuntimeError(
             "ONNX Runtime installation finished but the local runtime could "
@@ -1628,18 +1839,19 @@ def install_runtimes(
     # sea importable en la versión/arquitectura actual.
     inject_runtime_paths()
     ensure_runtime_dlls_on_path()
-    missing = [
-        name for name in ("torch", "onnxruntime")
-        if not _can_import(name)
-    ]
+    missing = []
+    details: list[str] = []
+    for name in ("torch", "onnxruntime"):
+        ok, detail = _post_install_import_check(name)
+        if not ok:
+            missing.append(name)
+            details.append(f"--- {name} ---\n{detail}\n{_vc_redist_hint(detail)}")
     if missing:
-        details = "\n\n".join(
-            f"--- {name} ---\n{_import_error_detail(name)}\n{_vc_redist_hint(_import_error_detail(name))}"
-            for name in missing
-        )
         raise RuntimeError(
             "Runtime installation finished but these local packages could "
-            f"not be imported: {', '.join(missing)}\n\n{details}\n\n"
+            f"not be imported: {', '.join(missing)}\n\n"
+            + "\n\n".join(details)
+            + "\n\n"
             f"store={RUNTIME_MODULES_DIR}\n"
             f"python={sys.version.split()[0]} ({'frozen' if getattr(sys, 'frozen', False) else 'dev'}) "
             f"variant={used_variant}"
@@ -1684,6 +1896,23 @@ def torch_status() -> dict:
     inject_runtime_paths()
     ensure_runtime_dlls_on_path()
     installed = _can_import("torch")
+    if not installed and _store_has_package_dir("torch") and _can_probe_subprocess():
+        # El store contiene torch pero este proceso no consigue importarlo
+        # (import fallido previo que dejó submódulos huérfanos, antivirus,
+        # etc.). El veredicto lo da un subproceso limpio: si allí importa,
+        # el store es válido y NO debe re-descargarse ~3 GB en cada arranque
+        # (antes el runtime quedaba "not ready" eterno con reinstalaciones
+        # en bucle a pesar de tener el paquete bien instalado).
+        try:
+            ok, _probe_detail = _subprocess_import_ok("torch")
+        except Exception:
+            ok = False
+        if ok:
+            logger.warning(
+                "torch no importa in-process pero sí en subproceso: store "
+                "válido, no se reinstala"
+            )
+            installed = True
     gpu = False
     if installed:
         try:
@@ -1709,6 +1938,18 @@ def onnx_status() -> dict:
     inject_runtime_paths()
     ensure_runtime_dlls_on_path()
     installed = _can_import("onnxruntime")
+    if not installed and _store_has_package_dir("onnxruntime") and _can_probe_subprocess():
+        # Mismo guard que torch: el store manda sobre el proceso actual.
+        try:
+            ok, _probe_detail = _subprocess_import_ok("onnxruntime")
+        except Exception:
+            ok = False
+        if ok:
+            logger.warning(
+                "onnxruntime no importa in-process pero sí en subproceso: "
+                "store válido, no se reinstala"
+            )
+            installed = True
     gpu = False
     if installed:
         try:
@@ -1758,6 +1999,7 @@ def uninstall_local_runtimes(parent=None) -> None:
         return
     if os.path.isdir(RUNTIME_MODULES_DIR):
         _rmtree_force(RUNTIME_MODULES_DIR)
+    _invalidate_store_probe_cache()
 
 
 def get_status() -> dict:

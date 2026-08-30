@@ -888,7 +888,9 @@ def test_pytorch_install_command_includes_onnx_package():
     from src.runtimes.manager import _build_pytorch_command
 
     cmd = _build_pytorch_command("cpu")
-    assert "torch" in cmd
+    # Pin defensivo del set PyTorch: el especificador público casa con el
+    # wheel +cuXXX del índice (PEP 440); ver _TORCH_PIN en manager.py.
+    assert "torch==2.13.0" in cmd
     assert "onnx" in cmd
     # Se instala con --target (store local) y desde el índice de PyTorch.
     assert "--target" in cmd
