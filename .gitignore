@@ -16,6 +16,10 @@ bin/
 
 # Datos personales (tokens, API keys, etc.)
 personal/
+.env
+.env.*
+*.pem
+*.key
 
 # Herramientas de escritorio
 .freebuff/
