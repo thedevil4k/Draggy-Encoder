@@ -59,7 +59,7 @@ DRAGGY_ENCODER/
 
 ## Requirements
 
-- Python 3.9–3.14
+- Python 3.10–3.14
 - GPU recommended for AI upscaling (NVIDIA CUDA or AMD Vulkan)
 - No Git required: model downloads use the bundled `huggingface_hub`
   (the packaged app no longer falls back to `git clone`, since the
@@ -81,6 +81,31 @@ and PyTorch — no manual setup required. ONNX models work immediately;
 PyTorch is ready for `.pth` import/conversion without extra steps.
 A failed runtime download never blocks the app from starting:
 retry from *Manage Dependencies → AI Runtimes → Install*.
+
+**The PyTorch build is resolved, not hardcoded.** Before downloading, the app
+queries the PyTorch wheel indices and PyPI metadata and picks the
+(variant, version) pair that actually publishes wheels for your CPython, your
+platform and your NVIDIA driver — for example CUDA 13.0 builds on a recent
+driver, or an older CUDA/CPU build otherwise. The progress dialog shows the
+resolved choice (`CUDA 13.0 · torch 2.14.0 + torchvision 0.29.0 + …`).
+If a download is interrupted or fails validation, the previously working
+runtime is kept: the new files are assembled and verified in a temporary
+directory and only then swapped in.
+
+**Installing and uninstalling each runtime is independent.** PyTorch and ONNX
+Runtime share one folder, but the Uninstall button on each row removes only
+that runtime (plus its own satellites) and leaves the other one — and the
+shared dependencies such as numpy — untouched. Read the confirmation dialog:
+it tells you exactly what will be removed. On Windows, if the runtime is
+loaded in memory its DLLs cannot be deleted immediately; the app schedules the
+removal for the next launch and tells you so. Reinstalling before that restart
+is safe: the pending cleanup recognises the new installation and leaves it
+alone.
+
+- Installing **ONNX Runtime** also installs `onnx`/`onnxscript`, which is what
+  `torch.onnx.export` needs to convert `.pth` checkpoints.
+- Installing **PyTorch** installs them too, so a `.pth`-only workflow works
+  after installing either one.
 
 ## Portable builds
 

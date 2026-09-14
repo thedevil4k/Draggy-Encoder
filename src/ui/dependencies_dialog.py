@@ -911,6 +911,16 @@ class DependenciesDialog(QDialog):
                 "Instálalo desde https://aka.ms/vs/17/release/vc_redist.x64.exe "
                 "y reintenta. Si no tienes GPU NVIDIA, prueba la variante CPU."
             )
+        elif "no se encontró ninguna versión de pytorch instalable" in low or "wheels de torch" in low:
+            # El resolver no encontró pareja (variante, versión) instalable.
+            # Culpar a la red aquí sería engañoso: el motivo real (Python
+            # demasiado antiguo, plataforma sin wheels...) ya viene en el
+            # mensaje, junto con los pasos a seguir.
+            hint = (
+                "No hay ninguna versión de PyTorch compatible con este "
+                "Python/plataforma. Revisa el motivo indicado arriba; lo "
+                "habitual es necesitar una versión de Python más reciente."
+            )
         elif "dll load failed" in low or "errno 126" in low or "errno 127" in low:
             hint = (
                 "Falló la carga de una DLL nativa (antivirus o VC++ faltante).\n"
@@ -974,11 +984,31 @@ class DependenciesDialog(QDialog):
         size = (info or {}).get("size_bytes", 0) or 0
         size_txt = f" (~{_fmt_bytes(size)})" if size else ""
 
+        # El store de runtimes es COMPARTIDO: al borrar un runtime solo se van
+        # sus paquetes. Seavisa explícitamente para que nadie crea que se lleva
+        # el otro por delante.
+        detail = ""
+        if info and info.get("kind") == dependencies.KIND_RUNTIME:
+            others = [
+                d.get("display_name") or d.get("id")
+                for d in dependencies.list_all()
+                if d.get("kind") == dependencies.KIND_RUNTIME
+                and d.get("id") != dep_id
+                and d.get("status") == dependencies.STATUS_INSTALLED
+            ]
+            detail = f"\nSe borrarán solo los archivos de '{dep_id}'."
+            if others:
+                detail += (
+                    f"\nEl resto de runtimes instalados ({', '.join(others)}) "
+                    "se mantiene."
+                )
+
         confirm = QMessageBox.question(
             self,
             "Uninstall dependency",
             f"¿Seguro que quieres borrar '{dep_id}'?\n\n"
-            f"Se eliminará de forma permanente desde:\n  {path}{size_txt}\n\n"
+            f"Se eliminará de forma permanente desde:\n  {path}{size_txt}\n"
+            f"{detail}\n\n"
             "Esta acción no se puede deshacer.",
         )
         if confirm != QMessageBox.StandardButton.Yes:
@@ -991,9 +1021,28 @@ class DependenciesDialog(QDialog):
 
     def _on_uninstall_finished(self, dep_id):
         self._uninstall_worker = None
-        QMessageBox.information(
-            self, "Done", f"'{dep_id}' se ha desinstalado correctamente."
+        # False = el borrado quedó incompleto porque Windows mantiene archivos
+        # del runtime en uso (ya importado en este proceso). Se completará en
+        # el próximo arranque, y el usuario debe saberlo.
+        still_there = any(
+            (d.get("id") == dep_id and d.get("status") == dependencies.STATUS_INSTALLED)
+            for d in dependencies.list_all()
         )
+        if still_there:
+            QMessageBox.information(
+                self,
+                "Desinstalación incompleta (archivos en uso)",
+                f"'{dep_id}' se ha marcado para borrar, pero algunos archivos "
+                "están en uso por este mismo proceso y Windows no deja "
+                "eliminarlos ahora.\n\n"
+                "Se borrarán automáticamente la próxima vez que abras la "
+                "aplicación. Si quieres que desaparezcan ya, cierra la app y "
+                "vuelve a abrirla.",
+            )
+        else:
+            QMessageBox.information(
+                self, "Done", f"'{dep_id}' se ha desinstalado correctamente."
+            )
         self._populate()
         self._refresh_engines_tab()
 

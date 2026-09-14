@@ -686,14 +686,31 @@ def test_purge_keeps_shared_package_dir_when_compatible_sibling_exists(
     assert rm.store_is_compatible_with_python() is True
 
 
-def test_install_cleans_foreign_leftovers_and_detects_runtime(tmp_path, monkeypatch):
+def _target_from_pip_command(current, cmd):
+    """Destino real de un comando pip (``--target``), o el store si no lleva.
+
+    Los instaladores instalan en un directorio de staging y solo después
+    hacen el swap al store; un doble de pip que escriba siempre en el store
+    dejaría el staging vacío y la validación previa al swap (a propósito)
+    fallaría.
+    """
+    if "--target" in cmd:
+        return cmd[cmd.index("--target") + 1]
+    return current
+
+
+def test_install_cleans_foreign_leftovers_and_detects_runtime(tmp_path, monkeypatch, isolated_runtime):
     """Regression: pip --target can orphan a dist-info from a previous Python
     (cp314 numpy next to freshly installed cp311 onnxruntime). After
     install_onnxruntime, the orphan must be gone and the runtime detected."""
     import types
     import src.runtimes.manager as rm
 
-    store = str(tmp_path)
+    # Store anidado: el staging y el ``.previous`` del instalador son
+    # directorios HERMANOS del store, así que con el store en tmp_path el
+    # staging caería en el directorio compartido del run de pytest y podría
+    # chocar con otro test.
+    store = str(tmp_path / "runtimes" / "ai_modules")
     monkeypatch.setattr(rm, "RUNTIME_MODULES_DIR", store)
     os.makedirs(store, exist_ok=True)
 
@@ -707,14 +724,15 @@ def test_install_cleans_foreign_leftovers_and_detects_runtime(tmp_path, monkeypa
 
     # Fake pip: writes a real cp311 onnxruntime package + dist-info.
     def _fake_install(cmd, *a, **k):
-        pkg = os.path.join(store, "onnxruntime")
+        target = _target_from_pip_command(store, cmd)
+        pkg = os.path.join(target, "onnxruntime")
         os.makedirs(pkg, exist_ok=True)
         with open(os.path.join(pkg, "__init__.py"), "w") as f:
             f.write(
                 "def get_available_providers():\n"
                 "    return ['CPUExecutionProvider']\n"
             )
-        di = os.path.join(store, "onnxruntime-1.28.0.dist-info")
+        di = os.path.join(target, "onnxruntime-1.28.0.dist-info")
         os.makedirs(di, exist_ok=True)
         with open(os.path.join(di, "WHEEL"), "w") as f:
             f.write("Tag: %s\n" % _current_cp_tag())
@@ -749,7 +767,22 @@ def test_install_cleans_foreign_leftovers_and_detects_runtime(tmp_path, monkeypa
         ),
     )
 
-    rm.install_onnxruntime("cpu", progress_callback=lambda v, m: None)
+    # La validación previa al swap se dobla: usa un subproceso, y este test
+    # dobla ``subprocess`` por completo para simular pip. Lo que fija el test
+    # es la purga de metadatos de otra versión de Python y la detección
+    # posterior, no la sonda (que tiene sus propios tests).
+    monkeypatch.setattr(
+        rm, "_validate_package_in_dir",
+        lambda name, target, timeout=180.0: (True, ""),
+    )
+
+    # Instalador ORIGINAL: este test ejercita el instalador con pip doblado y
+    # el fixture de aislamiento lo neutraliza a propósito.
+    import conftest as _conftest
+
+    _conftest._ORIGINALS["install_onnxruntime"](
+        "cpu", progress_callback=lambda v, m: None
+    )
 
     assert not os.path.exists(numpy_di)
     assert rm.store_is_compatible_with_python() is True
@@ -887,10 +920,17 @@ def test_pytorch_install_command_includes_onnx_package():
     PyTorch installer must install it alongside torch."""
     from src.runtimes.manager import _build_pytorch_command
 
-    cmd = _build_pytorch_command("cpu")
-    # Pin defensivo del set PyTorch: el especificador público casa con el
-    # wheel +cuXXX del índice (PEP 440); ver _TORCH_PIN en manager.py.
-    assert "torch==2.13.0" in cmd
+    plan = {
+        "variant": "cpu",
+        "versions": {"torch": "2.14.0", "torchvision": "0.29.0", "torchaudio": "2.11.0"},
+        "source": "index",
+        "note": "",
+        "attempts": [],
+    }
+    cmd = _build_pytorch_command("cpu", plan)
+    # Las versiones salen del plan resuelto contra los índices reales (antes
+    # era un pin estático que podía no existir en el índice elegido).
+    assert "torch==2.14.0" in cmd
     assert "onnx" in cmd
     # Se instala con --target (store local) y desde el índice de PyTorch.
     assert "--target" in cmd
@@ -2722,12 +2762,28 @@ def test_hardware_summary_includes_os_and_python():
 
 def _run_startup_worker(monkeypatch, hardware_fn, ffmpeg_fn, codecs_fn):
     """Ejecuta StartupWorker.run() con las tres fases parcheadas y devuelve
-    el dict estructurado emitido por startup_finished."""
+    el dict estructurado emitido por startup_finished.
+
+    Los instaladores de runtimes de IA se neutralizan en ``runtimes.manager``
+    (que es de donde ``StartupWorker`` los importa de forma perezosa): con un
+    store sin runtime, el auto-install del arranque se pondría a DESCARGAR
+    PyTorch de verdad (GB y minutos de red) dentro de un test unitario. El
+    instalador es el punto por el que pasa toda descarga, así que bloqueándolo
+    el arranque se comporta como en un equipo sin red, que es un caso
+    soportado y no fatal.
+    """
     import src.app as appmod
+    import src.runtimes.manager as rm
 
     monkeypatch.setattr(appmod, "get_hardware_summary", hardware_fn)
     monkeypatch.setattr(appmod, "ensure_ffmpeg", ffmpeg_fn)
     monkeypatch.setattr(appmod, "test_all_codecs", codecs_fn)
+
+    def _no_download(*args, **kwargs):
+        raise RuntimeError("descarga de runtimes deshabilitada en tests")
+
+    monkeypatch.setattr(rm, "install_onnxruntime", _no_download)
+    monkeypatch.setattr(rm, "install_pytorch", _no_download)
 
     worker = appmod.StartupWorker()
     results = []
@@ -2737,7 +2793,7 @@ def _run_startup_worker(monkeypatch, hardware_fn, ffmpeg_fn, codecs_fn):
     return results[0]
 
 
-def test_startup_worker_hardware_failure_is_non_fatal(qapp, monkeypatch):
+def test_startup_worker_hardware_failure_is_non_fatal(qapp, monkeypatch, isolated_runtime):
     """Un fallo de detección de hardware NO debe abortar el arranque ni
     traducirse a 'FFmpeg Error': phase=ok con hardware_error informado."""
     def _hw():
@@ -2756,7 +2812,7 @@ def test_startup_worker_hardware_failure_is_non_fatal(qapp, monkeypatch):
     assert result["compatible_codecs"] == {"CPU": [("libx264", "H.264")]}
 
 
-def test_startup_worker_ffmpeg_failure_is_fatal(qapp, monkeypatch):
+def test_startup_worker_ffmpeg_failure_is_fatal(qapp, monkeypatch, isolated_runtime):
     """Sin FFmpeg el resultado es phase='ffmpeg' y ffmpeg_path=None."""
     result = _run_startup_worker(
         monkeypatch,
@@ -2768,7 +2824,7 @@ def test_startup_worker_ffmpeg_failure_is_fatal(qapp, monkeypatch):
     assert result["ffmpeg_path"] is None
 
 
-def test_startup_worker_codec_failure_is_non_fatal(qapp, monkeypatch):
+def test_startup_worker_codec_failure_is_non_fatal(qapp, monkeypatch, isolated_runtime):
     """Un fallo del test de codecs degrada (lista vacía) sin abortar:
     phase=ok con codecs_error informado."""
     def _codecs(ffmpeg_path, progress_callback=None):
@@ -2786,7 +2842,7 @@ def test_startup_worker_codec_failure_is_non_fatal(qapp, monkeypatch):
     assert result["compatible_codecs"] == {}
 
 
-def test_startup_worker_generic_failure_reports_startup_phase(qapp, monkeypatch):
+def test_startup_worker_generic_failure_reports_startup_phase(qapp, monkeypatch, isolated_runtime):
     """Un fallo no atribuible a hardware/ffmpeg/codecs se marca phase='startup'
     con el error, no como 'FFmpeg Error'."""
     def _ff(progress_callback=None):

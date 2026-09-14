@@ -59,12 +59,31 @@ def _pending_cleanup_path():
     return os.path.join(get_session_dir(), PENDING_CLEANUP_FILENAME)
 
 
+def _path_signature(path: str) -> int:
+    """Marca de creación de ``path`` (0 si no existe o no se puede leer).
+
+    En Windows ``st_ctime_ns`` no cambia al añadir archivos dentro, así que
+    sirve para distinguir "el directorio bloqueado que registramos" de "un
+    directorio NUEVO que se ha re-creado en la misma ruta".
+    """
+    try:
+        return int(os.stat(path).st_ctime_ns)
+    except OSError:
+        return 0
+
+
 def _register_pending_cleanup(path: str) -> None:
     """Registra una ruta para borrarla en el próximo arranque (best-effort).
 
     Windows bloquea DLLs cargadas (torch/onnxruntime ya importados). No
     podemos borrarlos en caliente; al siguiente arranque, antes de importar
     cualquier runtime, ``process_pending_cleanup()`` completa el borrado.
+
+    Se guarda además la marca de creación del directorio. Es imprescindible:
+    si el usuario desinstala (queda bloqueado), REINSTALA el mismo runtime y
+    luego reinicia, el borrado pendiente apuntaría a la ruta de la instalación
+    NUEVA y se la llevaría por delante. Comparando la marca se detecta que ese
+    directorio ya no es el que se quería borrar y se respeta.
     """
     try:
         ensure_runtime_dirs()
@@ -78,21 +97,83 @@ def _register_pending_cleanup(path: str) -> None:
                 data = {}
         if not isinstance(data, dict):
             data = {}
-        data.setdefault("paths", [])
-        if path not in data["paths"]:
-            data["paths"].append(path)
+        entries = data.setdefault("paths", [])
+        entry = {"path": path, "sig": _path_signature(path)}
+        # Reemplaza una entrada previa de la misma ruta (re-registro).
+        entries[:] = [
+            e for e in entries
+            if (e.get("path") if isinstance(e, dict) else e) != path
+        ]
+        entries.append(entry)
         with open(p, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2)
     except Exception:
         pass
 
 
+def _pending_entry_path(entry) -> str:
+    """Ruta de una entrada del fichero de limpiezas pendientes.
+
+    Acepta el formato antiguo (una ruta suelta) y el nuevo (``{path, sig}``).
+    """
+    if isinstance(entry, dict):
+        return str(entry.get("path") or "")
+    return str(entry or "")
+
+
+def _pending_entry_signature(entry) -> int:
+    """Marca de creación registrada (0 si el formato no la tiene)."""
+    if isinstance(entry, dict):
+        try:
+            return int(entry.get("sig") or 0)
+        except (TypeError, ValueError):
+            return 0
+    return 0
+
+
+def _remove_empty_dir_tree(path: str) -> bool:
+    """Borra ``path`` si está vacío (o solo contiene dirs vacíos).
+
+    Los DLL bloqueados impiden borrar SUS archivos, pero el resto del árbol sí
+    se puede limpiar; esto retira la carcasa vacía en vez de dejarla para
+    siempre. Devuelve True si el directorio desapareció.
+    """
+    if not os.path.exists(path):
+        return True
+    if os.path.isfile(path):
+        try:
+            os.remove(path)
+        except OSError:
+            return False
+        return not os.path.exists(path)
+    for dirpath, dirnames, filenames in os.walk(path, topdown=False):
+        for name in filenames:
+            try:
+                os.remove(os.path.join(dirpath, name))
+            except OSError:
+                pass
+        for name in dirnames:
+            try:
+                os.rmdir(os.path.join(dirpath, name))
+            except OSError:
+                pass
+    try:
+        os.rmdir(path)
+    except OSError:
+        return False
+    return True
+
+
 def process_pending_cleanup() -> None:
     """Completa borrados pendientes del arranque anterior.
 
     DEBE llamarse antes de importar ``torch``/``onnxruntime`` (en ``main.py``
-    justo después de ``inject_runtime_paths()``) para que los DLLs no estén
-    todavía bloqueados. Idempotente y tolerante a errores de E/S.
+    justo después de inyectar los runtimes, antes de importarlos) para que los
+    DLLs no estén todavía bloqueados. Idempotente y tolerante a errores de E/S.
+
+    Una entrada se descarta (se considera hecha) si la ruta ya no existe o si
+    el directorio que hay ahora NO es el que se registró: eso significa que el
+    runtime se reinstaló y borrarlo destruiría una instalación válida.
     """
     p = _pending_cleanup_path()
     if not os.path.exists(p):
@@ -104,15 +185,23 @@ def process_pending_cleanup() -> None:
         return
     if not isinstance(data, dict):
         data = {}
-    paths = list(data.get("paths") or [])
+    entries = list(data.get("paths") or [])
     remaining = []
-    for path in paths:
+    for entry in entries:
+        path = _pending_entry_path(entry)
+        if not path:
+            continue
+        if not os.path.exists(path):
+            continue  # ya no está: nada que hacer
+        expected = _pending_entry_signature(entry)
+        if expected and _path_signature(path) != expected:
+            continue  # re-creado: es una instalación nueva, se respeta
         try:
             shutil.rmtree(path, ignore_errors=True)
         except Exception:
             pass
-        if os.path.exists(path):
-            remaining.append(path)
+        if os.path.exists(path) and not _remove_empty_dir_tree(path):
+            remaining.append(entry)
     try:
         if remaining:
             with open(p, "w", encoding="utf-8") as f:
@@ -281,6 +370,16 @@ def _onnxruntime_status():
     )
 
 
+def _uninstall_runtime(dep_id: str, parent=None) -> bool:
+    """Desinstala un runtime concreto del store compartido.
+
+    Envoltorio para que el REGISTRY no dependa del nombre exacto de la función
+    del manager (que es quien registra el resultado y programa la limpieza de
+    los archivos bloqueados para el próximo arranque).
+    """
+    return ai_runtimes_manager.uninstall_runtime(dep_id, parent=parent)
+
+
 def _slot_status(display_name, category, install_dir, kind):
     """Estado real de una ranura de modelos: cuenta motores instalados en
     ``bin/models/<Category>`` y reporta el tamaño agregado.
@@ -441,7 +540,9 @@ REGISTRY = [
         "display_name": "PyTorch runtime",
         "status_fn": _pytorch_status,
         "reinstall_fn": ai_runtimes_manager.install_pytorch,
-        "uninstall_fn": ai_runtimes_manager.uninstall_local_runtimes,
+        # Se desinstala SOLO PyTorch (y sus satélites onnx/onnxscript): el store
+        # es compartido con ONNX Runtime, que debe seguir funcionando.
+        "uninstall_fn": lambda parent=None: _uninstall_runtime("torch", parent),
         "open_label": "Open bin/runtimes/ai_modules",
         "is_updatable": True,
     },
@@ -451,7 +552,7 @@ REGISTRY = [
         "display_name": "ONNX Runtime (CPU/GPU)",
         "status_fn": _onnxruntime_status,
         "reinstall_fn": ai_runtimes_manager.install_onnxruntime,
-        "uninstall_fn": ai_runtimes_manager.uninstall_local_runtimes,
+        "uninstall_fn": lambda parent=None: _uninstall_runtime("onnxruntime", parent),
         "open_label": "Open bin/runtimes/ai_modules",
         "is_updatable": True,
     },
@@ -587,8 +688,11 @@ def uninstall(dep_id: str, parent=None) -> bool:
             raise RuntimeError(
                 f"{dep_id} no se puede desinstalar desde la aplicación."
             )
-        fn(parent=parent)
-        return True
+        # Si el instalador devuelve un bool, False significa "quedan archivos
+        # bloqueados; el borrado se completará en el próximo arranque". La UI
+        # lo usa para avisar en vez de decir que todo ha desaparecido ya.
+        result = fn(parent=parent)
+        return True if result is None else bool(result)
     raise KeyError(f"Dependencia desconocida: {dep_id}")
 
 

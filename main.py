@@ -142,7 +142,11 @@ except Exception:
 # cualquier otro módulo importe torch/onnxruntime. Así el usuario no
 # necesita instalarlos manualmente con pip.
 try:
-    from src.runtimes.manager import inject_runtime_paths
+    from src.runtimes.manager import inject_runtime_paths, cleanup_install_leftovers
+    # Restos de una instalación interrumpida (staging sin validar o store
+    # anterior pendiente de borrar): se limpian ANTES de tocar sys.path, de
+    # modo que un staging a medias nunca pueda confundirse con el store.
+    cleanup_install_leftovers()
     inject_runtime_paths()
 except Exception:
     pass

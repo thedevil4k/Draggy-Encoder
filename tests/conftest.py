@@ -6,14 +6,37 @@ headless UI tests can construct QWidgets without a real display server.
 The Qt application object is exposed via the ``qapp`` fixture (function scoped)
 so each test gets a clean event loop and widgets can be safely garbage
 collected between tests.
+
+``isolated_runtime`` is the opt-in isolation for tests that exercise the AI
+runtime installers. It is deliberately NOT autouse: most of the suite needs the
+real runtime store of the checkout (``local_store_runtime`` in test_draggy.py
+imports torch from it), so redirecting the store globally would break those
+tests instead of protecting anything.
 """
 import os
-import sys
+import shutil
 
 # Must run before any PySide6 import.
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import pytest
+
+# Igual que hace ``main.py`` al arrancar: el store de runtimes del checkout se
+# inyecta en ``sys.path`` para que los tests puedan importar el torch/onnxruntime
+# reales (los que ejercitan conversión .pth → .onnx y carga de checkpoints).
+# Sin esto, esos tests dependían de que otro test anterior hubiera llamado a
+# ``inject_runtime_paths()``: pasaban o se saltaban según el orden de ejecución.
+try:
+    from src.runtimes.manager import inject_runtime_paths
+
+    inject_runtime_paths()
+except Exception:  # el store puede no existir (checkout recién clonado)
+    pass
+
+# Funciones originales que ``isolated_runtime`` dobla. Los tests que necesitan
+# el comportamiento real (resolución contra índices) las usan desde aquí en
+# lugar de depender de cómo monkeypatch guarda el valor previo.
+_ORIGINALS: dict = {}
 
 
 @pytest.fixture()
@@ -33,6 +56,84 @@ def qapp():
         # construction time in headless sandboxes).
         app = QApplication(["draggy-test", "-platform", "offscreen"])
     return app
+
+
+@pytest.fixture()
+def isolated_runtime(tmp_path_factory, monkeypatch):
+    """Store de runtimes temporal y sin red, para tests de instalación.
+
+    Hace falta por tres motivos, todos aprendidos de fallos reales:
+
+    * ``install_*`` instalan en staging y luego dan un swap del store
+      (renombrar el viejo a ``.previous`` y mover el nuevo a su sitio). Sin
+      aislar, un test podía renombrar y BORRAR el store real del checkout
+      (~3 GB) que usa el desarrollador.
+    * ``resolve_pytorch_plan`` consulta los índices de PyTorch y PyPI: sin
+      anclaje, un test de instalación haría I/O de red no determinista.
+    * El auto-install de arranque llama a los instaladores cuando no detecta
+      runtime; con el store de test vacío ese camino descargaría GB de verdad.
+      Se corta en el propio instalador, que es el punto por el que pasa toda
+      descarga.
+
+    Devuelve la ruta del store temporal para los tests que la necesiten.
+    """
+    import sys
+
+    # Import por submódulo (no por paquete): así ``manager`` es SIEMPRE el
+    # mismo objeto que el que parchea monkeypatch, sin depender de cómo se
+    # resolvió ``src.runtimes.manager`` en cada test.
+    import src.runtimes.manager  # noqa: F401  (registra el submódulo)
+    manager = sys.modules["src.runtimes.manager"]
+    _ORIGINALS.setdefault("resolve_pytorch_plan", manager.resolve_pytorch_plan)
+    # Los tests de instalación ejercitan el instalador de verdad (con pip
+    # doblado): necesitan la función original, porque este fixture la bloquea
+    # para que ningún test dispare una descarga real por accidente.
+    _ORIGINALS.setdefault("install_pytorch", manager.install_pytorch)
+    _ORIGINALS.setdefault("install_onnxruntime", manager.install_onnxruntime)
+    _ORIGINALS.setdefault("install_runtimes", manager.install_runtimes)
+
+    fake_bin = tmp_path_factory.mktemp("bin")
+    store = fake_bin / "runtimes" / "ai_modules"
+    store.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(manager, "RUNTIME_MODULES_DIR", str(store))
+    monkeypatch.setattr(manager, "get_bin_dir", lambda: str(fake_bin))
+
+    def _no_download(*args, **kwargs):
+        raise RuntimeError(
+            "descarga deshabilitada en tests (isolated_runtime): este test ha "
+            "llegado a un instalador real de runtimes de IA. Si el test "
+            "ejercita el instalador a propósito, llama a "
+            "conftest._ORIGINALS['install_pytorch']."
+        )
+
+    monkeypatch.setattr(manager, "install_pytorch", _no_download)
+    monkeypatch.setattr(manager, "install_onnxruntime", _no_download)
+    monkeypatch.setattr(manager, "install_runtimes", _no_download)
+
+    # Resolver sin red: el set conocido bueno sobre el índice preferido.
+    monkeypatch.setattr(
+        manager,
+        "resolve_pytorch_plan",
+        lambda variant="auto", use_cache=True: {
+            "variant": manager._resolve_variant(variant),
+            "versions": {},
+            "source": "offline",
+            "note": "tests",
+            "attempts": [],
+        },
+    )
+    # La metadata de PyPI (versión de Python por release) tampoco se consulta:
+    # los tests que la necesiten la doblan explícitamente.
+    monkeypatch.setattr(
+        manager, "_pypi_release_requires_python", lambda package, version: None
+    )
+    monkeypatch.setattr(manager, "_pypi_versions_newest_first", lambda package: [])
+
+    yield str(store)
+
+    # El store temporal se va con tmp_path; el checkout no se toca nunca.
+    for leftover in (manager._staging_dir(), manager._aside_dir()):
+        shutil.rmtree(leftover, ignore_errors=True)
 
 
 def pytest_runtest_setup(item):

@@ -75,11 +75,6 @@ def _pip_command_prefix() -> list[str]:
     return [_pip_python(), "-I", "-m", "pip"]
 
 
-# Tag de versión de CPython en los wheels (ej. "cp314-cp314-win_amd64").
-# Captura el número "majorminor" completo (314, 311, ...).
-_WHEEL_CP_RE = re.compile(r"^cp(\d+)-")
-
-
 # ---------------------------------------------------------------------------
 # Path injection
 # ---------------------------------------------------------------------------
@@ -146,13 +141,32 @@ def _wheel_tag_matches(tag: str) -> bool:
     Python (cp311 vs cp314): inyectar un store compilado para otra versión
     rompe el arranque (ej. numpy cp314 importado desde Python 3.11). Los
     wheels abi3 (``cp311-abi3``) son compatibles hacia delante.
+
+    Un tag que NO se reconoce se acepta (True): este guard solo debe rechazar
+    lo que demuestra ser de otra CPython. Rechazar por un tag raro convierte
+    un WHEEL malformado o un formato futuro en "el store entero es
+    incompatible" — y eso desactiva la IA y provoca re-descargas de GB.
     """
-    m = _WHEEL_CP_RE.match(tag)
-    if not m:
-        return True  # pure-python (py3-none-any) o tag desconocido
-    tag_num = int(m.group(1))
-    cur_num = int(f"{sys.version_info.major}{sys.version_info.minor}")
-    if "abi3" in tag:
+    text = (tag or "").strip()
+    if not text:
+        return True
+    first = text.split("-")[0].strip()
+    if not first.startswith("cp"):
+        return True  # py3-none-any, py2.py3-none-any, ...
+    digits = ""
+    for char in first[2:]:
+        if char.isdigit():
+            digits += char
+        else:
+            break
+    if not digits:
+        return True
+    try:
+        tag_num = int(digits)
+        cur_num = int(f"{sys.version_info.major}{sys.version_info.minor}")
+    except (TypeError, ValueError):  # pragma: no cover - int() sobre dígitos
+        return True
+    if "abi3" in text:
         return cur_num >= tag_num
     return cur_num == tag_num
 
@@ -689,21 +703,25 @@ def _python_short() -> str:
 def _is_python_version_supported() -> bool:
     """True si es una versión de Python con wheels oficiales de PyTorch/ONNX.
 
-    PyTorch y ONNX Runtime suelen tardar en publicar wheels para las
-    versiones más nuevas de Python. A día de hoy (2026) el soporte
-    estable es 3.9–3.14.
+    El suelo real lo marca PyTorch: las versiones actuales publican desde
+    Python 3.10 (antes llegaron a soportar 3.8/3.9). Si la app corre por
+    debajo, ningún índice sirve wheels y seguir sólo alarga el error, así que
+    se rechaza de entrada con un mensaje claro.
     """
     major = sys.version_info.major
     minor = sys.version_info.minor
     if major != 3:
         return False
-    return 9 <= minor <= 14
+    minimum = _torch_min_python(_TORCH_MIN_PYTHON[0][0])
+    return minor >= minimum[1]
 
 
 def get_python_support_info() -> dict:
     """Devuelve información de compatibilidad para mostrar en la UI."""
     supported = _is_python_version_supported()
     short = _python_short()
+    minimum = _torch_min_python(_TORCH_MIN_PYTHON[0][0])
+    floor = f"{minimum[0]}.{minimum[1]}"
     if supported:
         return {
             "supported": True,
@@ -714,76 +732,832 @@ def get_python_support_info() -> dict:
         "supported": False,
         "short": short,
         "message": (
-            f"Python {short} is NOT supported by official PyTorch/ONNX wheels yet. "
-            "Please use Python 3.11–3.14, or build the PyInstaller bundle with one of those versions. "
+            f"Python {short} is NOT supported by official PyTorch/ONNX wheels. "
+            f"Please use Python {floor} or newer, or build the PyInstaller "
+            "bundle with one of those versions. "
             "AI upscaling/interpolation/colorize will be disabled."
         ),
     }
 
 
 # ---------------------------------------------------------------------------
-# Package specs
+# Package specs — resolución dinámica de variante y versión
+#
+# El bug histórico (2026): la variante CUDA se elegía con una heurística
+# ("Python >= 3.13 -> cu126, si no cu121") y la versión se fijaba a un pin
+# estático (torch==2.13.0). Ambas cosas se decidían SIN consultar los índices
+# reales, así que la pareja (índice, versión) podía no existir:
+#
+#   cu121 (elegido para Python 3.9-3.12 con GPU NVIDIA) no publica NINGUNA
+#   versión del pin -> pip responde "Could not find a version that satisfies
+#   the requirement torch==2.13.0" y la instalación falla con código 1.
+#
+# La regla correcta es no adivinar: se consultan los índices de PyTorch y se
+# instala la pareja (variante, versión) que DE VERDAD tiene wheels para el
+# intérprete, la plataforma y el driver actuales. El pin estático sobrevive
+# solo como plan B para cuando no hay red (ver _plan_from_offline_defaults).
 # ---------------------------------------------------------------------------
 
+# Tag de CPython del intérprete en ejecución, como prefijo de wheel ("cp314").
+_CP_TAG = f"cp{sys.version_info.major}{sys.version_info.minor}"
 
-def _default_gpu_variant() -> str:
-    """Variant CUDA por defecto según la versión de Python en uso.
+# Fichero de caché disco de la resolución (evita re-sondear los índices en
+# cada refresco de estado y sobrevive a reinicios de la app).
+_PLAN_CACHE_FILE = "pytorch_plan.json"
+_PLAN_CACHE_TTL_S = 12 * 3600
+_plan_cache: dict = {"ts": 0.0, "plan": None}
 
-    PyTorch publica wheels CUDA por versión de Python:
-    - cu121: wheels para cp39–cp312 (Windows) / cp39–cp313 (Linux)
-    - cu126: wheels para cp39–cp314 (Windows + Linux) desde torch 2.6.0
-    - cu130: wheels para cp310–cp314 (Windows + Linux) desde torch 2.9.0
+# Candidatos ordenados por preferencia. `driver_any` son versiones de driver
+# NVIDIA (rama 5xx, tal como las reporta el propio driver) que sabemos que
+# pueden cargar la CUDA embebida de cada wheel. Un driver de rama igual o
+# superior es aceptable; si no se puede medir el driver, se acepta el
+# candidato (mejor intentar CUDA que degradar a CPU por una sonda fallida).
+#
+# NOTA sobre cu126: los wheels de PyTorch embeben el runtime CUDA y hablan
+# con el driver por la CUDA Driver API, que es retrocompatible dentro de la
+# misma rama mayor, pero no entre ramas mayores. Los requisitos de abajo son
+# deliberadamente conservadores: solo se exige el driver cuando la rama mayor
+# del runtime es MÁS NUEVA que la del toolkit CUDA 12 con el que se publicó.
+_VARIANT_CANDIDATES: tuple[dict, ...] = (
+    {"variant": "cuda130", "cuda_pref": "13.0", "url": "https://download.pytorch.org/whl/cu130",
+     "label": "CUDA 13.0", "driver_any": (580,)},
+    {"variant": "cuda126", "cuda_pref": None, "url": "https://download.pytorch.org/whl/cu126",
+     "label": "CUDA 12.6", "driver_any": ()},
+    {"variant": "cuda121", "cuda_pref": None, "url": "https://download.pytorch.org/whl/cu121",
+     "label": "CUDA 12.1", "driver_any": ()},
+    {"variant": "cuda118", "cuda_pref": None, "url": "https://download.pytorch.org/whl/cu118",
+     "label": "CUDA 11.8", "driver_any": ()},
+    {"variant": "cpu", "cuda_pref": None, "url": "https://download.pytorch.org/whl/cpu",
+     "label": "CPU", "driver_any": ()},
+)
+_CANDIDATES_BY_VARIANT = {c["variant"]: c for c in _VARIANT_CANDIDATES}
+_INDEX_URLS = {c["variant"]: c["url"] for c in _VARIANT_CANDIDATES}
 
-    En Python 3.13+, cu121 NO tiene wheels Windows (solo Linux cp313),
-    así que usamos cu126 que tiene soporte completo cp313-win_amd64.
-    """
-    minor = sys.version_info.minor
-    if minor >= 14:
-        return "cuda130"
-    if minor >= 13:
-        return "cuda126"
-    return "cuda121"
+# Paquetes que forman el set de PyTorch (los tres se publican en el mismo
+# índice y deben salir de la MISMA familia de versión para ser consistentes).
+_PYTORCH_PACKAGES = ("torch", "torchvision", "torchaudio")
 
+# Versión mínima de Python de cada familia de torch. Consultar la metadata
+# de PyPI por versión exacta sería una petición por versión; este mapa cubre
+# los saltos reales de `requires-python` publicados por PyTorch y es la parte
+# que decide si un Python antiguo puede instalar la familia nueva.
+_TORCH_MIN_PYTHON: tuple[tuple[str, tuple[int, int]], ...] = (
+    ("2.13", (3, 10)),
+    ("2.10", (3, 10)),
+    ("2.9", (3, 9)),
+    ("2.6", (3, 9)),
+    ("2.5", (3, 9)),
+    ("2.4", (3, 8)),
+)
 
-def _resolve_variant(variant: str) -> str:
-    """Resuelve 'auto' a cpu/cuda121/cuda118/cuda126/cuda130."""
-    if variant == "auto":
-        if _has_nvidia_gpu():
-            return _default_gpu_variant()
-        return "cpu"
-    if variant in ("cpu", "cuda118", "cuda11.8", "cuda121", "cuda126", "cuda130"):
-        if variant == "cuda11.8":
-            return "cuda118"
-        return variant
-    return "cpu"
-
-
-# Set PyTorch conocido-bueno (pin defensivo). Para subir de versión:
-# actualizar los tres a la pareja publicada en
-# https://download.pytorch.org/whl/<variant> (los wheels llevan sufijo local
-# +cuXXX; el pin público los selecciona igual). PEP 440: un especificador
-# público (sin segmento local) casa con el wheel con sufijo local, así que
-# ``torch==2.13.0`` selecciona ``torch-2.13.0+cu126`` del índice. Sin pin,
-# el resolver puede mezclar sets inconsistentes (una torchvision nueva que
-# fuerza un torch más viejo, etc.) y dejar un store que no importa.
+# Plan B sin red: el set más reciente que conocemos bueno, con el índice que
+# lo publica. Si el usuario está offline y no hay caché, se usa esto y pip
+# decide; el error final (si lo hay) ya lo explica _pytorch_no_candidate_error.
 _TORCH_PIN = "torch==2.13.0"
 _TORCHVISION_PIN = "torchvision==0.28.0"
 _TORCHAUDIO_PIN = "torchaudio==2.11.0"
+_OFFLINE_PLAN_VARIANT = "cuda126"
 
 
-def _build_pytorch_command(variant: str) -> list[str]:
-    """Construye el comando pip para instalar torch/torchvision/torchaudio."""
-    variant = _resolve_variant(variant)
-    if variant == "cpu":
-        index_url = "https://download.pytorch.org/whl/cpu"
-    elif variant == "cuda118":
-        index_url = "https://download.pytorch.org/whl/cu118"
-    elif variant == "cuda126":
-        index_url = "https://download.pytorch.org/whl/cu126"
-    elif variant == "cuda130":
-        index_url = "https://download.pytorch.org/whl/cu130"
-    else:  # cuda121
-        index_url = "https://download.pytorch.org/whl/cu121"
+class PytorchPlanError(RuntimeError):
+    """No hay ninguna pareja (variante, versión) instalable.
+
+    Lleva ``attempts`` para que la UI pueda listar qué se probó y por qué
+    falló cada candidato, en lugar del escueto "pip exited with code 1".
+    """
+
+    def __init__(self, message: str, attempts: list[dict]):
+        super().__init__(message)
+        self.attempts = attempts
+
+
+def _default_gpu_variant() -> str:
+    """Variante CUDA preferida de forma offline (sin consultar índices).
+
+    Solo se usa como último recurso cuando la red no permite resolver el
+    plan. El orden de preferencia lo define :data:`_VARIANT_CANDIDATES`:
+    se prefiere la CUDA más nueva disponible y se descarta lo que no pueda
+    publicar wheels (cu121 ya no recibe versiones nuevas).
+    """
+    return _VARIANT_CANDIDATES[0]["variant"]
+
+
+def _resolve_variant(variant: str) -> str:
+    """Normaliza un nombre de variante a cpu/cuda118/cuda121/cuda126/cuda130.
+
+    ``auto`` NO consulta la red aquí (es una función barata y síncrona que
+    usan también los tests y la UI): devuelve la variante preferida según el
+    hardware. La resolución real con consulta a los índices la hace
+    :func:`resolve_pytorch_plan`, que es la que usa el instalador.
+    """
+    if variant in ("cuda11.8",):
+        return "cuda118"
+    if variant in _CANDIDATES_BY_VARIANT:
+        return variant
+    if variant == "auto":
+        if _has_nvidia_gpu():
+            return _gpu_preferred_variant()
+        return "cpu"
+    return "cpu"
+
+
+def _nvidia_driver_branch() -> int | None:
+    """Rama mayor del driver NVIDIA ("580" en "580.88"), o None si no se mide.
+
+    ``nvidia-smi`` es el canal fiable y está en PATH en cualquier equipo con
+    driver instalado (el mismo supuesto que usa ``_has_nvidia_gpu``). Un
+    fallo de la sonda NO se interpreta como "sin GPU": devuelve None.
+    """
+    try:
+        proc = subprocess.run(
+            ["nvidia-smi", "--query-gpu=driver_version", "--format=csv,noheader"],
+            capture_output=True, text=True, timeout=15,
+        )
+    except Exception:
+        return None
+    if proc.returncode != 0:
+        return None
+    first = (proc.stdout or "").strip().splitlines()
+    if not first:
+        return None
+    m = re.match(r"\s*(\d+)", first[0])
+    return int(m.group(1)) if m else None
+
+
+def _variant_driver_ok(candidate: dict) -> bool:
+    """True si el driver instalado puede cargar la CUDA de este candidato.
+
+    ``driver_any`` vacío significa "sin requisito medible" (CUDA 12.x: la
+    retrocompatibilidad dentro de la rama 12 cubre los drivers en uso). Si el
+    requisito existe y el driver NO se pudo medir, se acepta igualmente: es
+    preferible intentar CUDA y fallar con un mensaje claro que degradar a CPU
+    silenciosamente por una sonda que no respondió.
+    """
+    required = candidate.get("driver_any") or ()
+    if not required:
+        return True
+    driver = _nvidia_driver_branch()
+    if driver is None:
+        return True
+    return driver >= min(required)
+
+
+def _gpu_preferred_variant() -> str:
+    """Primera variante CUDA de la lista de preferencia que el driver acepte.
+
+    Si ninguna CUDA es viable con el driver actual, devuelve "cpu": instalar
+    una torch CUDA que no puede cargar deja el runtime inservible, y el
+    usuario siempre puede forzar una variante concreta desde la UI.
+    """
+    for cand in _VARIANT_CANDIDATES:
+        if cand["variant"] == "cpu":
+            break
+        if _variant_driver_ok(cand):
+            return cand["variant"]
+    return "cpu"
+
+
+def _version_key(version: str) -> tuple:
+    """Clave de orden comparable para versiones ``2.13.0`` / ``0.28.0``.
+
+    Los segmentos no numéricos (local ``+cu126``, sufijos ``rc1``) se
+    descartan: para elegir "la más nueva" basta con la parte numérica, y así
+    el orden es total y estable (nada de tuple[Any] incomparable).
+    """
+    numeric: list[int] = []
+    for part in re.split(r"[.+-]", version or ""):
+        if part.isdigit():
+            numeric.append(int(part))
+        else:
+            break
+    return tuple(numeric)
+
+
+def _torch_min_python(family: str) -> tuple[int, int]:
+    """Versión mínima de Python publicada para una familia de torch.
+
+    ``family`` es "major.minor" ("2.13"). Las familias más nuevas que
+    conocemos empiezan en 3.10; las antiguas llegaron a soportar 3.8.
+    """
+    for prefix, minimum in _TORCH_MIN_PYTHON:
+        if family == prefix:
+            return minimum
+    try:
+        major, minor = (int(x) for x in family.split(".")[:2])
+    except ValueError:
+        return (3, 9)
+    newest = _version_key(_TORCH_MIN_PYTHON[0][0])
+    if (major, minor) >= newest:
+        return _TORCH_MIN_PYTHON[0][1]
+    oldest = _version_key(_TORCH_MIN_PYTHON[-1][0])
+    if (major, minor) <= oldest:
+        return _TORCH_MIN_PYTHON[-1][1]
+    return (3, 9)
+
+
+def _platform_compatible_index() -> bool:
+    """True si el índice de PyTorch publica wheels para esta plataforma.
+
+    macOS no usa los índices ``whl/<variante>`` (recibe torch por PyPI), así
+    que la resolución dinámica se salta en Darwin y se deja el plan offline.
+    """
+    return not sys.platform.startswith("darwin")
+
+
+_wheel_list_cache: dict[str, list[tuple[str, str]]] = {}
+
+
+def _http_get_text(url: str, timeout: float = 30.0) -> str:
+    """GET de texto con ``requests`` y repliegue a la stdlib.
+
+    ``requests`` viene con el bundle (lo arrastra huggingface_hub), pero el
+    gestor de runtimes también se ejecuta en el intérprete privado desnudo
+    (sonda/CLI) y en tests: un helper de red no debe ser el punto único de
+    fallo. El repliegue usa ``urllib`` con el CA bundle de certifi si está
+    disponible (el mismo que confía pip).
+    """
+    try:
+        import requests
+
+        resp = requests.get(url, timeout=timeout)
+        resp.raise_for_status()
+        return resp.text
+    except Exception as primary:
+        try:
+            import ssl
+            import urllib.request
+
+            context = None
+            try:
+                import certifi  # type: ignore
+
+                context = ssl.create_default_context(cafile=certifi.where())
+            except Exception:
+                context = ssl.create_default_context()
+            req = urllib.request.Request(
+                url, headers={"User-Agent": "DraggyEncoder runtime-resolver"}
+            )
+            with urllib.request.urlopen(req, timeout=timeout, context=context) as resp:
+                return resp.read().decode("utf-8", "replace")
+        except Exception as fallback:
+            raise RuntimeError(
+                f"No se pudo consultar {url}: {primary} / {fallback}"
+            ) from fallback
+
+
+def _index_wheel_list(index_url: str, package: str) -> list[tuple[str, str]]:
+    """``[(version, filename)]`` publicados por ``index_url`` para ``package``.
+
+    El índice de PyTorch es un listado HTML estático (el mismo que consume
+    pip). Solo se aceptan wheels compatibles con el intérprete y la
+    plataforma actuales: de nada sirve una versión que existe solo para otra
+    CPython. Cachea en memoria por sesión.
+    """
+    cache_key = f"{index_url}|{package}"
+    if cache_key in _wheel_list_cache:
+        return _wheel_list_cache[cache_key]
+
+    url = f"{index_url}/{package}/"
+    lookup_error = ""
+    try:
+        html = _http_get_text(url, timeout=30)
+    except RuntimeError as exc:
+        lookup_error = str(exc)
+        html = ""
+
+    found: list[tuple[str, str]] = []
+    if html:
+        # El href puede ser relativo o absoluto y puede llevar fragmento
+        # ``#sha256=...`` entre el nombre del wheel y la comilla de cierre
+        # (los índices modernos lo añaden): hay que tolerar ambos, o páginas
+        # como torchaudio devuelven cero wheels y parecen vacías.
+        for href in re.findall(r'<a[^>]+href="([^"]+)"', html):
+            filename = href.split("#", 1)[0].rstrip("/").rsplit("/", 1)[-1]
+            if not filename.endswith(".whl"):
+                continue
+            if not filename.startswith(package + "-"):
+                continue
+            if not _filename_matches_python(filename):
+                continue
+            if not _wheel_matches_platform(filename):
+                continue
+            found.append((_wheel_version(filename), filename))
+    if not found and lookup_error:
+        logger.info(
+            "resolución de %s en %s sin resultados (%s)", package, url, lookup_error
+        )
+    _wheel_list_cache[cache_key] = found
+    return found
+
+
+def _filename_matches_python(filename: str) -> bool:
+    """True si un wheel sirve para el intérprete actual.
+
+    A diferencia de ``_wheel_matches_cp`` (que exige el tag exacto
+    ``cp313-cp313`` y sirve para validar un wheel ya elegido), aquí también
+    se aceptan los wheels ``abi3``, que son compatibles hacia delante.
+    """
+    stem = filename[:-4] if filename.endswith(".whl") else filename
+    parts = stem.split("-")
+    if len(parts) < 3:
+        return False
+    py_tag, abi_tag = parts[-3], parts[-2]
+    if py_tag == _CP_TAG and abi_tag == _CP_TAG:
+        return True
+    if "abi3" in abi_tag:
+        m = re.match(r"cp(\d+)", py_tag)
+        if m:
+            return int(_CP_TAG[2:]) >= int(m.group(1))
+    return False
+
+
+def _wheel_version(filename: str) -> str:
+    """Versión declarada por el nombre de un wheel, normalizada.
+
+    No se puede trocear por ``-`` a ciegas: las URLs del índice percent-
+    codifican el ``+`` del segmento local (``torch-2.13.0%2Bcu130-...``), así
+    que ``%2B`` cuenta como un guion extra y desplaza los índices. Se extrae
+    la versión estructuralmente: nombre, versión y luego los tres tags
+    (python-abi-plataforma) al final.
+
+        torch-2.9.0+cu126-cp313-cp313-win_amd64.whl -> 2.9.0+cu126
+        torch-2.13.0-cp313-cp313-win_amd64.whl      -> 2.13.0
+    """
+    stem = filename[:-4] if filename.endswith(".whl") else filename
+    match = re.match(r"^[^-]+-([^-%]+(?:%2B[^-]*)?)-", stem, re.IGNORECASE)
+    if not match:
+        return ""
+    return _normalize_version(match.group(1))
+
+
+def _normalize_version(version: str) -> str:
+    """Deshace el percent-encoding de una versión (``2.13.0%2Bcu130``)."""
+    return (version or "").replace("%2B", "+").replace("%2b", "+").replace("%2E", ".").replace("%2e", ".")
+
+
+def _public_version(version: str) -> str:
+    """``2.9.0+cu126`` -> ``2.9.0`` (el pin que viaja a pip)."""
+    return version.split("+", 1)[0]
+
+
+def _pypi_release_requires_python(package: str, version: str) -> tuple[int, int] | None:
+    """``requires_python`` de una release cualquiera (cacheado), o None."""
+    if not version:
+        return None
+    cache_key = f"pyfloor|{package}|{version}"
+    cached = _wheel_list_cache.get(cache_key)
+    if cached is not None:
+        return cached[0][0] if cached else None
+    floor: tuple[int, int] | None = None
+    try:
+        import json as _json
+
+        payload = _json.loads(
+            _http_get_text(
+                f"https://pypi.org/pypi/{package}/{version}/json", timeout=30
+            )
+        )
+        requires = ((payload.get("info") or {}).get("requires_python") or "").strip()
+        match = re.search(r">=\s*(\d+)\.(\d+)", requires)
+        if match:
+            floor = (int(match.group(1)), int(match.group(2)))
+    except Exception:
+        floor = None
+    _wheel_list_cache[cache_key] = [(floor, "")] if floor else []
+    return floor
+
+
+def _pypi_versions_newest_first(package: str) -> list[str]:
+    """Versiones publicadas en PyPI, de más nueva a más antigua (cacheado)."""
+    cache_key = f"pypiversions|{package}"
+    cached = _wheel_list_cache.get(cache_key)
+    if cached is not None:
+        return [v for v, _f in cached]
+    versions: list[str] = []
+    try:
+        import json as _json
+
+        payload = _json.loads(
+            _http_get_text(f"https://pypi.org/pypi/{package}/json", timeout=30)
+        )
+        releases = payload.get("releases") or {}
+        versions = [
+            v for v in sorted(releases.keys(), key=_version_key, reverse=True)
+            if any(f.get("filename", "").endswith(".whl") for f in releases.get(v) or [])
+        ]
+    except Exception:
+        versions = []
+    _wheel_list_cache[cache_key] = [(v, "") for v in versions]
+    return versions
+
+
+def _pypi_newest_for_interpreter(package: str) -> str:
+    """Versión más nueva de ``package`` en PyPI instalable en este Python.
+
+    Un wheel ``cp314`` aparece como "compatible" en el listado del índice
+    aunque la app corra en 3.13 (el tag no siempre es el del intérprete),
+    así que la versión de Python del candidato se confirma contra el
+    ``requires_python`` real de la release. Sin esto se elegiría una torch
+    publicada solo para 3.14 y pip fallaría con "no matching distribution".
+    """
+    current = (sys.version_info.major, sys.version_info.minor)
+    for version in _pypi_versions_newest_first(package):
+        floor = _pypi_release_requires_python(package, version)
+        if floor is not None and current < floor:
+            continue
+        return version
+    return ""
+
+
+def _index_version_usable(package: str, version: str) -> bool:
+    """True si la versión del índice es instalable en ESTE intérprete."""
+    floor = _pypi_release_requires_python(package, version)
+    if floor is None:
+        return True  # sin dato: no se descarta lo que el índice ya filtró
+    current = (sys.version_info.major, sys.version_info.minor)
+    return current >= floor
+
+
+def _newest_usable_in_index(index_url: str, package: str) -> str:
+    """Candidatas del índice de más nueva a más antigua, la primera usable.
+
+    Se recorren TODAS las versiones compatibles en vez de quedarse con la más
+    nueva: si la última publicada es solo para un Python más moderno que el
+    que ejecuta la app, se baja a la siguiente.
+    """
+    candidates: list[tuple[tuple, str]] = []
+    for version, _filename in _index_wheel_list(index_url, package):
+        public = _public_version(version)
+        key = _version_key(public)
+        if key:
+            candidates.append((key, public))
+    candidates.sort(reverse=True)
+    for _key, public in candidates:
+        if _index_version_usable(package, public):
+            return public
+    return ""
+
+
+def _pypi_requires_version(package: str, version: str, dependency: str) -> str | None:
+    """Versión exacta de ``dependency`` que exige ``package==version``.
+
+    Es la fuente de verdad para emparejar el set: torchaudio/torchvision NO
+    comparten número de versión con torch (torchaudio 2.11.0 va con torch
+    2.13.0), pero su metadata sí declara qué torch necesitan. Preguntarlo
+    evita el bug inverso al original: instalar un set que existe pero cuyas
+    piezas no encajan entre sí.
+    """
+    cache_key = f"req|{package}|{version}|{dependency}"
+    cached = _wheel_list_cache.get(cache_key)
+    if cached is not None:
+        return cached[0][0] if cached else None
+    pinned: str | None = None
+    try:
+        import json as _json
+
+        payload = _json.loads(
+            _http_get_text(
+                f"https://pypi.org/pypi/{package}/{version}/json", timeout=30
+            )
+        )
+        for requirement in (payload.get("info") or {}).get("requires_dist") or []:
+            text = str(requirement)
+            if not text.lower().startswith(dependency):
+                continue
+            match = re.search(r"==\s*([0-9][0-9A-Za-z.+]*)", text)
+            if match:
+                pinned = match.group(1)
+                break
+    except Exception:
+        pinned = None
+    _wheel_list_cache[cache_key] = [(pinned, "")] if pinned else []
+    return pinned
+
+
+def _pypi_newest_for_torch(package: str, torch_version: str) -> str:
+    """Versión más nueva de ``package`` (PyPI) que exige exactamente esa torch.
+
+    Repliegue para los índices que no publican torchvision/torchaudio (caso
+    real: los wheels CUDA de torch y torchvision viven en el índice de
+    PyTorch, pero torchaudio se sirve desde PyPI). El emparejamiento NO puede
+    ser por número de versión — torchaudio 2.11.0 acompaña a torch 2.13.0 —
+    sino por la dependencia que la propia metadata declara.
+    """
+    current = (sys.version_info.major, sys.version_info.minor)
+    for version in _pypi_versions_newest_first(package):
+        floor = _pypi_release_requires_python(package, version)
+        if floor is not None and current < floor:
+            continue
+        pinned = _pypi_requires_version(package, version, "torch")
+        if pinned and _version_key(pinned) == _version_key(torch_version):
+            return version
+    return ""
+
+
+def _plan_cache_path() -> str:
+    return os.path.join(get_bin_dir(), "runtimes", _PLAN_CACHE_FILE)
+
+
+def _read_plan_cache() -> dict | None:
+    """Plan cacheado en disco, solo si sigue siendo válido para este entorno.
+
+    Se descarta si cambió la versión de Python, la plataforma o la variante
+    preferida por el hardware: un plan cacheado para otro intérprete sería
+    precisamente el bug que estamos arreglando.
+    """
+    try:
+        with open(_plan_cache_path(), "r", encoding="utf-8") as fh:
+            payload = json.load(fh)
+    except Exception:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    try:
+        if float(payload.get("ts", 0)) + _PLAN_CACHE_TTL_S < time.time():
+            return None
+    except (TypeError, ValueError):
+        return None
+    environment = payload.get("environment") or {}
+    if environment.get("python") != _python_short():
+        return None
+    if environment.get("platform") != sys.platform:
+        return None
+    if environment.get("preferred") != _gpu_preferred_variant():
+        return None
+    return payload.get("plan") if isinstance(payload.get("plan"), dict) else None
+
+
+def _write_plan_cache(plan: dict) -> None:
+    """Guarda el plan resuelto (best effort: la caché nunca debe romper nada)."""
+    payload = {
+        "ts": time.time(),
+        "environment": {
+            "python": _python_short(),
+            "platform": sys.platform,
+            "preferred": _gpu_preferred_variant(),
+        },
+        "plan": plan,
+    }
+    try:
+        os.makedirs(os.path.dirname(_plan_cache_path()), exist_ok=True)
+        with open(_plan_cache_path(), "w", encoding="utf-8") as fh:
+            json.dump(payload, fh, indent=2)
+    except Exception:
+        pass
+
+
+def clear_pytorch_plan_cache() -> None:
+    """Invalida la caché de resolución (memoria y disco)."""
+    with _probe_cache_lock:
+        _plan_cache["ts"] = 0.0
+        _plan_cache["plan"] = None
+    try:
+        os.remove(_plan_cache_path())
+    except OSError:
+        pass
+    _wheel_list_cache.clear()
+
+
+def _plan_from_offline_defaults(reason: str) -> dict:
+    """Plan sin red: el set conocido bueno sobre el índice preferido.
+
+    Se usa cuando los índices no se pueden consultar (sin red, proxy caído).
+    No es una adivinanza ciega como antes: la variante sale del hardware y el
+    resultado de pip se valida igualmente antes de dar la instalación por
+    buena, así que un plan equivocado se reporta con su causa real.
+    """
+    variant = _resolve_variant("auto")
+    return {
+        "variant": variant,
+        "versions": {},
+        "source": "offline",
+        "note": reason,
+        "attempts": [],
+    }
+
+
+def _pytorch_no_candidate_error(attempts: list[dict]) -> PytorchPlanError:
+    """Error accionable cuando ningún candidato puede satisfacer la petición."""
+    lines = [
+        "No se encontró ninguna versión de PyTorch instalable para este equipo.",
+        "",
+        f"  Python   : {sys.version.split()[0]}",
+        f"  Plataforma: {sys.platform}",
+        "",
+        "Se probaron estos canales de descarga:",
+    ]
+    for attempt in attempts:
+        reason = attempt.get("reason") or "sin versión compatible"
+        lines.append(f"  - {attempt.get('label', attempt.get('variant'))}: {reason}")
+    lines += [
+        "",
+        "Qué puedes hacer:",
+        "  1. Actualiza Python a 3.10 o superior (PyTorch ya no publica",
+        "     wheels para versiones anteriores).",
+        "  2. Si estás tras un proxy o firewall, revisa que puedas abrir",
+        "     https://download.pytorch.org/whl/ y https://pypi.org/simple/.",
+        "  3. Vuelve a intentarlo cuando recuperes la conexión: la lista de",
+        "     versiones se consulta en vivo, no está fijada en el programa.",
+    ]
+    return PytorchPlanError("\n".join(lines), attempts)
+
+
+def resolve_pytorch_plan(variant: str = "auto", use_cache: bool = True) -> dict:
+    """Elige (variante, versiones) que DE VERDAD existen para este equipo.
+
+    Devuelve ``{"variant", "versions": {"torch": "2.13.0", ...}, "source",
+    "attempts"}``. Es el corazón del arreglo: en lugar de fijar
+    ``torch==2.13.0`` sobre un índice elegido a ojo, se consultan los índices
+    de PyTorch y se instala la pareja que tiene wheels para este CPython,
+    esta plataforma y este driver.
+
+    Preferencia (``auto``): la CUDA más nueva que el driver pueda cargar,
+    empezando por la que el driver declara; se degrada a variantes CUDA más
+    antiguas y, en último término, a CPU, en lugar de fallar.
+
+    Lanza :class:`PytorchPlanError` (con la lista de intentos) si ningún
+    candidato sirve. Si no hay red pero hay un plan cacheado válido, se usa;
+    si no, se devuelve el plan offline con el set conocido bueno.
+    """
+    explicit = variant not in ("auto", "", None)
+    requested = _resolve_variant(variant)
+
+    # Suelo real de PyTorch: por debajo, ningún índice publica wheels y seguir
+    # consultando solo alarga el error. Se informa con el mínimo exigido.
+    minimum = _torch_min_python(_TORCH_MIN_PYTHON[0][0])
+    if (sys.version_info.major, sys.version_info.minor) < minimum:
+        raise PytorchPlanError(
+            "PyTorch ya no publica wheels para Python "
+            f"{_python_short()}. Se necesita Python {minimum[0]}.{minimum[1]} "
+            "o superior para instalar los runtimes de IA.\n\n"
+            "Actualiza tu Python (o usa el instalador de la aplicación, que "
+            "incluye su propio intérprete) y vuelve a intentarlo.",
+            [],
+        )
+
+    if not _platform_compatible_index():
+        return _plan_from_offline_defaults(
+            "macOS recibe PyTorch desde PyPI; se usa el set conocido bueno."
+        )
+
+    if use_cache and not explicit:
+        with _probe_cache_lock:
+            cached = _read_plan_cache()
+        if cached is not None:
+            logger.info(
+                "plan de PyTorch desde caché: %s %s",
+                cached.get("variant"), cached.get("versions"),
+            )
+            return cached
+
+    if explicit:
+        candidates = (
+            [_CANDIDATES_BY_VARIANT[requested]]
+            if requested in _CANDIDATES_BY_VARIANT
+            else []
+        )
+    else:
+        preferred = _gpu_preferred_variant()
+        order = [c["variant"] for c in _VARIANT_CANDIDATES]
+        start = order.index(preferred)
+        # Desde la preferida hacia abajo y, si nada funciona, las CUDA que se
+        # descartaron por driver (mejor intentarlo que rendirse) y CPU.
+        below = [v for v in order[start:] if v != "cpu"]
+        above = [v for v in order[:start] if v != "cpu"]
+        candidates = [_CANDIDATES_BY_VARIANT[v] for v in (*below, *above)]
+        if "cpu" in _CANDIDATES_BY_VARIANT:
+            candidates.append(_CANDIDATES_BY_VARIANT["cpu"])
+
+    attempts: list[dict] = []
+    for candidate in candidates:
+        index_url = candidate["url"]
+        label = candidate["label"]
+        variant_name = candidate["variant"]
+
+        torch_version = _newest_usable_in_index(index_url, "torch")
+        if not torch_version:
+            # Índice sin wheels de torch para este intérprete: cu121/cu118
+            # dejaron de publicar versiones hace tiempo y ESTE es el caso que
+            # rompía la instalación (antes se elegía este índice a ojo).
+            attempts.append({
+                "variant": variant_name,
+                "label": label,
+                "reason": "no publica wheels de torch para Python "
+                          f"{_python_short()}",
+            })
+            continue
+
+        versions = {"torch": torch_version}
+        detail = ""
+        for package in ("torchvision", "torchaudio"):
+            version = _newest_usable_in_index(index_url, package)
+            if not version:
+                # Algunos índices no sirven este paquete (torchaudio CUDA vive
+                # en PyPI): se busca la versión que declare depender de esta
+                # torch exacta, que es la relación real entre los paquetes.
+                version = _pypi_newest_for_torch(package, torch_version)
+                if version:
+                    detail = f"{package} desde PyPI"
+            if not version:
+                break
+            versions[package] = version
+
+        if len(versions) != len(_PYTORCH_PACKAGES):
+            missing = [p for p in _PYTORCH_PACKAGES if p not in versions]
+            attempts.append({
+                "variant": variant_name,
+                "label": label,
+                "reason": f"no hay {', '.join(missing)} compatible con torch "
+                          f"{torch_version}",
+            })
+            continue
+
+        plan = {
+            "variant": variant_name,
+            "versions": versions,
+            "source": "index",
+            "note": detail,
+            "attempts": attempts,
+        }
+        if not explicit:
+            _write_plan_cache(plan)
+        logger.info(
+            "PyTorch resuelto: %s %s (índice %s)",
+            variant_name, versions, index_url,
+        )
+        return plan
+
+    # Ningún candidato consultable. Antes de rendirse hay que distinguir dos
+    # situaciones muy distintas: que la red funcione y de verdad no exista
+    # nada instalable (error con la lista de intentos) o que los índices no
+    # se hayan podido consultar (se prueba el set conocido bueno y pip dará
+    # el error real si tampoco sirve).
+    if attempts:
+        try:
+            report = run_connectivity_probe()
+            network_ok = bool(report.get("ok"))
+        except Exception:
+            network_ok = False
+        if network_ok:
+            raise _pytorch_no_candidate_error(attempts)
+        logger.warning(
+            "no se pudieron consultar los índices de PyTorch; se usa el set "
+            "conocido bueno (%s)", attempts,
+        )
+    return _plan_from_offline_defaults(
+        "No se pudo consultar los índices de PyTorch; se usa el set conocido bueno."
+    )
+
+
+def pytorch_requirements(plan: dict) -> list[str]:
+    """Requisitos PEP 508 exactos del plan (pin por paquete resuelto).
+
+    Sin pin no habría garantía de que torch/torchvision/torchaudio salgan de
+    la misma familia (una torchvision nueva puede arrastrar un torch viejo).
+    """
+    versions = plan.get("versions") or {}
+    requirements = [
+        f"{package}=={versions[package]}"
+        for package in _PYTORCH_PACKAGES
+        if versions.get(package)
+    ]
+    if len(requirements) == len(_PYTORCH_PACKAGES):
+        return requirements
+    # Plan offline sin versiones resueltas: set conocido bueno.
+    return [_TORCH_PIN, _TORCHVISION_PIN, _TORCHAUDIO_PIN]
+
+
+def describe_pytorch_plan(plan: dict) -> str:
+    """Resumen humano del plan para la barra de progreso y los mensajes.
+
+    El usuario debe ver QUÉ se está instalando (variante y versiones), no solo
+    "Descargando PyTorch...": es la diferencia entre un error opaco y saber
+    que se ha elegido otra CUDA porque la preferida no tenía wheels.
+    """
+    variant = plan.get("variant") or "cpu"
+    label = (_CANDIDATES_BY_VARIANT.get(variant) or {}).get("label", variant)
+    versions = plan.get("versions") or {}
+    if versions:
+        pieces = " + ".join(
+            f"{pkg} {versions[pkg]}" for pkg in _PYTORCH_PACKAGES if versions.get(pkg)
+        )
+        return f"{label} · {pieces}"
+    return label
+
+
+def _build_pytorch_command(variant: str, plan: dict | None = None,
+                           target: str | None = None) -> list[str]:
+    """Construye el comando pip para instalar torch/torchvision/torchaudio.
+
+    ``variant`` puede ser "auto": en ese caso se resuelve contra los índices
+    reales (ver :func:`resolve_pytorch_plan`). ``plan`` permite reutilizar
+    una resolución ya hecha (lo normal desde el instalador, para no consultar
+    la red dos veces). ``target`` es el destino; por defecto el store real.
+    """
+    if plan is None:
+        plan = resolve_pytorch_plan(variant)
+    used_variant = plan.get("variant") or _resolve_variant(variant)
+    index_url = _INDEX_URLS.get(used_variant, _INDEX_URLS["cpu"])
 
     # ``--index-url`` apunta SOLO al índice de CUDA/CPU de PyTorch, así que
     # hay que añadir PyPI como ``--extra-index-url``: ``onnx`` y ``onnxscript``
@@ -793,12 +1567,12 @@ def _build_pytorch_command(variant: str) -> list[str]:
         *_pip_command_prefix(), "install",
         "--isolated", "--no-cache-dir", "--disable-pip-version-check",
         "--ignore-installed", "--only-binary=:all:",
-        "--target", RUNTIME_MODULES_DIR,
+        "--target", target or RUNTIME_MODULES_DIR,
         "--no-warn-script-location",
         "--upgrade",
         "--index-url", index_url,
         "--extra-index-url", "https://pypi.org/simple",
-        _TORCH_PIN, _TORCHVISION_PIN, _TORCHAUDIO_PIN, "onnx", "onnxscript",
+        *pytorch_requirements(plan), "onnx", "onnxscript",
     ]
 
 
@@ -977,6 +1751,7 @@ def _install_onnxruntime_from_wheel(
     end_pct: int,
     abort_event=None,
     timeout: float | None = None,
+    target: str | None = None,
 ) -> None:
     """Descarga el wheel de ONNX Runtime (reanudable + SHA-256) y lo instala.
 
@@ -984,6 +1759,9 @@ def _install_onnxruntime_from_wheel(
     de modo que un corte de red no reinicia la descarga y el contenido se
     verifica. pip instala el archivo LOCAL y solo resuelve las dependencias
     pequeñas (flatbuffers/numpy/packaging/protobuf), que fallan mucho menos.
+
+    ``target`` permite instalar en el directorio de staging en lugar del store
+    (el instalador hace el swap después de validar).
     """
     url, sha256_hex, filename = _onnx_wheel_info(variant)
     wheel_dir = tempfile.mkdtemp(prefix=".drag-onnx-")
@@ -1005,7 +1783,7 @@ def _install_onnxruntime_from_wheel(
                 *_pip_command_prefix(), "install",
                 "--isolated", "--no-cache-dir", "--disable-pip-version-check",
                 "--ignore-installed", "--only-binary=:all:",
-                "--target", RUNTIME_MODULES_DIR,
+                "--target", target or RUNTIME_MODULES_DIR,
                 "--no-warn-script-location",
                 "--upgrade",
                 wheel_path,
@@ -1268,19 +2046,32 @@ def _required_disk_bytes(kind: str, variant: str) -> tuple[int, int]:
     """Estimación conservadora de disco en bytes: ``(instalado, descarga)``.
 
     ``kind`` es "pytorch", "onnxruntime" o "all"; ``variant`` es
-    cpu/cudaXXX. Los wheels CUDA de torch pesan ~2.5 GB instalados (más la
-    descarga comprimida), frente a ~400 MB en CPU; ONNX Runtime es mucho más
-    ligero. Se incluye margen para torchvision/torchaudio/onnx y futuros
-    updates, de modo que el aviso dispare ANTES de que pip falle a mitad de
-    una descarga de gigabytes.
+    cpu/cudaXXX. Los wheels CUDA de torch pesan varios GB instalados (más la
+    descarga comprimida), frente a unas centenas de MB en CPU; ONNX Runtime
+    es mucho más ligero. Se incluye margen para torchvision/torchaudio/onnx y
+    futuros updates, de modo que el aviso dispare ANTES de que pip falle a
+    mitad de una descarga de gigabytes.
+
+    Además, la instalación usa un directorio temporal de staging en la MISMA
+    unidad (se renombra al store, no se copia), así que el pico de disco es
+    el nuevo contenido + el antiguo. Ese pico lo cubre el margen de la tabla;
+    ``_check_disk_space`` exige descarga+instalado cuando ambas rutas están en
+    el mismo dispositivo.
     """
-    is_cuda = variant != "cpu"
     if kind == "pytorch":
-        if is_cuda:
-            return (4_500_000_000, 3_000_000_000)
-        return (400_000_000, 250_000_000)
+        if variant == "cpu":
+            return (1_200_000_000, 800_000_000)
+        # Las CUDA recientes empaquetan el runtime (cuDNN, cuBLAS, ...) y
+        # ocupan más que las antiguas. Valores medidos en una instalación real
+        # de torch 2.14+cu130 (≈3.3 GB instalados, ≈2.5 GB descargados) más
+        # margen para torchvision/torchaudio/onnx y actualizaciones.
+        if variant == "cuda130":
+            return (5_000_000_000, 3_000_000_000)
+        if variant == "cuda126":
+            return (4_500_000_000, 2_800_000_000)
+        return (4_000_000_000, 2_500_000_000)
     if kind == "onnxruntime":
-        if is_cuda:
+        if variant != "cpu":
             return (400_000_000, 200_000_000)
         return (150_000_000, 60_000_000)
     # "all": suma de ambos paquetes.
@@ -1663,9 +2454,424 @@ def _raise_unsupported_python() -> None:
     short = _python_short()
     raise RuntimeError(
         f"Python {short} no tiene wheels oficiales de PyTorch/ONNX todavía. "
-        "Por favor, usa Python 3.9–3.14 para que la descarga funcione, "
+        "Por favor, usa Python 3.10–3.14 para que la descarga funcione, "
         "o instala torch/onnxruntime manualmente en este entorno."
     )
+
+
+# ---------------------------------------------------------------------------
+# Instalación por staging + swap (nunca dejar el store a medias)
+#
+# El método antiguo instalaba con ``pip install --target <store> --upgrade
+# --ignore-installed`` directamente sobre el store en uso. Consecuencias
+# reales observadas en un store de producción:
+#
+#   * pip no retira los ``*.dist-info`` de la versión anterior, así que el
+#     store acumulaba metadatos duplicados (numpy 2.4.4 Y 2.5.2, protobuf
+#     7.35.1 Y 7.36.0, packaging 26.2 Y 26.3...) y ``importlib.metadata``
+#     podía reportar la versión equivocada.
+#   * una instalación abortada dejaba archivos sueltos mezclados con la
+#     versión vieja: la causa del clásico "instaló pero no importa".
+#   * no había forma de validar el resultado ANTES de tocar lo que ya
+#     funcionaba.
+#
+# Ahora pip instala en un directorio temporal limpio en la MISMA unidad, se
+# valida ahí (subproceso aislado) y solo entonces se sustituye el contenido
+# del store. Si algo falla, se restaura lo anterior: el usuario nunca se
+# queda peor que antes de intentarlo.
+# ---------------------------------------------------------------------------
+
+# Subcarpetas de trabajo del staging. Viven en bin/runtimes/ (fuera del
+# store) para que un swap nunca se confunda con contenido instalado.
+_STAGING_DIR_NAME = ".staging"
+_ASIDE_DIR_NAME = ".previous"
+
+
+def _install_base_dir() -> str:
+    return os.path.dirname(RUNTIME_MODULES_DIR.rstrip("\\/")) or RUNTIME_MODULES_DIR
+
+
+def _staging_dir() -> str:
+    return os.path.join(_install_base_dir(), _STAGING_DIR_NAME)
+
+
+def _aside_dir() -> str:
+    return os.path.join(_install_base_dir(), _ASIDE_DIR_NAME)
+
+
+def _store_entries(path: str) -> set[str]:
+    """Nombres de primer nivel del store (set vacío si no existe)."""
+    try:
+        return set(os.listdir(path))
+    except OSError:
+        return set()
+
+
+def _move_store_to_aside() -> None:
+    """Aparta el store actual a ``bin/runtimes/.previous`` (un solo paso).
+
+    Se hace UNA vez por ciclo de instalación, antes de la primera llamada, y
+    sirve a la vez de copia de seguridad para restaurar y de estado antiguo
+    del que reciclar los paquetes que la nueva instalación no toca (p. ej.
+    instalar PyTorch conserva el onnxruntime ya presente en vez de borrarlo).
+
+    Bloqueado por Windows: si el store está en uso, el ``rename`` puede
+    fallar; en ese caso se deja el store donde está (el guard de versión
+    cubrirá los wheels incompatibles) y se sigue con staging vacío.
+    """
+    if _store_entries(RUNTIME_MODULES_DIR):
+        _rmtree_quiet(_aside_dir())
+        try:
+            os.makedirs(_install_base_dir(), exist_ok=True)
+            os.rename(RUNTIME_MODULES_DIR, _aside_dir())
+            return
+        except OSError as exc:
+            logger.warning("no se pudo apartar el store para el swap: %s", exc)
+    try:
+        os.makedirs(RUNTIME_MODULES_DIR, exist_ok=True)
+    except Exception:
+        pass
+
+
+def _commit_staging(replace_prefixes: tuple[str, ...]) -> None:
+    """Sustituye en el store los paquetes del prefijo dado por lo staged.
+
+    Estrategia: se borran del store los paquetes que la nueva instalación
+    reemplaza (el paquete, ``<paquete>.libs`` y sus ``*.dist-info``), se
+    reciclan del estado anterior los que la nueva instalación no incluye, y
+    se mueven los staged al store. Al final el store es autoconsistente y sin
+    metadatos duplicados, porque todo lo que entra viene de una instalación
+    limpia hecha de una vez.
+    """
+    staging = _staging_dir()
+    if not os.path.isdir(staging):
+        raise RuntimeError(
+            "La instalación no generó archivos: el directorio temporal de "
+            f"staging no existe ({staging})."
+        )
+    os.makedirs(RUNTIME_MODULES_DIR, exist_ok=True)
+    new_entries = _store_entries(staging)
+
+    # 1. Fuera del store lo que se reemplaza (incluye dist-info huérfanos).
+    for entry in list(_store_entries(RUNTIME_MODULES_DIR)):
+        if _entry_matches_prefixes(entry, replace_prefixes):
+            _rmtree_quiet(os.path.join(RUNTIME_MODULES_DIR, entry))
+
+    # 2. Reciclar del estado apartado lo que la nueva instalación no trae.
+    #    Se descartan los wheels compilados para OTRA versión de Python: son
+    #    justo la basura que rompía la detección del store.
+    aside = _aside_dir()
+    for entry in list(_store_entries(aside)):
+        if entry in new_entries or _entry_matches_prefixes(entry, replace_prefixes):
+            continue
+        if entry == "__pycache__":
+            continue
+        if entry.endswith(".dist-info") and _dist_info_is_foreign(entry):
+            continue
+        source = os.path.join(aside, entry)
+        target = os.path.join(RUNTIME_MODULES_DIR, entry)
+        if os.path.exists(target):
+            continue
+        try:
+            os.rename(source, target)
+        except OSError:
+            try:
+                shutil.move(source, target)
+            except Exception:
+                logger.warning("no se pudo reciclar %s del store anterior", entry)
+
+    # 3. Mover lo staged dentro (rename, misma unidad: instantáneo).
+    for entry in sorted(new_entries):
+        source = os.path.join(staging, entry)
+        target = os.path.join(RUNTIME_MODULES_DIR, entry)
+        _rmtree_quiet(target)
+        try:
+            os.rename(source, target)
+        except OSError:
+            if os.path.isdir(source):
+                shutil.copytree(source, target, dirs_exist_ok=True)
+                _rmtree_quiet(source)
+            else:
+                shutil.copy2(source, target)
+                _rmtree_quiet(source)
+    _rmtree_quiet(staging)
+    _schedule_aside_cleanup()
+
+
+def _entry_matches_prefixes(entry: str, prefixes: tuple[str, ...]) -> bool:
+    """True si una entrada del store pertenece a uno de los paquetes dados.
+
+    Empareja el paquete (``torch``), sus datos compilados (``torch.libs``) y
+    TODOS sus metadatos (``torch-2.13.0+cu130.dist-info``), que es justo la
+    basura que ``pip --target --upgrade`` dejaba atrás.
+
+    Las comparaciones normalizan ``-`` y ``_`` porque el nombre canónico de un
+    paquete no coincide con el del directorio ni con el de sus metadatos:
+    ``onnxruntime_gpu-1.30.0.dist-info`` declara ``Name: onnxruntime-gpu`` y
+    ``onnx_ir-1.0.0.dist-info`` declara ``onnx-ir``. Comparando solo el prefijo
+    del nombre de archivo, esos metadatos sobrevivían a la desinstalación y la
+    app seguía reportando el runtime como instalado.
+    """
+    candidates = _dist_info_name_variants(entry) if entry.endswith(".dist-info") else ()
+    for prefix in prefixes:
+        if entry == prefix:
+            return True
+        if entry.startswith(prefix + "."):
+            return True
+        if candidates and prefix.replace("-", "_") in candidates:
+            return True
+    return False
+
+
+def _dist_info_name(dist_info_dirname: str) -> str:
+    """Nombre de paquete declarado por un ``*.dist-info`` (normalizado).
+
+    Se prefiere el ``Name`` real de la metadata (fuente autoritativa); si no se
+    puede leer, se cae al prefijo del nombre del directorio.
+    """
+    variants = _dist_info_name_variants(dist_info_dirname)
+    if variants:
+        return sorted(variants, key=len, reverse=True)[0].replace("_", "-")
+    base = dist_info_dirname[: -len(".dist-info")]
+    return base.split("-", 1)[0].replace("_", "-").lower()
+
+
+def _dist_info_name_variants(dist_info_dirname: str) -> frozenset[str]:
+    """Posibles nombres de paquete de un ``*.dist-info``, normalizados.
+
+    Devuelve todas las formas con ``_`` (la convención que usan los prefijos
+    internos) para poder comparar sin adivinar. Incluye el nombre del
+    directorio truncado en el último guion antes de la versión, que es lo que
+    permite reconocer metadatos huérfanos cuyo ``METADATA`` falta.
+    """
+    base = dist_info_dirname[: -len(".dist-info")]
+    variants: set[str] = set()
+
+    metadata_name = ""
+    try:
+        metadata_path = os.path.join(RUNTIME_MODULES_DIR, dist_info_dirname, "METADATA")
+        with open(metadata_path, "r", encoding="utf-8", errors="replace") as fh:
+            for _ in range(40):
+                line = fh.readline()
+                if not line:
+                    break
+                if line.lower().startswith("name:"):
+                    metadata_name = line.split(":", 1)[1].strip()
+                    break
+                if not line.strip():
+                    break
+    except OSError:
+        metadata_name = ""
+
+    if metadata_name:
+        variants.add(metadata_name.replace("-", "_").lower())
+    # Prefijo del directorio: "onnxruntime_gpu-1.30.0" -> "onnxruntime_gpu".
+    head = base.split("-", 1)[0]
+    if head:
+        variants.add(head.replace("-", "_").lower())
+        variants.add(head.replace("_", "-").replace("-", "_").lower())
+    return frozenset(variants)
+
+
+def _schedule_aside_cleanup() -> None:
+    """Programa el borrado del store anterior para el próximo arranque.
+
+    No se borra ahora a propósito: si este proceso ya importó torch desde la
+    ruta vieja, Windows mantiene sus DLL mapeadas y borrarlas en caliente
+    dejaría el runtime a medias. ``process_pending_cleanup()`` lo completa al
+    arrancar, antes de importar nada.
+    """
+    aside = _aside_dir()
+    if not os.path.isdir(aside):
+        return
+    try:
+        from src.dependencies import _rmtree_force
+
+        _rmtree_force(aside)
+    except Exception:
+        _rmtree_quiet(aside)
+
+
+def cleanup_install_leftovers() -> int:
+    """Borra restos de instalaciones anteriores (llamado al arrancar).
+
+    Un cierre a mitad de swap puede dejar ``.staging`` (instalación sin
+    validar) o ``.previous`` (store anterior). Ninguno debe sobrevivir: el
+    staging a medias no debe poder confundirse con el store y el anterior ya
+    no se necesita. Devuelve cuántos directorios limpió.
+
+    Guarda de seguridad: ``.previous`` SOLO se borra si parece un store
+    instalado de verdad (lo que deja un swap). Si un test o un script ha
+    redirigido ``RUNTIME_MODULES_DIR`` y ha dejado ahí contenido ajeno a un
+    swap, se respeta: el árbol ``bin/`` no está en git y borrar por error
+    significa perder varios GB sin vuelta atrás (pasó durante el desarrollo).
+    """
+    cleaned = 0
+
+    staging = _staging_dir()
+    if os.path.isdir(staging):
+        _rmtree_quiet(staging)
+        if not os.path.isdir(staging):
+            cleaned += 1
+
+    aside = _aside_dir()
+    if os.path.isdir(aside) and _looks_like_store(aside):
+        try:
+            from src.dependencies import _rmtree_force
+
+            _rmtree_force(aside)
+        except Exception:
+            _rmtree_quiet(aside)
+        if not os.path.isdir(aside):
+            cleaned += 1
+
+    return cleaned
+
+
+def _looks_like_store(path: str) -> bool:
+    """True si ``path`` parece un store de runtimes con paquetes instalados.
+
+    Exige evidencia fuerte: un directorio de paquete conocido (``torch``,
+    ``onnxruntime``, ...) o metadatos de wheel (``*.dist-info``). Un
+    directorio con contenido arbitrario no pasa, y eso es deliberado: es la
+    diferencia entre limpiar un swap de verdad y borrar datos que un test o un
+    usuario hayan dejado ahí (el árbol ``bin/`` no está en git).
+    """
+    entries = _store_entries(path)
+    if not entries:
+        return False
+    if any(
+        os.path.isdir(os.path.join(path, name))
+        for name in ("torch", "onnxruntime", "torchvision", "torchaudio")
+    ):
+        return True
+    return any(entry.endswith(".dist-info") for entry in entries)
+
+
+def _merge_missing_from_base(destination: str) -> None:
+    """Copia al destino los paquetes de ``.previous`` que le falten.
+
+    Necesario para validar en staging un paquete cuyas dependencias ya
+    existían en el store (p. ej. PyTorch nuevo con numpy del store anterior):
+    el subproceso de validación debe ver el mismo conjunto que verá la app
+    tras el swap.
+    """
+    aside = _aside_dir()
+    if not os.path.isdir(aside):
+        return
+    existing = _store_entries(destination)
+    for entry in _store_entries(aside):
+        if entry in existing or entry == "__pycache__":
+            continue
+        source = os.path.join(aside, entry)
+        target = os.path.join(destination, entry)
+        try:
+            if os.path.isdir(source):
+                shutil.copytree(source, target, dirs_exist_ok=True)
+            else:
+                shutil.copy2(source, target)
+        except Exception:
+            logger.warning("no se pudo preparar %s para la validación", entry)
+
+
+def _validate_package_in_dir(module_name: str, target: str,
+                             timeout: float = 180.0) -> tuple[bool, str]:
+    """Verifica en un subproceso aislado que ``module_name`` importe de ``target``.
+
+    Se usa antes del swap (validar staging) y después (confirmar el store).
+    Nombre de módulo distinto por llamada a propósito: la sonda valida SIEMPRE
+    el directorio que se le pasa y registra su origen, de modo que un éxito
+    con el store viejo no pueda confundirse con un éxito con el staging.
+    """
+    python = get_embed_python_path()
+    if python is None:
+        if getattr(sys, "frozen", False):
+            return False, (
+                "No se encontró el Python privado (embed-python) junto al "
+                "ejecutable: no se puede validar el runtime. Reinstala la app."
+            )
+        python = sys.executable
+    try:
+        proc = subprocess.run(
+            [python, "-c", _IMPORT_PROBE_SOURCE, target, module_name],
+            capture_output=True, text=True, timeout=timeout,
+            env=_isolated_pip_env(),
+        )
+    except subprocess.TimeoutExpired:
+        return False, (
+            f"La validación de '{module_name}' agotó {int(timeout)}s (el "
+            "import se colgó; posible antivirus examinando las DLL recién "
+            "extraídas)."
+        )
+    except OSError as exc:
+        return False, f"No se pudo ejecutar la validación ({python}): {exc}"
+    if proc.returncode == 0 and "DRAGGY-IMPORT-OK" in (proc.stdout or ""):
+        return True, ""
+    output = ((proc.stdout or "") + (proc.stderr or "")).strip()
+    return False, output or f"(sin salida; exit code {proc.returncode})"
+
+
+def _staged_install(
+    report: dict,
+    *,
+    packages: tuple[str, ...],
+    requirements: list[str],
+    index_url: str,
+    kind: str,
+    variant: str,
+    progress_callback,
+    start_pct: int,
+    end_pct: int,
+    message: str,
+    abort_event=None,
+    timeout: float | None = None,
+) -> None:
+    """Instala en staging, valida y sustituye en el store los paquetes dados.
+
+    ``packages`` son los nombres de paquete cuyas entradas del store se
+    reemplazan al hacer el swap. ``requirements`` es lo que se pasa a pip.
+
+    Antes del swap se valida en un subproceso aislado que CADA paquete se
+    importe de verdad desde el staging: es la garantía de que el store nunca
+    queda con una instalación que pip dio por buena pero no es usable (el
+    caso clásico: "instaló pero no importa").
+    """
+    staging = _staging_dir()
+    _rmtree_quiet(staging)
+    os.makedirs(staging, exist_ok=True)
+    _check_disk_space(kind, variant)
+
+    command = [
+        *_pip_command_prefix(), "install",
+        "--isolated", "--no-cache-dir", "--disable-pip-version-check",
+        "--ignore-installed", "--only-binary=:all:",
+        "--target", staging,
+        "--no-warn-script-location",
+        "--upgrade",
+        "--index-url", index_url,
+        "--extra-index-url", "https://pypi.org/simple",
+        *requirements,
+    ]
+    _run_pip_checked(
+        report, command, progress_callback,
+        start_pct=start_pct, end_pct=end_pct, message=message,
+        abort_event=abort_event, timeout=timeout,
+    )
+
+    _merge_missing_from_base(staging)
+    for module_name in packages:
+        ok, detail = _validate_package_in_dir(module_name, staging)
+        if not ok:
+            _rmtree_quiet(staging)
+            raise RuntimeError(
+                f"La instalación de '{module_name}' se descargó pero no se "
+                "puede importar; se ha conservado la versión anterior.\n\n"
+                f"Detalles del import:\n{detail}\n\n"
+                f"staging={staging}"
+            )
+
+    _commit_staging(packages)
+    _invalidate_store_probe_cache()
 
 
 def install_pytorch(
@@ -1679,8 +2885,14 @@ def install_pytorch(
     ``bin/runtimes/ai_modules``.
 
     Separado de ONNX Runtime: cada fila del panel de dependencias instala
-    únicamente su paquete, evitando arrastrar 3 GB de torch cuando el
+    únicamente su paquete, evitando arrastrar varios GB de torch cuando el
     usuario solo quiere ONNX (y viceversa).
+
+    La pareja (variante, versión) NO se fija a mano: la resuelve
+    :func:`resolve_pytorch_plan` consultando los índices de PyTorch, porque un
+    pin estático sobre un índice elegido por heurística es exactamente lo que
+    hacía fallar la instalación con "Could not find a version that satisfies
+    the requirement torch==X".
 
     ``abort_event`` cancela la descarga; ``timeout`` acota el tiempo total.
     """
@@ -1691,20 +2903,35 @@ def install_pytorch(
     # Purga previa: si el store tiene wheels de otra versión de Python
     # (cp314 vs cp311), quitarlos para que pip resuelva limpio.
     _purge_foreign_version_wheels()
-    used_variant = _resolve_variant(variant)
+
+    plan = resolve_pytorch_plan(variant)
+    used_variant = plan.get("variant") or _resolve_variant(variant)
+    # El preflight de disco va ANTES de apartar el store: si no hay espacio, la
+    # instalación debe abortar sin haber tocado nada. (Antes se apartaba el
+    # store primero y el abort lo dejaba movido de sitio: el runtime
+    # "desaparecía" de su carpeta sin que se hubiera instalado nada.)
     _check_disk_space("pytorch", used_variant)
-    _run_pip_checked(
+    _move_store_to_aside()
+
+    # El plan debe fijar las tres piezas para que no se mezclen familias
+    # (una torchvision nueva puede arrastrar un torch viejo).
+    requirements = [*pytorch_requirements(plan), "onnx", "onnxscript"]
+    _staged_install(
         report,
-        _build_pytorch_command(used_variant),
-        progress_callback,
+        packages=("torch", "torchvision", "torchaudio", "onnx", "onnxscript"),
+        requirements=requirements,
+        index_url=_INDEX_URLS.get(used_variant, _INDEX_URLS["cpu"]),
+        kind="pytorch",
+        variant=used_variant,
+        progress_callback=progress_callback,
         start_pct=5,
         end_pct=99,
-        message="Descargando PyTorch...",
+        message=f"Descargando PyTorch ({describe_pytorch_plan(plan)})...",
         abort_event=abort_event,
         timeout=timeout,
     )
-    # Purga posterior: pip --target deja dist-infos huérfanos de la versión
-    # previa que mantendrían el store 'incompatible' (guard de versión).
+
+    # Purga posterior: cubre wheels ajenos reciclados del store anterior.
     _purge_foreign_version_wheels()
     _invalidate_store_probe_cache("torch")
     if progress_callback:
@@ -1736,15 +2963,73 @@ def install_pytorch(
     return used_variant
 
 
+def _install_onnx_stack_into_staging(
+    report: dict,
+    staging: str,
+    progress_callback,
+    start_pct: int,
+    end_pct: int,
+    abort_event=None,
+    timeout: float | None = None,
+) -> None:
+    """Instala ``onnx``/``onnxscript`` (y sus dependencias) en el staging.
+
+    Es lo que usa ``torch.onnx.export`` para convertir checkpoints ``.pth`` a
+    ONNX. Va aparte del wheel de ONNX Runtime porque vive en PyPI, no en el
+    índice de PyTorch, y porque el instalador de PyTorch ya los instala: así
+    instalar/desinstalar cualquiera de los dos runtimes es simétrico.
+
+    Un fallo aquí NO aborta la instalación del runtime: ONNX Runtime sirve
+    para ejecutar modelos .onnx aunque no se pueda convertir. Se registra y se
+    sigue; el usuario verá el aviso correspondiente al intentar convertir.
+    """
+    try:
+        _run_pip_checked(
+            report,
+            [
+                *_pip_command_prefix(), "install",
+                "--isolated", "--no-cache-dir", "--disable-pip-version-check",
+                "--ignore-installed", "--only-binary=:all:",
+                "--target", staging,
+                "--no-warn-script-location",
+                "--upgrade",
+                "onnx", "onnxscript",
+            ],
+            progress_callback,
+            start_pct=start_pct,
+            end_pct=end_pct,
+            message="Instalando el soporte de conversión ONNX...",
+            abort_event=abort_event,
+            timeout=timeout,
+        )
+    except RuntimeError as exc:
+        if str(exc) == "cancelled by user":
+            raise
+        logger.warning("no se pudo instalar el stack onnx en el staging: %s", exc)
+
+
 def install_onnxruntime(
     variant: str = "auto",
     progress_callback=None,
     parent=None,
     abort_event=None,
     timeout: float | None = None,
+    staged: bool = True,
 ) -> str:
-    """Instala SOLO ONNX Runtime (onnxruntime / onnxruntime-gpu) en
+    """Instala ONNX Runtime (onnxruntime / onnxruntime-gpu) en
     ``bin/runtimes/ai_modules``.
+
+    Instala además el stack ``onnx``/``onnxscript``: es lo que necesita
+    ``torch.onnx.export`` para convertir un ``.pth`` a ONNX, y desinstalar
+    ONNX Runtime se lo lleva (sin ninguno de los dos runtimes no sirve para
+    nada). Si solo se instalara el runtime, el usuario que desinstala y
+    reinstala se encontraría con que ya no puede convertir modelos, sin ningún
+    aviso. Como el desinstalador los trata como parte del grupo, el instalador
+    debe reponerlos: instalar y desinstalar tienen que ser simétricos.
+
+    Usa el mismo esquema de staging que PyTorch: descarga y valida en un
+    directorio limpio y solo entonces sustituye el store, conservando lo que
+    ya estaba (torch, numpy, ...).
 
     ``abort_event`` cancela la descarga; ``timeout`` acota el tiempo total.
     """
@@ -1754,12 +3039,54 @@ def install_onnxruntime(
     os.makedirs(RUNTIME_MODULES_DIR, exist_ok=True)
     _purge_foreign_version_wheels()
     used_variant = _resolve_variant(variant)
-    _check_disk_space("onnxruntime", used_variant)
-    _install_onnxruntime_from_wheel(
-        used_variant, report, progress_callback,
-        start_pct=5, end_pct=99,
-        abort_event=abort_event, timeout=timeout,
-    )
+
+    # Paquete real que se instala (gpu/cpu) y, por tanto, el que se valida y
+    # cuyas entradas del store se reemplazan.
+    backend = "onnxruntime_gpu" if used_variant != "cpu" else "onnxruntime"
+    replaces = (backend, "onnxruntime", "onnxruntime-gpu", "onnx", "onnxscript", "onnx_ir")
+    onnx_stack = ("onnx", "onnxscript", "onnx_ir")
+
+    if staged:
+        staging = _staging_dir()
+        _rmtree_quiet(staging)
+        os.makedirs(staging, exist_ok=True)
+        _check_disk_space("onnxruntime", used_variant)
+        # Antes de apartar el store: un abort por disco no debe mover nada.
+        _move_store_to_aside()
+        # El runtime por su wheel oficial (descarga reanudable + SHA-256)...
+        _install_onnxruntime_from_wheel(
+            used_variant, report, progress_callback,
+            start_pct=5, end_pct=90,
+            abort_event=abort_event, timeout=timeout, target=staging,
+        )
+        # ...y el stack onnx desde PyPI, que es donde vive.
+        _install_onnx_stack_into_staging(
+            report, staging, progress_callback,
+            start_pct=90, end_pct=97,
+            abort_event=abort_event, timeout=timeout,
+        )
+        # Las dependencias que la instalación no trae se reciclan del store
+        # anterior para que la validación vea el mismo conjunto que verá la app.
+        _merge_missing_from_base(staging)
+        for module_name in ("onnxruntime", *onnx_stack):
+            ok, detail = _validate_package_in_dir(module_name, staging)
+            if not ok:
+                _rmtree_quiet(staging)
+                raise RuntimeError(
+                    f"'{module_name}' se descargó pero no se puede importar; "
+                    "se ha conservado la versión anterior.\n\n"
+                    f"Detalles del import:\n{detail}\n\n"
+                    f"staging={staging}"
+                )
+        _commit_staging(replaces)
+    else:
+        _check_disk_space("onnxruntime", used_variant)
+        _install_onnxruntime_from_wheel(
+            used_variant, report, progress_callback,
+            start_pct=5, end_pct=99,
+            abort_event=abort_event, timeout=timeout,
+        )
+
     _purge_foreign_version_wheels()
     _invalidate_store_probe_cache("onnxruntime")
     if progress_callback:
@@ -1805,29 +3132,54 @@ def install_runtimes(
     os.makedirs(RUNTIME_MODULES_DIR, exist_ok=True)
     _purge_foreign_version_wheels()
 
-    used_variant = _resolve_variant(variant)
+    # Una sola resolución para todo el ciclo: el índice, la variante y las
+    # versiones se consultan una vez y se reutilizan en las dos fases.
+    plan = resolve_pytorch_plan(variant)
+    used_variant = plan.get("variant") or _resolve_variant(variant)
 
     # Umbral combinado: el pico de disco lo marcan los wheels CUDA de torch.
+    # Antes de apartar el store, para que un abort por falta de espacio no
+    # mueva la instalación existente.
     _check_disk_space("all", used_variant)
+    _move_store_to_aside()
 
     # 1. PyTorch (la parte más grande)
-    _run_pip_checked(
+    _staged_install(
         report,
-        _build_pytorch_command(used_variant),
-        progress_callback,
+        packages=("torch", "torchvision", "torchaudio", "onnx", "onnxscript"),
+        requirements=[*pytorch_requirements(plan), "onnx", "onnxscript"],
+        index_url=_INDEX_URLS.get(used_variant, _INDEX_URLS["cpu"]),
+        kind="all",
+        variant=used_variant,
+        progress_callback=progress_callback,
         start_pct=5,
         end_pct=85,
-        message="Descargando PyTorch...",
+        message=f"Descargando PyTorch ({describe_pytorch_plan(plan)})...",
         abort_event=abort_event,
         timeout=timeout,
     )
 
-    # 2. ONNX Runtime (wheel oficial descargado de forma reanudable)
+    # 2. ONNX Runtime (wheel oficial descargado de forma reanudable) sobre el
+    #    store ya actualizado por la fase anterior.
+    backend = "onnxruntime_gpu" if used_variant != "cpu" else "onnxruntime"
+    staging = _staging_dir()
+    _rmtree_quiet(staging)
+    os.makedirs(staging, exist_ok=True)
     _install_onnxruntime_from_wheel(
         used_variant, report, progress_callback,
         start_pct=86, end_pct=99,
-        abort_event=abort_event, timeout=timeout,
+        abort_event=abort_event, timeout=timeout, target=staging,
     )
+    _merge_missing_from_base(staging)
+    ok, detail = _validate_package_in_dir("onnxruntime", staging)
+    if not ok:
+        _rmtree_quiet(staging)
+        raise RuntimeError(
+            "ONNX Runtime se descargó pero no se puede importar; se ha "
+            "conservado la versión anterior.\n\n"
+            f"Detalles del import:\n{detail}\n\nstaging={staging}"
+        )
+    _commit_staging((backend, "onnxruntime", "onnxruntime-gpu"))
 
     _purge_foreign_version_wheels()
 
@@ -1864,14 +3216,23 @@ def install_runtimes(
 # ---------------------------------------------------------------------------
 
 
-def _version_of(module_name: str) -> str:
-    """Obtiene la versión exclusivamente desde dist-info del store local."""
+def _version_of(module_name: str, extra_names: tuple[str, ...] = ()) -> str:
+    """Obtiene la versión exclusivamente desde dist-info del store local.
+
+    ``extra_names`` cubre los paquetes cuyo nombre de DISTRIBUCIÓN no coincide
+    con el de importación: ``import onnxruntime`` puede venir del wheel
+    ``onnxruntime-gpu`` (y el driver CUDA decide cuál de los dos se instaló),
+    así que sin esta lista la UI mostraba la versión como "—".
+    """
+    candidates = {module_name.replace("_", "-").lower()}
+    candidates.update(name.replace("_", "-").lower() for name in extra_names)
+    candidates.update(name.replace("_", "").lower() for name in extra_names)
     try:
         import importlib.metadata as _meta
-        wanted = module_name.replace("_", "-").lower()
+
         for dist in _meta.distributions(path=[RUNTIME_MODULES_DIR]):
             name = (dist.metadata.get("Name") or "").replace("_", "-").lower()
-            if name == wanted:
+            if name in candidates or name.replace("-", "") in candidates:
                 return dist.version or "—"
     except Exception:
         pass
@@ -1963,7 +3324,7 @@ def onnx_status() -> dict:
         "installed": installed,
         "local": installed,
         "system": _can_import_system("onnxruntime") if not installed else False,
-        "version": _version_of("onnxruntime") if installed else "—",
+        "version": _version_of("onnxruntime", ("onnxruntime-gpu", "onnxruntime_gpu")) if installed else "—",
         "gpu": gpu,
         "install_dir": _import_dir("onnxruntime") if installed else RUNTIME_MODULES_DIR,
     }
@@ -1986,11 +3347,97 @@ def install_all(progress_callback=None, parent=None, variant: str = "auto",
     )
 
 
+def _runtime_group_prefixes(dep_id: str) -> tuple[str, ...]:
+    """Entradas del store que pertenecen a un runtime concreto.
+
+    El store es COMPARTIDO por PyTorch y ONNX Runtime, y cada uno arrastra
+    además sus propios satélites. Al desinstalar uno solo se deben ir sus
+    paquetes y metadatos, y **nada más**: borrar el store entero se llevaba por
+    delante el otro runtime y todas las dependencias compartidas (numpy,
+    protobuf, ...) sin que el usuario lo hubiera pedido.
+
+    ``onnx``/``onnxscript``/``onnx_ir`` no valen para nada sin PyTorch
+    (``torch.onnx.export`` es su único consumidor) y sin ONNX Runtime no hay
+    quien ejecute el resultado, así que se van con CUALQUIERA de los dos: es
+    preferible quedarse corto de paquetes (la siguiente instalación los trae)
+    que dejar cientos de MB huérfanos.
+    """
+    onnx_stack = ("onnx", "onnxscript", "onnx_ir")
+    groups = {
+        "torch": ("torch", "torchvision", "torchaudio", "torchgen",
+                  "functorch", *onnx_stack),
+        "onnxruntime": ("onnxruntime", "onnxruntime_gpu", *onnx_stack),
+    }
+    return groups.get(dep_id, ())
+
+
+def _uninstall_runtime_group(dep_id: str) -> tuple[bool, list[str]]:
+    """Borra del store los paquetes de un runtime. Devuelve ``(completo, restos)``.
+
+    ``completo`` es False cuando Windows mantiene algún archivo bloqueado (el
+    runtime ya está importado en este proceso): esos restos se programan para
+    borrarse en el próximo arranque, antes de importar nada.
+
+    Las dependencias compartidas (numpy, protobuf, packaging...) NO se tocan:
+    pueden pertenecer tanto a PyTorch como a ONNX Runtime, y el otro runtime
+    debe seguir funcionando. Lo que quede huérfano se limpia en la siguiente
+    instalación, que reemplaza el paquete y sus metadatos a la vez.
+    """
+    from src.dependencies import _rmtree_force
+
+    prefixes = _runtime_group_prefixes(dep_id)
+    if not prefixes:
+        raise RuntimeError(f"Runtime desconocido: {dep_id}")
+
+    targets = [
+        entry
+        for entry in sorted(_store_entries(RUNTIME_MODULES_DIR))
+        if _entry_matches_prefixes(entry, prefixes)
+    ]
+    if not targets:
+        # Nada que borrar: el runtime no está en el store (o ya se limpió).
+        return True, []
+
+    leftovers: list[str] = []
+    for entry in targets:
+        path = os.path.join(RUNTIME_MODULES_DIR, entry)
+        complete = _rmtree_force(path)
+        if not complete or os.path.exists(path):
+            leftovers.append(path)
+
+    # Limpieza de restos evidentes de esa instalación (no compartidos).
+    for extra in ("__pycache__",):
+        path = os.path.join(RUNTIME_MODULES_DIR, extra)
+        if os.path.isdir(path):
+            _rmtree_quiet(path)
+
+    _invalidate_store_probe_cache()
+    return not leftovers, leftovers
+
+
+def uninstall_runtime(dep_id: str, parent=None) -> bool:
+    """Desinstala UN runtime (``torch`` u ``onnxruntime``) del store compartido.
+
+    Devuelve True si el borrado quedó completo; False si algún archivo estaba
+    bloqueado y se completará en el próximo arranque.
+    """
+    complete, leftovers = _uninstall_runtime_group(dep_id)
+    if not complete:
+        logger.info(
+            "desinstalación de %s incompleta; restos programados: %s",
+            dep_id, leftovers,
+        )
+    return complete
+
+
 def uninstall_local_runtimes(parent=None) -> None:
     """Borra el store local de runtimes (``bin/runtimes/ai_modules``) completo.
 
-    PyTorch y ONNX Runtime se instalan juntos ahí, así que el borrado es
-    conjunto. En Windows, si algún DLL está cargado (runtime ya importado),
+    Borrado conjunto de PyTorch Y ONNX Runtime. Se mantiene para una limpieza
+    total explícita; el botón "Uninstall" de cada fila usa
+    :func:`uninstall_runtime` para respetar el otro runtime.
+
+    En Windows, si algún DLL está cargado (runtime ya importado),
     ``dependencies._rmtree_force`` lo programa para el próximo arranque.
     """
     try:
