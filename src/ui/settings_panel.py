@@ -9,12 +9,15 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QSlider,
     QSpinBox,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
 
 from src.config import AUDIO_OPTIONS, FORMATS, RESOLUTIONS
 from src.hardware.codecs import get_available_devices_with_codecs
+from src import preferences
+from src.ui.audio_fx_panel import AudioFxPanel
 
 
 class SettingsPanel(QWidget):
@@ -191,6 +194,30 @@ class SettingsPanel(QWidget):
         self.audio_boost_check.setChecked(False)
         grid.addWidget(self.audio_boost_check, 11, 1)
 
+        # Desplegable de Audio Boost avanzado. Va en la misma fila que la
+        # casilla (a su izquierda), cerrado por defecto: el usuario que solo
+        # quiere el boost rápido no ve nada más y el resultado es idéntico
+        # al de siempre.
+        self.audio_fx_toggle = QToolButton()
+        self.audio_fx_toggle.setCheckable(True)
+        self.audio_fx_toggle.setChecked(False)
+        self.audio_fx_toggle.setArrowType(Qt.RightArrow)
+        self.audio_fx_toggle.setText("Avanzado")
+        self.audio_fx_toggle.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        self.audio_fx_toggle.setToolTip(
+            "Abrir para ajustar ecualización, compresión del rango dinámico\n"
+            "y limitación de picos. Sin tocar nada aquí, el boost se aplica\n"
+            "igual que siempre."
+        )
+        grid.addWidget(self.audio_fx_toggle, 11, 0, alignment=Qt.AlignLeft)
+
+        self.audio_fx_panel = AudioFxPanel()
+        self.audio_fx_panel.setVisible(False)
+        grid.addWidget(self.audio_fx_panel, 12, 0, 1, 2)
+
+        self.audio_fx_toggle.toggled.connect(self._on_audio_fx_toggle_clicked)
+        self.audio_fx_panel.changed.connect(self._on_audio_fx_changed)
+
         # Trim
         self.trim_check = QCheckBox("Trim (only export a portion of the video)")
         self.trim_check.toggled.connect(self._on_trim_toggled)
@@ -243,7 +270,52 @@ class SettingsPanel(QWidget):
         # It is disabled only when audio is completely disabled (-an).
         audio = self.audio_combo.currentData()
         self.audio_boost_check.setEnabled(audio != "noaudio")
+        if audio == "noaudio":
+            # Sin audio no hay nada que boostear ni que procesar: se cierra el
+            # desplegable para no ofrecer controles que no harían nada.
+            self.audio_fx_toggle.setChecked(False)
+            self._on_audio_fx_toggled(False)
+        self.audio_fx_toggle.setEnabled(audio != "noaudio")
         self._refresh_audio_track_enabled()
+
+    def _on_audio_fx_toggled(self, expanded):
+        """Muestra/oculta el bloque avanzado y actualiza la flecha."""
+        self.audio_fx_panel.setVisible(bool(expanded))
+        self.audio_fx_toggle.setArrowType(
+            Qt.DownArrow if expanded else Qt.RightArrow
+        )
+
+    def _on_audio_fx_changed(self):
+        """Persiste la configuración de efectos (merge: no pisa otras claves)."""
+        try:
+            preferences.set("audio_fx", self.audio_fx_panel.get_effects())
+        except Exception:
+            pass
+
+    def restore_audio_fx(self):
+        """Carga los efectos guardados y abre el bloque si había algo activo.
+
+        Se llama al construir la ventana. Si el usuario dejó el desplegable
+        abierto, se vuelve a abrir para que no pierda de vista sus ajustes.
+        """
+        try:
+            saved = preferences.get("audio_fx", None)
+            expanded = bool(preferences.get("audio_fx_expanded", False))
+        except Exception:
+            saved, expanded = None, False
+        if saved:
+            # Sin emitir: la restauración no debe reescribir preferencias.
+            self.audio_fx_panel.set_effects(saved)
+        self.audio_fx_toggle.setChecked(expanded)
+        self._on_audio_fx_toggled(expanded)
+        self._on_audio_changed()
+
+    def _on_audio_fx_toggle_clicked(self, checked):
+        self._on_audio_fx_toggled(checked)
+        try:
+            preferences.set("audio_fx_expanded", bool(checked))
+        except Exception:
+            pass
 
     def _refresh_audio_track_enabled(self):
         has_tracks = self.audio_track_combo.count() > 0
@@ -322,6 +394,7 @@ class SettingsPanel(QWidget):
             "format": self.format_combo.currentData(),
             "audio": self.audio_combo.currentData(),
             "audio_boost": self.audio_boost_check.isChecked(),
+            "audio_fx": self.audio_fx_panel.get_effects(),
             "audio_stream_index": self.audio_track_combo.currentData(),
             "audio_stream_label": self.audio_track_combo.currentText(),
             "trim": self.trim_check.isChecked(),

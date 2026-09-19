@@ -555,14 +555,25 @@ def build_args(input_path, output_path, settings, loudnorm_meas=None):
     Audio:
         - noaudio      → -an (sin audio)
         - copy sin boost → -c:a copy (no re-codifica)
-        - aac / mp3 / copy + boost → re-codifica con loudnorm EBU R128
-          (I=-16 LUFS para cine, TP=-1.5, LRA=11 dB)
+        - aac / mp3 / copy + boost → re-codifica con normalización EBU R128
+
+    El boost tiene DOS modos, y el segundo altera al primero (no se apila):
+
+      * **Casilla sola** (``audio_fx`` vacío): two-pass ``loudnorm`` lineal,
+        exactamente el comportamiento histórico.
+      * **Casilla + desplegable con algo activo**: la normalización se integra
+        en ``audio_fx.build_effects_chain()``, que coloca el nivel donde el
+        compresor trabaja, comprime/ecualiza, vuelve a normalizar y limita.
 
     Si ``loudnorm_meas`` es un dict con input_i/input_tp/input_lra/input_thresh/
     target_offset (devuelto por ``src.ffmpeg.loudnorm.measure_loudness``), se
     aplica el modo lineal de dos pasadas para precisión broadcast (-0.5 dB de
     desviación típico vs ±3 dB del single-pass).
     """
+    # Import perezoso: audio_fx no importa runner, así que no hay ciclo, pero
+    # mantiene el arranque de la app ligero.
+    from src.ffmpeg import audio_fx
+
     # Use input seeking (-ss before -i) for fast seeking on large files.
     # Use -t (duration) after the input to avoid timestamp reset surprises.
     start_time = settings.get("start_time")
@@ -640,12 +651,13 @@ def build_args(input_path, output_path, settings, loudnorm_meas=None):
         args.extend(["-c:a", "copy"])
     else:
         # Cualquier otro caso (incluido copy + boost) fuerza re-codificación para
-        # poder aplicar loudnorm.
+        # poder aplicar la normalización.
         codec_a = "libmp3lame" if audio == "mp3" else "aac"
         args.extend(["-c:a", codec_a, "-b:a", "192k"])
         if audio_boost:
-            af = _build_loudnorm_filter(loudnorm_meas)
-            args.extend(["-af", af])
+            af = build_boost_filter(settings, loudnorm_meas)
+            if af:
+                args.extend(["-af", af])
 
     # Formato contenedor
     fmt = settings.get("format", "mp4")
@@ -656,6 +668,38 @@ def build_args(input_path, output_path, settings, loudnorm_meas=None):
 
     args.append(output_path)
     return args
+
+
+def build_boost_filter(settings, measured=None):
+    """Filtro(s) del Audio Boost según lo que haya configurado el usuario.
+
+    Es el ÚNICO punto donde se decide el modo del boost, para que la ruta
+    estándar, la ruta IA y la previsualización se comporten igual:
+
+      * Sin efectos activos  -> ``loudnorm`` lineal two-pass (histórico).
+      * Con efectos activos  -> cadena de ``audio_fx`` (la que altera el boost).
+
+    Devuelve una cadena de filtros lista para ``-af`` (vacía si no hay nada
+    que aplicar).
+    """
+    from src.ffmpeg import audio_fx
+
+    effects = settings.get("audio_fx")
+    if not audio_fx.effects_are_active(effects):
+        return _build_loudnorm_filter(measured)
+
+    measured_i = None
+    if isinstance(measured, dict):
+        try:
+            measured_i = float(measured.get("input_i"))
+        except (TypeError, ValueError):
+            measured_i = None
+    chain = audio_fx.build_effects_chain(
+        effects,
+        measured_i=measured_i,
+        target_lufs=settings.get("audio_target_lufs"),
+    )
+    return ",".join(chain)
 
 
 def _build_loudnorm_filter(measured):

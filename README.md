@@ -107,6 +107,25 @@ alone.
 - Installing **PyTorch** installs them too, so a `.pth`-only workflow works
   after installing either one.
 
+### Audio Boost: two levels
+
+- **Quick:** just the *Audio Boost (normalize volume)* checkbox. It applies the
+  usual two-pass EBU R128 normalization (`loudnorm` `I=-16` / `TP=-1.5` /
+  `LRA=11`) and raises the volume to the streaming standard with nothing to
+  configure.
+- **Detailed:** the *Avanzado* tab next to the checkbox opens an equalizer
+  (bass/mid/treble), a dynamic-range compressor (threshold, ratio, attack,
+  release, with presets) and a peak limiter.
+
+The options in the dropdown **alter the boost itself**, they are not stacked on
+top of it: the normalization is recalculated to let the equalizer and the
+compressor do their job. With nothing enabled the boost behaves exactly as it
+does with the dropdown closed, so merely opening it never changes the sound.
+
+*Escuchar efecto* plays a short excerpt of the track with the current settings
+applied; while it is playing, moving any control returns updated audio so you
+can tune by ear, and *Parar* stops it.
+
 ## Portable builds
 
 GitHub Actions publishes these platform-specific artifacts:

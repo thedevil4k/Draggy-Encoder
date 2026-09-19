@@ -47,6 +47,7 @@ from src.ui.dependencies_dialog import DependenciesDialog
 from src.ui.hardware_dialog import HardwareDialog
 from src.ui.preferences_dialog import PreferencesDialog
 from src.ui.preview_dialog import PreviewDialog
+from src.ui.audio_preview import AudioPreviewEngine
 from src.ui.settings_panel import SettingsPanel
 from src.ui.tasks_panel import TasksPanel
 from src.ui.update_banner import UpdateBanner
@@ -925,6 +926,19 @@ class MainWindow(QMainWindow):
         # no hace nada si los valores no son válidos o la pref está off.
         self._restore_last_codec_device()
 
+        # Efectos de audio guardados + estado del desplegable. Se restaura al
+        # construir la ventana para que el usuario recupere sus ajustes.
+        try:
+            self.settings_panel.restore_audio_fx()
+        except Exception:
+            pass
+
+        # Motor de escucha de los efectos (genera un fragmento y lo reproduce).
+        # Se conecta aquí porque necesita la ruta del vídeo y el ffmpeg de la
+        # ventana, que el panel no conoce.
+        self._audio_preview = AudioPreviewEngine(self)
+        self._wire_audio_preview()
+
         self.settings_scroll = QScrollArea()
         self.settings_scroll.setObjectName("settingsScroll")
         self.settings_scroll.setWidgetResizable(True)
@@ -1595,6 +1609,15 @@ class MainWindow(QMainWindow):
            variantes-update.
         7. Resto: cierre normal sin propuesta.
         """
+        # La escucha de efectos abre un ffmpeg y un reproductor: se detienen
+        # siempre, pase lo que pase con la cadena de auto-actualización, para
+        # no dejar audio sonando ni un proceso huérfano tras cerrar.
+        try:
+            preview = getattr(self, "_audio_preview", None)
+            if preview is not None:
+                preview.cleanup()
+        except Exception:
+            pass
         # 0) Cancel any in-flight regular compress/preview BEFORE
         #    the auto-update dialog runs. The followup path
         #    (Update + Compress + close) keeps its own event.ignore()
@@ -3274,6 +3297,58 @@ class MainWindow(QMainWindow):
             if os.name == "nt"
             else os.path.expanduser("~/Desktop")
         )
+
+    def _wire_audio_preview(self):
+        """Conecta el botón 'Escuchar efecto' del panel con el motor de audio.
+
+        El panel no conoce la ruta del vídeo ni el ffmpeg (los tiene la
+        ventana), así que la conexión vive aquí y el panel solo emite señales.
+        """
+        panel = self.settings_panel.audio_fx_panel
+        panel.preview_requested.connect(self._on_audio_preview_requested)
+        panel.preview_stop_requested.connect(self._on_audio_preview_stopped)
+        self._audio_preview.status.connect(panel.set_status)
+        self._audio_preview.failed.connect(self._on_audio_preview_failed)
+        self._audio_preview.ready.connect(self._on_audio_preview_ready)
+
+    def _on_audio_preview_requested(self):
+        """Genera y reproduce el fragmento con los efectos actuales."""
+        video_path = getattr(self, "input_path", None)
+        if not video_path or not os.path.exists(str(video_path)):
+            preview_panel = self.settings_panel.audio_fx_panel
+            preview_panel.set_playback_state(False)
+            preview_panel.set_status(
+                "Importa un vídeo para poder escuchar los efectos."
+            )
+            return
+        settings = self.settings_panel.get_settings()
+        ffmpeg_path = getattr(self, "ffmpeg_path", None)
+        if not ffmpeg_path:
+            try:
+                from src.ffmpeg.manager import get_local_ffmpeg_path
+
+                ffmpeg_path = get_local_ffmpeg_path()
+            except Exception:
+                ffmpeg_path = None
+        self.settings_panel.audio_fx_panel.set_playback_state(True)
+        self._audio_preview.play(
+            ffmpeg_path,
+            str(video_path),
+            settings.get("audio_fx"),
+            start_time=settings.get("start_time"),
+            audio_stream_index=settings.get("audio_stream_index") or 0,
+        )
+
+    def _on_audio_preview_stopped(self):
+        self._audio_preview.stop()
+
+    def _on_audio_preview_ready(self, _path):
+        self.settings_panel.audio_fx_panel.set_playback_state(True)
+
+    def _on_audio_preview_failed(self, message):
+        panel = self.settings_panel.audio_fx_panel
+        panel.set_playback_state(False)
+        panel.set_status(message)
 
     def _restore_last_codec_device(self):
         """Aplica ``last_device`` + ``last_codec`` desde prefs si está activa

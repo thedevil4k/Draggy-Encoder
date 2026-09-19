@@ -1,0 +1,14 @@
+{
+  "ORT fp32 (raw run)": 71.4,
+  "app ONNXRUNTIMEInferenceEngine fp32 process_frame": 144.82,
+  "app PyTorchInferenceEngine process_frame (x4)": 87.82,
+  "app engine fp16 process_frame (converted model)": 4447.81,
+  "post-process fp32 2880x1920 (ORT path today)": 68.14,
+  "torch autocast fp16 (app today, benchmark=False)": 43.39,
+  "torch autocast fp16 (benchmark=True)": 43.22,
+  "torch fp16 NCHW (benchmark=True)": 42.81,
+  "torch fp16 channels_last (benchmark=True)": 30.12,
+  "torch fp16 cl + full frame round trip (app-shaped)": 63.51,
+  "torch fp32 (cudnn.benchmark=False)": 66.25,
+  "torch fp32 (cudnn.benchmark=True)": 67.19
+}
