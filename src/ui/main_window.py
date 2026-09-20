@@ -803,9 +803,11 @@ class MainWindow(QMainWindow):
         self.btn_output = QPushButton(f"Output: ...{os.path.basename(self.output_dir)}")
         self.btn_output.clicked.connect(self._select_output)
         self.btn_hardware = QPushButton("Hardware Info")
+        self.btn_hardware.setToolTip(
+            "Hardware detectado y códecs disponibles. La redetección de "
+            "hardware y códecs está dentro de esa ventana."
+        )
         self.btn_hardware.clicked.connect(self._show_hardware)
-        self.btn_redetect = QPushButton("Re-detect Hardware & Codecs")
-        self.btn_redetect.clicked.connect(self._on_redetect_clicked)
         self.btn_ai_engines = QPushButton(" AI Engines")
         self.btn_ai_engines.setIcon(QIcon(get_asset_path("AI panel.png")))
         self.btn_ai_engines.setToolTip(
@@ -816,14 +818,13 @@ class MainWindow(QMainWindow):
         self.btn_preferences = QPushButton("Preferences")
         self.btn_preferences.clicked.connect(self._show_preferences)
         for _btn in (self.btn_runtimes, self.btn_output, self.btn_hardware,
-                     self.btn_redetect, self.btn_ai_engines, self.btn_preferences):
+                     self.btn_ai_engines, self.btn_preferences):
             _btn.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
             _btn.setMinimumWidth(0)
 
         top_layout.addWidget(self.btn_runtimes)
         top_layout.addWidget(self.btn_output)
         top_layout.addWidget(self.btn_hardware)
-        top_layout.addWidget(self.btn_redetect)
         top_layout.addWidget(self.btn_ai_engines)
         top_layout.addWidget(self.btn_preferences)
         layout.addLayout(top_layout)
@@ -1470,8 +1471,23 @@ class MainWindow(QMainWindow):
         self._update_ai_rendered_bitrate()
 
     def _show_hardware(self):
-        dialog = HardwareDialog(self.hardware_info, self)
-        dialog.exec()
+        """Abre la ventana de hardware, con los códecs y la redetección dentro.
+
+        El botón de redetectar vive ahora en esa ventana (antes estaba en la
+        barra superior): al pulsarlo se lanza el mismo worker de siempre y, al
+        terminar, la ventana se refresca en el sitio sin cerrarse.
+        """
+        dialog = HardwareDialog(
+            self.hardware_info,
+            compatible_codecs=getattr(self, "compatible_codecs", None),
+            parent=self,
+            redetect_cb=self._on_redetect_clicked,
+        )
+        self._hardware_dialog = dialog
+        try:
+            dialog.exec()
+        finally:
+            self._hardware_dialog = None
 
     def _show_dependencies(self):
         """Open the AI Engines manager (model catalog only).
@@ -3228,7 +3244,7 @@ class MainWindow(QMainWindow):
     def _on_redetect_clicked(self):
         if hasattr(self, "redetect_worker") and self.redetect_worker.isRunning():
             return
-        self.btn_redetect.setEnabled(False)
+        self._set_redetect_busy(True)
         self.btn_compress.setEnabled(False)
         self.btn_preview.setEnabled(False)
         self.progress.setValue(0)
@@ -3242,8 +3258,31 @@ class MainWindow(QMainWindow):
         self.redetect_worker.error.connect(self._on_redetect_error)
         self.redetect_worker.start()
 
+    def _set_redetect_busy(self, busy, message=""):
+        """Marca el estado 'redetectando' en la ventana de hardware abierta.
+
+        El botón vive ahora dentro de ``HardwareDialog``; si no hay ninguna
+        ventana abierta no hay nada que marcar.
+        """
+        dialog = getattr(self, "_hardware_dialog", None)
+        if dialog is not None:
+            try:
+                dialog.set_busy(busy, message)
+            except Exception:
+                logger.debug("could not update the hardware dialog", exc_info=True)
+
+    def _refresh_hardware_dialog(self, hardware_info, compatible_codecs):
+        """Refresca la ventana de hardware si está abierta."""
+        dialog = getattr(self, "_hardware_dialog", None)
+        if dialog is None:
+            return
+        try:
+            dialog.refresh(hardware_info, compatible_codecs)
+        except Exception:
+            logger.debug("could not refresh the hardware dialog", exc_info=True)
+
     def _on_redetect_done(self, hardware_info, compatible_codecs):
-        self.btn_redetect.setEnabled(True)
+        self._set_redetect_busy(False)
         self.btn_compress.setEnabled(bool(self.input_path))
         self.btn_preview.setEnabled(bool(self.input_path))
         self.progress.setValue(100)
@@ -3262,10 +3301,11 @@ class MainWindow(QMainWindow):
         self.settings_panel.refresh(hardware_info, compatible_codecs)
         recommended = hardware_info.get("recommended_device", "CPU")
         self.settings_panel.set_device(recommended)
+        self._refresh_hardware_dialog(hardware_info, compatible_codecs)
         self.status_label.setText("Re-detection finished.")
 
     def _on_redetect_error(self, msg):
-        self.btn_redetect.setEnabled(True)
+        self._set_redetect_busy(False)
         self.btn_compress.setEnabled(bool(self.input_path))
         self.btn_preview.setEnabled(bool(self.input_path))
         self.status_label.setText(f"Re-detection error: {msg}")

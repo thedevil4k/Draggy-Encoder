@@ -1554,10 +1554,10 @@ def test_dependencies_dialog_responsive(qapp):
         qapp.processEvents()
         assert dialog.width() == 1200 and dialog.height() == 800
 
-        # A size below the 820x560 minimum is clamped, not ignored.
+        # A size below the 720x460 minimum is clamped, not ignored.
         dialog.resize(600, 400)
         qapp.processEvents()
-        assert dialog.width() >= 820 and dialog.height() >= 560
+        assert dialog.width() >= 720 and dialog.height() >= 460
 
         # El diálogo default es SOLO Dependencies (binarios): no tiene
         # pestañas y no construye el catálogo de motores.
@@ -1575,11 +1575,37 @@ def test_dependencies_dialog_responsive(qapp):
             assert engines_dialog.width() == 1200 and engines_dialog.height() == 800
             engines_dialog.resize(600, 400)
             qapp.processEvents()
-            assert engines_dialog.width() >= 820 and engines_dialog.height() >= 560
+            assert engines_dialog.width() >= 720 and engines_dialog.height() >= 460
         finally:
             engines_dialog.close()
     finally:
         dialog.close()
+
+
+def test_dependencies_dialog_fits_the_screen(qapp):
+    """El diálogo no puede abrirse más grande que el área útil de la pantalla.
+
+    Con escalado de Windows (150 % en un panel de 1366x768) el área LÓGICA se
+    queda en ~911x512: un 960x640 fijo se salía y los botones quedaban fuera.
+    El contenido ya se desplaza por dentro, así que basta con respetar el área.
+    """
+    from PySide6.QtWidgets import QApplication, QScrollArea
+    from src.ui.dependencies_dialog import DependenciesDialog
+
+    for mode in (None, "ai_engines"):
+        dialog = DependenciesDialog(initial_tab=mode)
+        dialog._check_timer.stop()
+        try:
+            dialog.show()
+            QApplication.processEvents()
+            available = (dialog.screen()
+                         or QApplication.primaryScreen()).availableGeometry()
+            assert dialog.width() <= available.width(), (dialog.width(), available.width())
+            assert dialog.height() <= available.height(), (dialog.height(), available.height())
+            # El contenido se desplaza en su propio scroll (nunca se recorta).
+            assert dialog.findChildren(QScrollArea)
+        finally:
+            dialog.close()
 
 
 def test_preferences_dialog_diagnostics_tab(qapp, monkeypatch):
@@ -1626,6 +1652,147 @@ def test_preferences_dialog_about_tab(qapp):
         assert ISSUES_URL in joined
     finally:
         dialog.close()
+
+
+def test_preferences_dialog_fits_the_screen_and_scrolls(qapp):
+    """El diálogo no puede salir más alto que el área útil de la pantalla.
+
+    Caso real: la pestaña Behavior (siete secciones con explicaciones largas)
+    medía ~1236 px de contenido, así que el diálogo crecía más que la pantalla
+    y los botones OK/Cancel quedaban por debajo del borde, fuera de alcance.
+    """
+    from PySide6.QtWidgets import QApplication, QScrollArea
+    from src.ui import preferences_dialog as pd
+
+    dialog = pd.PreferencesDialog()
+    try:
+        dialog.show()
+        QApplication.processEvents()
+        screen = dialog.screen() or QApplication.primaryScreen()
+        available = screen.availableGeometry()
+        assert dialog.height() <= available.height(), (dialog.height(), available.height())
+        assert dialog.width() <= available.width(), (dialog.width(), available.width())
+        # Cada pestaña vive dentro de un área desplazable: lo que no quepa se
+        # alcanza con la barra, no se recorta.
+        for index in range(dialog.tabs.count()):
+            assert isinstance(dialog.tabs.widget(index), QScrollArea)
+        # Los botones quedan FUERA del scroll: se ven siempre.
+        assert dialog.btn_ok.isVisible() and dialog.btn_cancel.isVisible()
+        bottom = dialog.btn_ok.mapToGlobal(dialog.btn_ok.rect().bottomLeft()).y()
+        assert bottom <= available.y() + available.height()
+    finally:
+        dialog.close()
+
+
+def test_hardware_dialog_lists_codecs_per_device(qapp):
+    """La ventana de hardware lista los códecs disponibles por dispositivo."""
+    from PySide6.QtWidgets import QLabel
+    from src.ui.hardware_dialog import HardwareDialog
+
+    info = {
+        "cpu": {"name": "Test CPU", "cores": 6, "threads": 12},
+        "gpus": [{"name": "NVIDIA GeForce RTX 3060", "vendor": "NVIDIA",
+                  "memory": "12288 MiB"}],
+        "recommended_device": "NVIDIA GPU",
+    }
+    codecs = {
+        "CPU": [("libx264", "H.264 (CPU)"), ("libx265", "HEVC (CPU)"),
+                ("ffv1", "FFV1 (lossless)")],
+        "NVIDIA GPU (NVIDIA GeForce RTX 3060)": [
+            ("h264_nvenc", "H.264 NVENC (8-bit)"),
+            ("hevc_nvenc", "HEVC NVENC (8-bit)"),
+        ],
+    }
+    dlg = HardwareDialog(info, compatible_codecs=codecs)
+    try:
+        texts = [lbl.text() for lbl in dlg.findChildren(QLabel)]
+        joined = "\n".join(texts)
+        # Cabecera de la sección + recuento total y por dispositivo.
+        assert any("Codecs available" in t for t in texts)
+        assert any("5 codec(s) across 2 device(s)" in t for t in texts)
+        assert any("CPU" in t and "3 codec(s)" in t for t in texts)
+        assert any("NVIDIA GPU (NVIDIA GeForce RTX 3060)" in t and "2 codec(s)" in t
+                   for t in texts)
+        # Cada códec, con su encoder y formato de píxel al lado.
+        assert "H.264 NVENC (8-bit)" in joined
+        assert "hevc_nvenc" in joined and "yuv420p" in joined
+        assert "FFV1 (lossless)" in joined and "libx264" in joined
+    finally:
+        dlg.deleteLater()
+
+
+def test_hardware_dialog_without_codecs_says_so(qapp):
+    """Sin datos de códecs lo dice, en vez de mostrar una sección vacía."""
+    from PySide6.QtWidgets import QLabel
+    from src.ui.hardware_dialog import HardwareDialog
+
+    dlg = HardwareDialog({"cpu": {}, "gpus": []})
+    try:
+        texts = [lbl.text() for lbl in dlg.findChildren(QLabel)]
+        assert any("Not detected yet" in t for t in texts)
+    finally:
+        dlg.deleteLater()
+
+
+def test_hardware_dialog_redetect_button_and_refresh(qapp):
+    """El botón de redetectar llama a la función del programa y el diálogo se
+    refresca en el sitio, sin cerrarse."""
+    from PySide6.QtWidgets import QLabel
+    from src.ui.hardware_dialog import HardwareDialog
+
+    calls = []
+    dlg = HardwareDialog({"cpu": {"name": "CPU vieja"}, "gpus": []},
+                         compatible_codecs={}, redetect_cb=lambda: calls.append(1))
+    try:
+        assert dlg.btn_redetect.isEnabled()
+        dlg._on_redetect()
+        assert calls == [1]
+        # Mientras dura: botón bloqueado y aviso visible.
+        assert not dlg.btn_redetect.isEnabled()
+        assert "Re-detecting" in dlg.lbl_busy.text()
+
+        # Llega el resultado -> el diálogo se repinta con los datos nuevos.
+        dlg.refresh({"cpu": {"name": "CPU nueva"}, "gpus": []},
+                    {"CPU": [("libx264", "H.264 (CPU)")]})
+        dlg.set_busy(False)
+        texts = [lbl.text() for lbl in dlg.findChildren(QLabel)]
+        assert any("CPU nueva" in t for t in texts)
+        assert any("H.264 (CPU)" in t for t in texts)
+        assert dlg.btn_redetect.isEnabled()
+    finally:
+        dlg.deleteLater()
+
+
+def test_hardware_dialog_without_callback_disables_redetect(qapp):
+    """Sin función de redetección el botón queda desactivado (no miente)."""
+    from src.ui.hardware_dialog import HardwareDialog
+
+    dlg = HardwareDialog({"cpu": {}, "gpus": []})
+    try:
+        assert not dlg.btn_redetect.isEnabled()
+        dlg._on_redetect()  # no debe lanzar nada
+    finally:
+        dlg.deleteLater()
+
+
+def test_hardware_dialog_fits_the_screen(qapp):
+    """El diálogo de hardware tampoco puede salirse de la pantalla."""
+    from PySide6.QtWidgets import QApplication, QScrollArea
+    from src.ui.hardware_dialog import HardwareDialog
+
+    codecs = {"CPU": [(f"c{i}", f"Códec {i}") for i in range(30)]}
+    dlg = HardwareDialog({"cpu": {"name": "CPU"}, "gpus": []},
+                         compatible_codecs=codecs)
+    try:
+        dlg.show()
+        QApplication.processEvents()
+        available = (dlg.screen() or QApplication.primaryScreen()).availableGeometry()
+        assert dlg.height() <= available.height()
+        assert dlg.width() <= available.width()
+        assert isinstance(dlg.area, QScrollArea)
+        assert dlg.btn_close.isVisible() and dlg.btn_redetect.isVisible()
+    finally:
+        dlg.close()
 
 
 # ==--------------------------------------------------------------------==
@@ -3261,7 +3428,11 @@ def test_hardware_dialog_shows_os_and_python(qapp):
         # Los labels de Python usan rich text (<b>…</b>), así que comprobamos
         # los fragmentos por separado.
         assert any("Python interpreter" in t and "3.11.15 (64-bit)" in t for t in texts)
-        assert any(r"C:\venv\python.exe" in t for t in texts)
+        # La ruta va en un campo de sólo lectura (una etiqueta con la ruta
+        # entera fijaba el ancho mínimo del diálogo), así que se busca ahí.
+        from PySide6.QtWidgets import QLineEdit
+        paths = [edit.text() for edit in dlg.findChildren(QLineEdit)]
+        assert any(r"C:\venv\python.exe" in t for t in paths)
     finally:
         dlg.deleteLater()
 

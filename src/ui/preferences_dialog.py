@@ -37,15 +37,18 @@ from PySide6.QtCore import Qt, QUrl
 from PySide6.QtGui import QDesktopServices, QFont
 from PySide6.QtWidgets import (
     QAbstractItemView,
+    QApplication,
     QCheckBox,
     QComboBox,
     QDialog,
+    QFrame,
     QGroupBox,
     QHBoxLayout,
     QHeaderView,
     QLabel,
     QLineEdit,
     QPushButton,
+    QScrollArea,
     QTableWidget,
     QTableWidgetItem,
     QTabWidget,
@@ -55,6 +58,7 @@ from PySide6.QtWidgets import (
 
 import src.preferences as preferences
 import src.update_history as update_history
+from src.ui.dialog_utils import fit_to_screen, wrap_scrollable
 from src.config import (
     APP_NAME,
     APP_VERSION,
@@ -171,7 +175,9 @@ class PreferencesDialog(QDialog):
     def __init__(self, parent=None, initial_tab="behavior"):
         super().__init__(parent)
         self.setWindowTitle("Preferences — DRAGGY ENCODER")
-        self.setMinimumSize(640, 420)
+        self.setMinimumSize(560, 360)
+        # Ancho preferido: entra el texto de los checkboxes sin barra horizontal.
+        self._PREFERRED_WIDTH = 940
         self.resize(720, 460)
         self.setStyleSheet(
             "QDialog { background-color: #0f0f1a; color: #e0e0e0; }"
@@ -204,6 +210,7 @@ class PreferencesDialog(QDialog):
         self._initial_tab = initial_tab if initial_tab in ("behavior", "history") else "behavior"
         self._build_ui()
         self._load_values()
+        self._fit_to_screen()
 
     def _build_ui(self):
         outer = QVBoxLayout(self)
@@ -211,10 +218,10 @@ class PreferencesDialog(QDialog):
         outer.setContentsMargins(12, 12, 12, 12)
 
         self.tabs = QTabWidget(self)
-        self.tabs.addTab(self._build_behavior_tab(), "Behavior")
-        self.tabs.addTab(self._build_history_tab(), "History")
-        self.tabs.addTab(self._build_diagnostics_tab(), "Diagnostics")
-        self.tabs.addTab(self._build_about_tab(), "About")
+        self.tabs.addTab(self._scrollable(self._build_behavior_tab()), "Behavior")
+        self.tabs.addTab(self._scrollable(self._build_history_tab()), "History")
+        self.tabs.addTab(self._scrollable(self._build_diagnostics_tab()), "Diagnostics")
+        self.tabs.addTab(self._scrollable(self._build_about_tab()), "About")
         if self._initial_tab == "history":
             self.tabs.setCurrentIndex(1)
         else:
@@ -222,6 +229,8 @@ class PreferencesDialog(QDialog):
         outer.addWidget(self.tabs, stretch=1)
 
         # ------------------ Botones ------------------
+        # Van FUERA del área desplazable: tienen que verse siempre, aunque el
+        # contenido de la pestaña no quepa en la pantalla.
         bottom = QHBoxLayout()
         bottom.addStretch()
         self.btn_cancel = QPushButton("Cancel")
@@ -232,6 +241,34 @@ class PreferencesDialog(QDialog):
         bottom.addWidget(self.btn_cancel)
         bottom.addWidget(self.btn_ok)
         outer.addLayout(bottom)
+
+    @staticmethod
+    def _scrollable(page):
+        """Mete una pestaña en un área desplazable (ver ``ui.dialog_utils``).
+
+        La pestaña Behavior creció hasta no caber en pantallas de 768-900 px de
+        alto: las últimas secciones (y los botones) quedaban por debajo del
+        borde. Con el scroll el contenido entra siempre, la ventana puede
+        quedarse dentro del área útil (ver ``_fit_to_screen``) y nada se
+        recorta.
+        """
+        return wrap_scrollable(page)
+
+    def _fit_to_screen(self):
+        """Deja el diálogo dentro del área útil de la pantalla.
+
+        El tamaño lo imponía el contenido, así que en un portátil el diálogo
+        salía más alto que la pantalla. Ahora se limita al área disponible
+        (descontando la barra de tareas) y lo que no cabe se desplaza dentro de
+        cada pestaña.
+
+        El ancho pedido (940) es el que evita la barra horizontal: los textos
+        de los ``QCheckBox`` son frases largas de una línea y no se parten, así
+        que por debajo de ~930 px el contenido pide scroll horizontal (que
+        sigue disponible, sólo que como último recurso).
+        """
+        fit_to_screen(self, preferred_width=self._PREFERRED_WIDTH,
+                      preferred_height=840, min_width=560, min_height=360)
 
     # -------------------- Behavior tab --------------------
 

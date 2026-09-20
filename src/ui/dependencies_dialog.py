@@ -70,6 +70,7 @@ def _friendly_convert_status(raw: str) -> str:
 
 
 from src.ffmpeg.upstream import clear_cache
+from src.ui.dialog_utils import fit_to_screen
 from src.ui.engines_tab import EnginesTab
 
 
@@ -563,7 +564,10 @@ class DependenciesDialog(QDialog):
             "AI Engines — DRAGGY ENCODER" if self._engines_mode
             else "Dependencies — DRAGGY ENCODER"
         )
-        self.setMinimumSize(820, 560)
+        # Mínimo deliberadamente bajo: cada panel tiene su propio scroll, así
+        # que un diálogo más pequeño sigue siendo usable (aparece scroll en las
+        # filas) y en cambio cabe en pantallas lógicas estrechas por escalado.
+        self.setMinimumSize(720, 460)
         self.resize(960, 640)
         self.setStyleSheet(
             "QDialog { background-color: #0f0f1a; color: #e0e0e0; }"
@@ -606,6 +610,13 @@ class DependenciesDialog(QDialog):
         self._check_timer.setSingleShot(True)
         self._check_timer.timeout.connect(self._run_upstream_check)
         self._build()
+        # Que el tamaño inicial quepa en la pantalla. El contenido ya se
+        # desplaza por dentro (cada panel tiene su propio QScrollArea), así que
+        # basta con no pedir más área de la que hay: en pantallas pequeñas —o
+        # con escalado de Windows al 150 %, que reduce el área LÓGICA— un
+        # 960x640 fijo se salía por abajo y dejaba los botones fuera.
+        fit_to_screen(self, preferred_width=960, preferred_height=800,
+                      min_width=720, min_height=460)
 
     def _on_state_changed_for_engines(self, _engine_id=None):
         """Slot del bus de estado (método bound → autodesconexión fiable)."""
