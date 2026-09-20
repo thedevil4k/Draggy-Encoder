@@ -491,6 +491,48 @@ privado") — esperado y ajeno a estos cambios.
 
 ---
 
+## 6.7 NPU / ARM64: aparcado a propósito (2026-09-20)
+
+**Decisión:** no se implementa aceleración por NPU por ahora. Motivo: no hay
+hardware NPU en el equipo de desarrollo, así que no se puede medir, y la
+ganancia es incierta para esta carga (modelo pequeño de 0,62 M params, frame a
+frame: mucho movimiento de datos y pocos FLOPs por píxel, justo lo contrario de
+donde brillan las NPU). Con lo medido, en un portátil la iGPU (Xe/Adreno) tiene
+muchas papeletas de ganar a la NPU en velocidad; la NPU ganaría en consumo.
+
+**Cuándo revisarlo**
+- Al tener un equipo con NPU (lo más barato de probar es un Intel Core Ultra:
+  OpenVINO es el EP más maduro y sencillo).
+- Si aparecen usuarios con portátil **sin GPU dedicada**: ahí el atajo barato
+  es DirectML / OpenVINO-GPU (iGPU), no la NPU. Hoy ese usuario corre en CPU a
+  los 0,67 fps medidos, así que cualquier acelerador ayuda.
+
+**Primer paso exacto cuando toque** (una rama de provider, no un rediseño)
+- Intel: `pip install onnxruntime-openvino` →
+  `providers=[("OpenVINOExecutionProvider", {"device_type": "NPU"})]`. En NPU la
+  precisión es **FP16 obligatoria** (el selector FP16 ya está implementado), las
+  ops no soportadas caen a CPU dentro del grafo y conviene dar formas fijas
+  (`reshape_input`). Existe `AUTO:GPU,NPU,CPU` para no elegir a mano.
+- Qualcomm: `onnxruntime-qnn` (`QNNExecutionProvider`, QAIRT), solo Windows
+  ARM64; lo ideal es INT8, lo que pide un paso de cuantización con calibración
+  (`onnxruntime.quantization`) que hoy no existe.
+- AMD (Ryzen AI / XDNA): Vitis AI EP. El tooling más verde y atado a
+  versión de driver/NPU: dejarlo para el final.
+
+**Lo que ya está preparado (para que salga barato):** la preferencia
+`execution_provider` con fallback que ahora **avisa** en la UI; el selector de
+precisión FP16; la telemetría por etapa y el baremo por provider (se vería
+"NPU · X fps" frente a "CPU · Y fps" sin creerse nada); y el instalador de
+paquetes en el store privado, ya probado con un paquete nuevo (`safetensors`).
+
+**ARM64 no es una variante, es otro producto:** requiere runner ARM64, Python
+privado ARM64 y FFmpeg ARM64. El mayor riesgo histórico (PySide6) está resuelto:
+Qt publica wheels `win_arm64` (6.10/6.11). Aun así, el encargo actual es "solo
+instalador Windows x64 + AppImage Linux", así que ARM64 sería un workflow
+aparte, no una opción de este.
+
+---
+
 ## 7. Siguiente paso propuesto
 
 1. P0 (telemetría) → una sesión de trabajo, riesgo nulo, y da el presupuesto real de cada etapa.
