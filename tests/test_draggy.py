@@ -5319,9 +5319,18 @@ def test_onnx_input_channels_ok_three_state_semantics(monkeypatch):
 
 
 def test_convert_pth_to_onnx_ex_keeps_unverifiable_existing_onnx(tmp_path, monkeypatch):
-    """Si el probe no puede verificar el .onnx existente (onnxruntime
-    ausente) NO se borra: se reutiliza (una conversión previa lo creó).
-    Este es el caso del usuario con realesr-animevideov3.onnx en disco."""
+    """Un .onnx SIN marca de versión ya no se reutiliza a ciegas.
+
+    Antes se reutilizaba aunque no se pudiera verificar (onnxruntime ausente),
+    con el argumento de que lo creó una conversión previa. El problema es que
+    "conversión previa" puede significar "grafo equivocado": pasó con RRDBNet
+    (LeakyReLU de más tras la suma residual), que cargaba sin quejarse y
+    devolvía una imagen oscura y borrosa. Ahora:
+
+      * el archivo NUNCA se destruye (si la re-exportación falla se restaura), y
+      * la app prefiere fallar y caer a PyTorch antes que servir un grafo
+        posiblemente incorrecto.
+    """
     import sys
     from src.ai.inference import convert_pth_to_onnx_ex
 
@@ -5332,9 +5341,9 @@ def test_convert_pth_to_onnx_ex_keeps_unverifiable_existing_onnx(tmp_path, monke
     monkeypatch.setitem(sys.modules, "onnxruntime", None)
 
     path, err = convert_pth_to_onnx_ex(str(pth))
-    assert path == str(onnx)
-    assert err == ""
-    assert onnx.exists()
+    assert path is None and err, "no se puede reutilizar un .onnx sin marca"
+    assert onnx.exists(), "el archivo viejo no se pierde nunca"
+    assert not (tmp_path / "model.onnx.stale").exists()
 
 
 def test_convert_pth_to_onnx_ex_removes_proven_bad_existing_onnx(tmp_path, monkeypatch):

@@ -33,6 +33,7 @@ from src.ffmpeg.process_supervisor import (
     ProcessSupervisor,
     process_group_popen_kwargs,
 )
+from src.utils.timing import StageTimer
 
 
 logger = logging.getLogger(__name__)
@@ -908,6 +909,7 @@ def compress_video_with_ai(
     # --- Fases (tasks panel) ---
     phase_labels = []
     phase_labels.append(("probe", "Analyzing video"))
+    engine_phase_ids = {}
     for i, _e in enumerate(engines, 1):
         _eid = getattr(_e, "engine_id", "?") or "?"
         try:
@@ -916,6 +918,7 @@ def compress_video_with_ai(
         except Exception:
             _label = _eid
         phase_labels.append((f"engine-{i}", _label))
+        engine_phase_ids[id(_e)] = f"engine-{i}"
     _audio_codec = settings.get("audio", "copy")
     _audio_boost = bool(settings.get("audio_boost", False))
     _has_audio_phase = (
@@ -966,11 +969,15 @@ def compress_video_with_ai(
     if _decode_start not in (None, ""):
         dec_cmd.extend(["-ss", str(_decode_start)])
     dec_cmd.extend(["-i", input_path])
-    try:
-        _decode_start_s = float(_decode_start) if _decode_start not in (None, "") else 0.0
-        _decode_end_s = float(_decode_end) if _decode_end not in (None, "") else None
-    except (TypeError, ValueError):
-        _decode_start_s, _decode_end_s = 0.0, None
+    # Los campos de Trim de la UI son TEXTO ("00:01:30"). Antes se hacía
+    # float() sobre ellos: con "00:01:30" lanzaba ValueError, se caía al
+    # camino "sin límite" y el render seguía hasta el FINAL del vídeo
+    # ignorando el End en silencio. Ahora se parsea igual que en el resto de
+    # la app (_parse_time_to_seconds) y, si el valor no se entiende, se avisa.
+    _decode_start_s = _time_to_seconds(_decode_start, 0.0, "start_time",
+                                       status_callback)
+    _decode_end_s = _time_to_seconds(_decode_end, None, "end_time",
+                                     status_callback)
     if _decode_end_s is not None and _decode_end_s > _decode_start_s:
         dec_cmd.extend(["-t", str(_decode_end_s - _decode_start_s)])
     dec_cmd.extend([
@@ -1054,6 +1061,10 @@ def compress_video_with_ai(
     os.makedirs(log_dir, exist_ok=True)
     log_file = os.path.join(log_dir, f"render_{timestamp}.json")
 
+    # VRAM disponible ANTES de renderizar: si va justa, el usuario se entera
+    # ahora (y no cuando el motor falle en el frame 4000).
+    vram_info = _vram_preflight(status_callback)
+
     engine_ids = [
         getattr(e, "engine_id", "?") for e in engines
     ]
@@ -1084,6 +1095,7 @@ def compress_video_with_ai(
         "duration_seconds": duration,
         "encoder_command": enc_cmd,
         "decoder_command": dec_cmd,
+        "vram": vram_info,
         "status": "pending",
         "render_seconds": None,
         "output_size_bytes": None,
@@ -1165,26 +1177,84 @@ def compress_video_with_ai(
     frame_num = 0
     t_start = time.time()
     prev_front = None  # Salida del frente de la cadena (steps_antes) del frame anterior.
+    # Telemetría (P0): presupuesto real por etapa. Nace de una medición donde
+    # el 35 % del frame se iba en post-proceso CPU y el 18 % en PIL, sin que
+    # el log lo dijera.
+    stage_timer = StageTimer()
+
+    def _engine_snapshot(engine):
+        """Timings acumulados de una engine antes de llamarla (o None)."""
+        try:
+            return engine.get_cumulative_timing()
+        except Exception:
+            return None
+
+    def _record_engine_timing(engine, snapshot, total_ms):
+        """Anota el coste de una llamada a engine + sus fases internas."""
+        try:
+            stage_timer.add(f"engine:{getattr(engine, 'engine_id', '?')}", total_ms)
+            if not snapshot:
+                return
+            now = engine.get_cumulative_timing()
+            for key, stage in (("pre_ms", "ai_pre"), ("infer_ms", "ai_infer"),
+                               ("post_ms", "ai_post")):
+                delta = float(now.get(key, 0.0)) - float(snapshot.get(key, 0.0))
+                if delta >= 0:
+                    stage_timer.add(stage, delta)
+        except Exception:
+            pass
 
     def _apply_steps(target, remaining_steps):
-        """Aplica una lista de engines en orden a un frame."""
+        """Aplica una lista de engines en orden a un frame.
+
+        Si un engine falla se desactiva para el resto del render (el frame
+        pasa sin procesar) pero **el usuario se entera**: se avisa en la UI,
+        se marca su fase como fallida y el motivo queda en el render log.
+        """
         out = target
         for _e in remaining_steps:
             if getattr(_e, "_failed", False):
                 continue
             try:
+                snapshot = _engine_snapshot(_e)
+                step_t0 = time.perf_counter()
                 step_out = _e.process_frame(out)
+                _record_engine_timing(_e, snapshot,
+                                      (time.perf_counter() - step_t0) * 1000.0)
                 if step_out is None:
                     raise RuntimeError("engine returned None")
                 out = step_out
             except Exception as exc:
-                logger.error(
-                    "AI engine %s failed at frame %d (%s); disabling it for "
-                    "the rest of the render, keeping the previous frame output.",
-                    getattr(_e, "engine_id", "?"), frame_num, exc,
-                )
+                failure = _classify_ai_error(exc)
+                failure["engine_id"] = getattr(_e, "engine_id", "?")
+                failure["frame"] = frame_num
+                _e._failure_detail = failure
                 _e._failed = True
+                logger.error(
+                    "AI engine %s failed at frame %d (%s: %s); disabling it "
+                    "for the rest of the render, keeping the previous frame "
+                    "output.", failure["engine_id"], frame_num, failure["kind"],
+                    failure["message"],
+                )
+                _notify_ai_failure(_e, failure)
         return out
+
+    def _notify_ai_failure(engine, failure):
+        """Hace VISIBLE un fallo de IA en la UI (panel de tareas + estado)."""
+        if status_callback:
+            try:
+                status_callback(
+                    f"\u26a0 AI step '{failure.get('engine_id')}' disabled at "
+                    f"frame {failure.get('frame')}: {failure.get('title')}. "
+                    f"{failure.get('advice')}"
+                )
+            except Exception:
+                logger.debug("status_callback failed for AI failure", exc_info=True)
+        _emit_phase(
+            phase_cb, "failed", engine_phase_ids.get(id(engine)) or "engine-?",
+            label=str(failure.get("engine_id") or ""),
+            msg=f"{failure.get('title')}: {str(failure.get('message'))[:160]}",
+        )
 
     def _resize_frame(im, dst_w_in, dst_h_in):
         """Resize de un frame BGR uint8 a (dst_w_in, dst_h_in).
@@ -1228,8 +1298,34 @@ def compress_video_with_ai(
                 resized = np.repeat(resized[..., None], 3, axis=2)
             return resized
 
+    # --- P1: pre/post-proceso en GPU (apagado por defecto) -----------------
+    # Se intenta DESPUÉS de conocer el tamaño final del encoder y antes del
+    # bucle. Si algo no cuadra (preferencia apagada, sin CUDA, autocomprobación
+    # fallida) cada engine sigue con su camino de siempre y se anota el motivo.
+    try:
+        gpu_post_report = _configure_gpu_post_for_chain(
+            steps_antes, steps_despues, interp_step,
+            dst_w, dst_h, src_w, src_h, _resize_frame, status_callback,
+        )
+    except Exception as exc:
+        # Un fallo aquí NUNCA puede impedir el render: se sigue por el camino
+        # clásico y se anota.
+        logger.warning("GPU post-process setup failed: %s", exc)
+        gpu_post_report = [{"engine_id": "?", "active": False,
+                            "reason": f"setup-error:{type(exc).__name__}: {exc}"}]
+    if gpu_post_report:
+        log_entry["gpu_post"] = gpu_post_report
+    try:
+        log_entry["ai_execution"] = [
+            _e.describe_execution() for _e in engines
+            if hasattr(_e, "describe_execution")
+        ]
+    except Exception:
+        logger.debug("describe_execution unavailable", exc_info=True)
+
     try:
         while True:
+            frame_t0 = time.perf_counter()
             if abort_event and abort_event.is_set():
                 break
 
@@ -1246,12 +1342,12 @@ def compress_video_with_ai(
                 )
                 break
 
-            raw = dec_proc.stdout.read(frame_size)
-            if not raw or len(raw) < frame_size:
-                break  # EOF or incomplete frame
-
             # Decode raw bytes to numpy (H, W, 3) BGR.
-            frame = np.frombuffer(raw, dtype=np.uint8).reshape((src_h, src_w, 3))
+            with stage_timer.stage("decode"):
+                raw = dec_proc.stdout.read(frame_size)
+                if not raw or len(raw) < frame_size:
+                    break  # EOF or incomplete frame
+                frame = np.frombuffer(raw, dtype=np.uint8).reshape((src_h, src_w, 3))
 
 # --- Cadena de AI: frente (pasos previos a la interpolación) ---
             # Aplicamos en orden todas las engines que van ANTES del paso de
@@ -1265,7 +1361,8 @@ def compress_video_with_ai(
             interp_pending = None
             if do_interpolate and prev_front is not None:
                 try:
-                    interp_before = interp_step.interpolate_frame(prev_front, cur_front)
+                    with stage_timer.stage("interp"):
+                        interp_before = interp_step.interpolate_frame(prev_front, cur_front)
                     interp_pending = _apply_steps(
                         np.ascontiguousarray(interp_before), steps_despues,
                     )
@@ -1275,6 +1372,18 @@ def compress_video_with_ai(
                         "interpolated frame (A/V cadence may shift).", frame_num, exc,
                     )
                     interp_pending = None
+                    # Visible una sola vez (esto se repite en cada frame): el
+                    # usuario tiene que saber que su vídeo NO se está
+                    # interpolando, no solo enterarse por el log.
+                    if not getattr(interp_step, "_failure_reported", False):
+                        interp_step._failure_reported = True
+                        failure = _classify_ai_error(exc)
+                        failure.update({
+                            "engine_id": getattr(interp_step, "engine_id", "?"),
+                            "frame": frame_num,
+                        })
+                        interp_step._failure_detail = failure
+                        _notify_ai_failure(interp_step, failure)
 
             # --- Frame actual: pasos posteriores ---
             upscaled = _apply_steps(np.ascontiguousarray(cur_front), steps_despues)
@@ -1286,25 +1395,32 @@ def compress_video_with_ai(
 
             # Ajustar tamaño al encoder y escribir.
             if upscaled.shape[0] != dst_h or upscaled.shape[1] != dst_w:
-                upscaled = _resize_frame(upscaled, dst_w, dst_h)
+                with stage_timer.stage("resize"):
+                    upscaled = _resize_frame(upscaled, dst_w, dst_h)
 
             frames_to_write = []
             if interp_pending is not None:
                 if interp_pending.dtype != np.uint8:
                     interp_pending = np.clip(interp_pending, 0, 255).astype(np.uint8)
                 if interp_pending.shape[0] != dst_h or interp_pending.shape[1] != dst_w:
-                    interp_pending = _resize_frame(interp_pending, dst_w, dst_h)
+                    with stage_timer.stage("resize"):
+                        interp_pending = _resize_frame(interp_pending, dst_w, dst_h)
                 frames_to_write.append(interp_pending)
             frames_to_write.append(upscaled)
 
             for out_frame in frames_to_write:
                 try:
-                    enc_proc.stdin.write(out_frame.tobytes())
+                    with stage_timer.stage("write"):
+                        enc_proc.stdin.write(out_frame.tobytes())
                 except (BrokenPipeError, ValueError, OSError):
                     logger.error("encoder pipe broken at frame %d", frame_num)
                     break
 
             frame_num += 1
+            stage_timer.mark_frame()
+            stage_timer.add("frame_total", (time.perf_counter() - frame_t0) * 1000.0)
+            if frame_num % 500 == 0:
+                _log_stage_progress(stage_timer, frame_num, total_frames)
             if progress_callback and total_frames > 0:
                 pct = min(100, int(frame_num * 100 / total_frames))
                 progress_callback(pct)
@@ -1395,8 +1511,57 @@ def compress_video_with_ai(
         # ffmpeg corriendo como huérfano después de abort / excepción.
         _kill_proc(dec_proc, "decoder")
 
-        # Actualizar log con resultado del render
+        # Actualizar log con resultado del render + telemetría por etapa (P0).
         log_entry["render_seconds"] = time.time() - t_start
+        try:
+            log_entry["stages"] = stage_timer.summary()
+            log_entry["ai_timing"] = [
+                {"engine_id": getattr(_e, "engine_id", "?"),
+                 **_e.get_cumulative_timing()}
+                for _e in engines if hasattr(_e, "get_cumulative_timing")
+            ]
+        except Exception:
+            logger.debug("stage timing collection failed", exc_info=True)
+        # Si el camino GPU se abandonó a mitad de render (tamaño inesperado,
+        # fallo del grafo), el usuario tiene que enterarse: pierde velocidad
+        # sin que el resultado cambie, y un aviso en el log no lo ve nadie.
+        try:
+            failures = [
+                {"engine_id": getattr(_e, "engine_id", "?"),
+                 "reason": str(getattr(_e, "_gpu_post_failure"))}
+                for _e in engines
+                if getattr(_e, "_gpu_post_failure", None)
+            ]
+            if failures:
+                log_entry["gpu_post_failures"] = failures
+                if status_callback:
+                    for item in failures:
+                        status_callback(
+                            f"\u26a0 GPU post-process disabled mid-render for "
+                            f"{item['engine_id']} ({item['reason']}); "
+                            f"continuing on the standard CPU path."
+                        )
+        except Exception:
+            logger.debug("gpu_post failure report failed", exc_info=True)
+        # Resumen de pasos de IA que se quedaron por el camino: el render puede
+        # terminar "bien" y aun así tener frames SIN procesar. Que se sepa.
+        try:
+            ai_failures = [
+                {"engine_id": getattr(_e, "engine_id", "?"), **_e._failure_detail}
+                for _e in engines
+                if getattr(_e, "_failure_detail", None)
+            ]
+            if ai_failures:
+                log_entry["ai_failures"] = ai_failures
+                if status_callback:
+                    names = ", ".join(str(f.get("engine_id")) for f in ai_failures)
+                    status_callback(
+                        f"\u26a0 {len(ai_failures)} AI step(s) disabled during "
+                        f"this render ({names}). The frames after the failure "
+                        f"were NOT processed by those steps."
+                    )
+        except Exception:
+            logger.debug("ai failure report failed", exc_info=True)
         _save_render_log(log_file, log_entry)
 
     if abort_event and abort_event.is_set():
@@ -1476,13 +1641,23 @@ def compress_video_with_ai(
 
     # Final publication happens after video encoding and optional audio mux.
     # os.replace is atomic because staging lives beside the destination.
+    # Duración esperada REAL del trozo renderizado. Antes, en cuanto
+    # ``start_time`` traía cualquier valor, la comprobación se saltaba entera:
+    # un render truncado con Trim podía publicarse sin revisarse.
+    try:
+        _full_duration = _get_duration_seconds(ffmpeg_path, input_path)
+        if _decode_end_s is not None and _decode_end_s > _decode_start_s:
+            _expected_duration = _decode_end_s - _decode_start_s
+        elif _decode_start_s:
+            _expected_duration = max(0.0, _full_duration - _decode_start_s)
+        else:
+            _expected_duration = _full_duration
+    except Exception:
+        _expected_duration = None
     valid, detail = validate_render_output(
         ffmpeg_path,
         output_path,
-        expected_duration=(
-            _get_duration_seconds(ffmpeg_path, input_path)
-            if not settings.get("start_time") else None
-        ),
+        expected_duration=_expected_duration,
     )
     if not valid:
         logger.error("AI pipeline produced invalid staged output: %s", detail)
@@ -1664,6 +1839,265 @@ def _split_ai_chain(engines):
             continue
         (steps_despues if interp_step is not None else steps_antes).append(_e)
     return steps_antes, steps_despues, interp_step
+
+
+#: Motivos por los que el post-proceso en GPU NO se activa y que NO merecen un
+#: aviso en la UI (son situaciones normales, no fallos).
+_GPU_POST_SILENT_REASONS = {
+    "preference-off", "not-supported", "no-cuda", "no-target-size",
+    "not-loaded", "input-size-unknown", "already-native",
+}
+
+#: Pistas de que un fallo de IA es falta de memoria de GPU. Se comprueban en
+#: minúsculas sobre el mensaje completo de la excepción.
+_OOM_HINTS = (
+    "out of memory", "outofmemory", "cuda_error_out_of_memory",
+    "failed to allocate", "cannot allocate memory", "insufficient memory",
+    "cudnn_status_alloc_failed", "cublas_status_alloc_failed",
+    "bad_alloc", "memory allocation", "std::bad_alloc",
+)
+
+#: Por debajo de esto se avisa ANTES de renderizar (no se bloquea nada: sólo
+#: se dice, para que el usuario no descubra el problema 3000 frames después).
+_VRAM_LOW_MB = 1500
+
+
+def _classify_ai_error(exc) -> dict:
+    """Traduce una excepción de un motor de IA a algo accionable para el usuario.
+
+    Un fallo de IA a mitad de render NO puede quedarse en el log: hasta ahora
+    el pipeline capturaba el error, desactivaba esa engine y seguía, de modo
+    que el vídeo terminaba "con éxito" pero con el resto de frames sin
+    procesar. Aquí se decide el mensaje que verá el usuario.
+    """
+    raw = f"{type(exc).__name__}: {exc}"
+    low = raw.lower()
+    if any(hint in low for hint in _OOM_HINTS):
+        return {
+            "kind": "out-of-memory",
+            "title": "Not enough GPU memory",
+            "advice": ("Close other programs using the GPU, export at a lower "
+                       "resolution, or pick a lighter model (AnimeVideo v3) / "
+                       "a smaller upscale factor."),
+            "message": raw,
+        }
+    if "no module named" in low or "dll load failed" in low or "not installed" in low:
+        return {
+            "kind": "runtime-missing",
+            "title": "AI runtime missing or broken",
+            "advice": ("Open Manage Dependencies → Runtimes & Binaries and "
+                       "reinstall the runtime for this engine."),
+            "message": raw,
+        }
+    if "cudnn" in low or "cuda" in low or "cublas" in low:
+        return {
+            "kind": "cuda",
+            "title": "GPU/CUDA error",
+            "advice": ("Update the NVIDIA driver, or switch AI Execution "
+                       "Provider to CPU in Preferences to keep working "
+                       "(much slower)."),
+            "message": raw,
+        }
+    if "expects" in low and "channel" in low or "shape" in low or "got:" in low:
+        return {
+            "kind": "shape",
+            "title": "Model does not match the chain",
+            "advice": ("That AI step expects a different frame format or "
+                       "resolution; remove it from the workflow or pick "
+                       "another model."),
+            "message": raw,
+        }
+    return {
+        "kind": "unknown",
+        "title": "AI step failed",
+        "advice": ("The rest of the render continued without that step; "
+                   "check the render log for the full error."),
+        "message": raw,
+    }
+
+
+def _gpu_memory_info():
+    """``(free_mb, total_mb)`` de la primera GPU NVIDIA, o ``(None, None)``.
+
+    Usa ``nvidia-smi`` (rápido y sin cargar torch). Si no existe o falla se
+    devuelve ``(None, None)``: la telemetría de VRAM es un extra, nunca un
+    requisito para renderizar.
+    """
+    try:
+        result = subprocess.run(
+            ["nvidia-smi", "--query-gpu=memory.total,memory.free",
+             "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if result.returncode != 0:
+            return None, None
+        line = (result.stdout or "").strip().splitlines()[0]
+        total_str, free_str = [part.strip() for part in line.split(",")[:2]]
+        return int(float(free_str)), int(float(total_str))
+    except Exception as exc:
+        logger.debug("nvidia-smi memory query failed: %s", exc)
+        return None, None
+
+
+def _vram_preflight(status_callback=None) -> dict:
+    """Avisa si queda poca VRAM ANTES de empezar a renderizar.
+
+    No bloquea ni cancela nada (un render lento es mejor que ningún render):
+    sólo hace visible una situación que, si no, el usuario descubre cuando el
+    motor falla a mitad de trabajo.
+    """
+    info: dict = {"checked": False}
+    free_mb, total_mb = _gpu_memory_info()
+    if free_mb is None:
+        return info
+    info.update({"checked": True, "free_mb": free_mb, "total_mb": total_mb})
+    if free_mb < _VRAM_LOW_MB:
+        info["warning"] = f"only {free_mb} MB free of {total_mb} MB"
+        message = (
+            f"\u26a0 Only {free_mb} MB of GPU memory free (of {total_mb} MB). "
+            "The AI step may run out of memory and be disabled mid-render. "
+            "Close other GPU programs or lower the export resolution."
+        )
+        logger.warning("Low VRAM before render: %s MB free of %s MB",
+                       free_mb, total_mb)
+        if status_callback:
+            status_callback(message)
+    return info
+
+
+def _time_to_seconds(value, default, field_name="", status_callback=None):
+    """Convierte un tiempo de Trim (número o ``"HH:MM:SS"``) a segundos.
+
+    Devuelve ``default`` cuando el campo está vacío y **avisa** cuando trae un
+    valor que no se entiende: interpretarlo como "sin límite" haría que el
+    render continuara hasta el final del vídeo (horas de GPU) sin decirlo.
+    """
+    if value in (None, ""):
+        return default
+    seconds = _parse_time_to_seconds(value)
+    if seconds is None:
+        logger.warning(
+            "Trim %s could not be parsed (%r); ignoring that bound for this "
+            "render.", field_name or "value", value,
+        )
+        if status_callback:
+            status_callback(
+                f"\u26a0 Trim {field_name} '{value}' is not a valid time "
+                f"(use HH:MM:SS or seconds); that bound was ignored."
+            )
+        return default
+    return float(seconds)
+
+
+def _last_chain_stage(steps_antes, steps_despues, interp_step):
+    """Devuelve el último engine de la cadena (el que alimenta al encoder).
+
+    Sólo ese puede reescalar a la resolución final: si un engine intermedio
+    redujera el frame, el siguiente paso de la cadena trabajaría con una
+    imagen ya encogida.
+    """
+    groups = [steps_despues, [interp_step] if interp_step else [], steps_antes]
+    for group in groups:
+        for engine in reversed(list(group or [])):
+            if engine is not None:
+                return engine
+    return None
+
+
+def _configure_gpu_post_for_chain(steps_antes, steps_despues, interp_step,
+                                  dst_w, dst_h, src_w, src_h, resize_fn,
+                                  status_callback=None):
+    """Intenta activar el pre/post-proceso en GPU en cada engine (P1).
+
+    Devuelve una lista de informes (uno por engine) apta para el JSON del
+    render. Nunca lanza y nunca deja el render peor que antes: si un engine no
+    puede activar el camino GPU, sigue con el suyo clásico.
+    """
+    report = []
+    try:
+        from src.ai import gpu_post
+        if not gpu_post.gpu_post_enabled():
+            return report
+    except Exception as exc:
+        logger.debug("gpu_post unavailable: %s", exc)
+        return report
+
+    last_engine = _last_chain_stage(steps_antes, steps_despues, interp_step)
+    chain = [e for e in (list(steps_antes) + list(steps_despues)) if e is not None]
+    if interp_step is not None:
+        chain.append(interp_step)
+
+    for engine in chain:
+        # Motores de terceros / de prueba pueden no implementar el camino GPU:
+        # eso no es un fallo, simplemente no está disponible.
+        if not callable(getattr(engine, "configure_gpu_post", None)):
+            report.append({"engine_id": getattr(engine, "engine_id", "?") or "?",
+                           "active": False, "reason": "not-supported"})
+            continue
+        is_last = engine is last_engine
+        target = (dst_w, dst_h) if is_last else (None, None)
+        try:
+            result = engine.configure_gpu_post(
+                target[0], target[1],
+                resize_fn=resize_fn if is_last else None,
+                input_size=(src_w, src_h),
+            )
+        except Exception as exc:
+            result = {"active": False,
+                      "reason": f"error:{type(exc).__name__}: {exc}"}
+        if not isinstance(result, dict):
+            result = {"active": False, "reason": "bad-result"}
+
+        label = getattr(engine, "engine_id", "?") or "?"
+        entry = {
+            "engine_id": label,
+            "resize": bool(is_last),
+            "active": bool(result.get("active")),
+            "reason": str(result.get("reason", "")),
+        }
+        for key in ("precision", "cuda_graph", "max_diff", "mean_diff",
+                    "converted", "cached", "out_size"):
+            if key in result:
+                entry[key] = result[key]
+        detail = result.get("detail")
+        if detail:
+            entry["detail"] = str(detail)[:400]
+        report.append(entry)
+
+        if status_callback:
+            if entry["active"]:
+                extra = " + resize" if is_last else ""
+                status_callback(
+                    f"\u26a1 GPU post-process active for {label}{extra} "
+                    f"({entry.get('precision', '?')}, "
+                    f"diff {entry.get('max_diff', 0)}/255)"
+                )
+            elif entry["reason"] not in _GPU_POST_SILENT_REASONS:
+                status_callback(
+                    f"\u26a0 GPU post-process unavailable for {label} "
+                    f"({entry['reason']}); using the standard CPU path."
+                )
+    if report:
+        logger.info("gpu_post report: %s", report)
+    return report
+
+
+def _log_stage_progress(timer, frame_num, total_frames):
+    """Línea INFO con el presupuesto por etapa cada N frames (P0)."""
+    try:
+        stages = (timer.summary() or {}).get("stages", {})
+        parts = []
+        for name in ("decode", "ai_pre", "ai_infer", "ai_post", "resize", "write"):
+            if name in stages:
+                parts.append(f"{name}={stages[name]['median_ms']:.1f}ms")
+        frame_ms = stages.get("frame_total", {}).get("median_ms", 0.0)
+        fps = (1000.0 / frame_ms) if frame_ms > 0 else 0.0
+        logger.info(
+            "stage timing @%s/%s: %s | frame=%.1fms (%.2f fps)",
+            frame_num, total_frames or "?", " ".join(parts), frame_ms, fps,
+        )
+    except Exception:
+        logger.debug("stage timing log failed", exc_info=True)
 
 
 def _fps_string_to_float(value):

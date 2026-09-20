@@ -309,6 +309,74 @@ def benchmark_backend(
     return result
 
 
+def benchmark_quality(
+    engine_id: str,
+    backend: str,
+    target_dir: Optional[str] = None,
+    model_path: Optional[str] = None,
+    use_cache: bool = True,
+) -> Optional[dict]:
+    """Mide la CALIDAD de un motor (baremo local) y la cachea.
+
+    Es la otra mitad del baremo que ve el usuario: ``benchmark_backend`` da la
+    velocidad y esto da la calidad, las dos medidas en su equipo con su modelo.
+    Nunca lanza: si el motor no carga o algo falla devuelve ``None`` y la fila
+    simplemente no muestra calidad.
+    """
+    backend = str(backend or "").strip().lower()
+    if backend not in ("onnx", "torch"):
+        return None
+    try:
+        from src.ai import model_rating
+    except Exception:
+        return None
+
+    if model_path is None and target_dir:
+        if backend == "onnx":
+            model_path = _find_onnx_file(target_dir)
+        else:
+            try:
+                from src.ai.inference import pick_weight_file
+                model_path = pick_weight_file(target_dir, engine_id)
+            except Exception:
+                model_path = None
+    if not model_path or not os.path.isfile(model_path):
+        return None
+
+    fingerprint = model_fingerprint(model_path)
+    if use_cache:
+        cached = model_rating.get_rating(engine_id, backend, fingerprint)
+        if cached:
+            return cached
+
+    engine = None
+    try:
+        engine = _build_backend_engine(engine_id, backend, model_path)
+        if not engine.load():
+            return None
+        rating = model_rating.measure_and_store(
+            engine_id, backend, engine, fingerprint=fingerprint,
+        )
+        if rating:
+            logger.info(
+                "quality %s/%s: %.1f/100 (fidelidad %.1f, detalle %.1f, "
+                "artefactos %.1f)", engine_id, backend, rating.get("score", 0),
+                rating.get("fidelity_score", 0), rating.get("detail_score", 0),
+                rating.get("artifacts_score", 0),
+            )
+        return rating
+    except Exception as exc:
+        logger.info("quality measurement failed for %s/%s: %s", engine_id,
+                    backend, exc)
+        return None
+    finally:
+        try:
+            if engine is not None:
+                engine.unload()
+        except Exception:
+            pass
+
+
 def benchmark_engine(
     engine_id: str,
     target_dir: Optional[str] = None,

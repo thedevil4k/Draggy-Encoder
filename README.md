@@ -128,13 +128,11 @@ can tune by ear, and *Parar* stops it.
 
 ## Portable builds
 
-GitHub Actions publishes these platform-specific artifacts:
+GitHub Actions publishes one package per platform:
 
-- **Windows:** `DraggyEncoder-Setup-*.exe`, built with PyInstaller and Inno Setup.
-- **Linux x86_64:** `DraggyEncoder-Linux-x86_64-*.tar.gz`, portable archive.
-- **Linux desktop:** `DraggyEncoder-Linux-x86_64-*.AppImage`, directly executable.
+- **Windows (x64):** `DraggyEncoder-Setup-*.exe`, built with PyInstaller and Inno Setup.
+- **Linux (x86_64):** `DraggyEncoder-Linux-x86_64-*.AppImage`, directly executable.
 
-The Linux archive is portable: extract it and run `./DraggyEncoder/DraggyEncoder`.
 The AppImage can be marked executable and launched from the file manager.
 
 ### Downloads — latest build
@@ -147,8 +145,8 @@ these links always point to the newest build without waiting for a version tag:
 - **Linux AppImage**:
   [DraggyEncoder-Linux-x86_64-1.AppImage](https://github.com/thedevil4k/Draggy-Encoder/releases/latest/download/DraggyEncoder-Linux-x86_64-1.AppImage)
 
-The portable Linux `tar.gz` is attached to tagged releases (`v*`) and to manual
-workflow runs (`workflow_dispatch`).
+The AppImage is also attached to tagged releases (`v*`), which are the permanent
+downloads; the rolling `latest` release always points at the newest push.
 
 Installed Linux formats store writable data under
 `${XDG_DATA_HOME:-~/.local/share}/draggy-encoder` so `/opt` and a read-only

@@ -90,7 +90,15 @@ if _TORCH_AVAILABLE:
             self.lrelu = nn.LeakyReLU(0.2, inplace=True)
 
         def forward(self, x):
-            return self.lrelu(self.rdb3(self.rdb2(self.rdb1(x))) * 0.2 + x)
+            # OJO (bug real corregido): el original de Real-ESRGAN NO aplica
+            # activación aquí, sólo escala el residuo:
+            #     out = rdb3(rdb2(rdb1(x))); return out * 0.2 + x
+            # Con un LeakyReLU extra después de la suma, cada uno de los 23
+            # bloques iba apagando la señal negativa (x0.2) y la salida salía
+            # oscura y sin contraste: medido con RealESRGAN_x4plus en este
+            # equipo, la media caía de 221 a 126 y la energía de bordes a
+            # 0.52x de la de un reescalado bilineal (es decir, MÁS borroso).
+            return self.rdb3(self.rdb2(self.rdb1(x))) * 0.2 + x
 
     class RRDBNet(nn.Module):
         """Real-ESRGAN RRDBNet that uses the exact key names of the official checkpoints.
@@ -140,14 +148,24 @@ if _TORCH_AVAILABLE:
             # Upsampling layers. Two variants exist:
             #   - num_feat_up == num_feat * 4  ->  PixelShuffle(2) halves channels
             #   - num_feat_up == num_feat      ->  F.interpolate nearest (no channel change)
+            #
+            # ORDEN (importante, era un bug real): el original de Real-ESRGAN
+            # hace SIEMPRE ``conv_up(interpolate(feat))`` — primero sube la
+            # resolución y después convoluciona para refinar. Al revés
+            # (convolucionar en baja resolución y luego interpolar con vecino)
+            # la salida sale oscurecida y MÁS BORROSA que un reescalado
+            # bilineal: medido con RealESRGAN_x4plus, la media caía de 221 a
+            # 126 y la energía de bordes a 0.52x de la del bilineal.
             num_up = int(math.log(self.scale, 2))
             use_pixel_shuffle = (self.num_feat_up > self.num_feat)
             for i in range(1, num_up + 1):
-                up_feat = getattr(self, f"conv_up{i}")(feat)
+                up_layer = getattr(self, f"conv_up{i}")
                 if use_pixel_shuffle:
-                    feat = self.lrelu(F.pixel_shuffle(up_feat, 2))
+                    feat = self.lrelu(F.pixel_shuffle(up_layer(feat), 2))
                 else:
-                    feat = self.lrelu(F.interpolate(up_feat, scale_factor=2, mode="nearest"))
+                    feat = self.lrelu(up_layer(
+                        F.interpolate(feat, scale_factor=2, mode="nearest")
+                    ))
 
             feat = self.lrelu(self.conv_hr(feat))
             return self.conv_last(feat)

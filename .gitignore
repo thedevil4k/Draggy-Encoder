@@ -34,6 +34,10 @@ personal/
 *.tmp
 *.log
 
+# Sondas y artefactos de medición locales (modelos derivados, capturas,
+# scripts de benchmark). No son parte del programa ni del bundle.
+tmp-perf/
+
 # PyInstaller
 build/
 dist/

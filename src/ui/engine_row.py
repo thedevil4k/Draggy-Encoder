@@ -401,6 +401,12 @@ class EngineRow(QFrame):
         # este equipo (solo con ambos medidos) + botón 'Usar' para aplicarlo.
         self._build_backend_suggestion(middle, onnx_bench, torch_bench)
 
+        # Baremo medido: calidad + velocidad del backend que se va a usar.
+        # El usuario no tiene que interpretar "quality_score: 74": ve un número
+        # medido en su equipo, una etiqueta en palabras y el desglose en el
+        # tooltip (de dónde sale cada punto).
+        self._build_rating_label(middle, display_backend)
+
         top.addLayout(middle)
 
         # ---- Right column: buttons + toggle ----
@@ -532,6 +538,38 @@ class EngineRow(QFrame):
         if torch_ms < onnx_ms:
             return "torch"
         return "onnx"
+
+    def _build_rating_label(self, parent_layout, display_backend) -> None:
+        """Etiqueta 'calidad · velocidad' medida en este equipo.
+
+        Sólo se rellena para motores de Upscale con algo medido: si no hay
+        datos, no se muestra nada (mejor nada que un número inventado).
+        """
+        try:
+            from src.ai import model_rating
+        except Exception:
+            return
+        try:
+            engine_id = self.engine.get("engine_id", "")
+            category = str(self.engine.get("category", "") or "")
+            if category and category != "Upscale":
+                return
+            backend_key = "onnx" if str(display_backend).lower() in (
+                "onnx", "onnxruntime") else str(display_backend).lower()
+            bench = (self.engine.get("benchmarks") or {}).get(backend_key) or None
+            rating = model_rating.get_rating(engine_id, backend_key)
+            line = model_rating.format_rating_line(rating, bench)
+            if not line:
+                return
+            self.lbl_rating = QLabel(line)
+            self.lbl_rating.setStyleSheet(
+                "color: #00d2d3; font-size: 10px; font-weight: bold;"
+            )
+            self.lbl_rating.setToolTip(model_rating.rating_tooltip(rating, bench))
+            parent_layout.addWidget(self.lbl_rating)
+        except Exception:
+            # Un baremo que no se puede pintar no puede romper la fila.
+            return
 
     def _build_backend_suggestion(self, parent_layout, onnx_bench, torch_bench) -> None:
         """Línea '⚡ Más rápido: X (a ms/f vs b ms/f)' + botón 'Usar'."""

@@ -283,7 +283,8 @@ def _fake_pip_stage(destination: str) -> None:
     un doble de pip que no escriba nada haría fallar esa validación (que es
     justo lo que debe pasar cuando la instalación no produce archivos).
     """
-    for name in ("torch", "torchvision", "torchaudio", "onnx", "onnxscript"):
+    for name in ("torch", "torchvision", "torchaudio", "onnx", "onnxscript",
+                 "safetensors"):
         os.makedirs(os.path.join(destination, name), exist_ok=True)
         with open(
             os.path.join(destination, name, "__init__.py"), "w", encoding="utf-8"
@@ -474,6 +475,21 @@ def test_pytorch_command_pins_the_resolved_plan():
     assert "onnx" in cmd
     assert "onnxscript" in cmd
     assert "https://download.pytorch.org/whl/cu126" in cmd
+
+
+def test_pytorch_command_installs_safetensors():
+    """``safetensors`` va con PyTorch: sin él no cargan los modelos
+
+    ``.safetensors`` (OmniSR, RIFE, FILM...). Se servía de PyPI, así que el
+    comando tiene que llevar PyPI como índice extra o pip no lo encuentra.
+    """
+    plan = {"variant": "cpu", "versions": {}, "source": "offline",
+            "note": "", "attempts": []}
+    cmd = rm._build_pytorch_command("cpu", plan)
+    assert "safetensors" in cmd
+    assert "https://pypi.org/simple" in cmd
+    assert "safetensors" in rm._runtime_group_prefixes("torch")
+    assert "safetensors" not in rm._runtime_group_prefixes("onnxruntime")
 
 
 def test_pytorch_command_falls_back_to_known_good_set_without_versions():
@@ -934,7 +950,8 @@ def test_cleanup_install_leftovers_keeps_unrecognised_previous(monkeypatch, tmp_
 def _seed_shared_store(store: str) -> None:
     """Store con PyTorch + ONNX Runtime + dependencias compartidas."""
     for name in ("torch", "torchvision", "torchaudio", "torchgen", "onnx", "onnxscript",
-                 "onnx_ir", "onnxruntime", "numpy", "sympy", "protobuf", "packaging"):
+                 "onnx_ir", "safetensors", "onnxruntime", "numpy", "sympy",
+                 "protobuf", "packaging"):
         _write_pkg(store, name, "1.0.0")
 
 
@@ -993,7 +1010,7 @@ def test_uninstall_runtime_onnx_also_removes_the_onnx_stack(monkeypatch, tmp_pat
     entries = os.listdir(store)
     for gone in ("onnxruntime", "onnx", "onnxscript", "onnx_ir"):
         assert _gone(gone, entries), (gone, entries)
-    for kept in ("torch", "torchvision", "numpy", "sympy"):
+    for kept in ("torch", "torchvision", "safetensors", "numpy", "sympy"):
         assert not _gone(kept, entries), (kept, entries)
 
 
@@ -1010,7 +1027,7 @@ def test_uninstall_runtime_torch_removes_its_satellites(monkeypatch, tmp_path):
     assert complete is True
     entries = os.listdir(store)
     for gone in ("torch", "torchvision", "torchaudio", "torchgen", "onnx",
-                 "onnxscript", "onnx_ir"):
+                 "onnxscript", "onnx_ir", "safetensors"):
         assert _gone(gone, entries), (gone, entries)
     for kept in ("onnxruntime", "numpy", "sympy", "protobuf"):
         assert not _gone(kept, entries), (kept, entries)

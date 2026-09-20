@@ -215,16 +215,34 @@ class _BenchmarkWorker(QThread):
 
     def run(self):
         try:
-            from src.ai.benchmark import benchmark_backend
+            from src.ai.benchmark import benchmark_backend, benchmark_quality
+            # El baremo de calidad sólo tiene sentido para upscalers (el juego
+            # de referencia compara contra una imagen degradada a propósito).
+            try:
+                from src.ai.registry import get_engine_meta
+                is_upscale = (get_engine_meta(self.engine_id) or {}).get(
+                    "category") == "Upscale"
+            except Exception:
+                is_upscale = False
             for backend in ("onnx", "torch"):
+                measured = None
                 try:
-                    benchmark_backend(
+                    measured = benchmark_backend(
                         self.engine_id, backend,
                         target_dir=self.target_dir,
                         use_cache=True,
                     )
                 except Exception:
                     pass
+                if measured and is_upscale:
+                    try:
+                        benchmark_quality(
+                            self.engine_id, backend,
+                            target_dir=self.target_dir,
+                            use_cache=True,
+                        )
+                    except Exception:
+                        pass
         except Exception:
             pass
 

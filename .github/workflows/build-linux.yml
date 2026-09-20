@@ -1,10 +1,11 @@
 name: Build Linux Bundle
 
-# Genera bundles para Linux x86_64. El bundle no incluye los runtimes de IA
-# pesados: añade un Python 3.13 relocatable para instalarlos bajo demanda.
+# Genera el **AppImage** para Linux x86_64 (única distribución Linux: el
+# tar.gz portable se retiró para no duplicar paquetes ni gastar cuota). El
+# bundle no incluye los runtimes de IA pesados: añade un Python 3.13
+# relocatable para instalarlos bajo demanda.
 #
-# Distribuciones actuales: tar.gz portable + AppImage. Los paquetes .deb y
-# .rpm se retiraron para simplificar y ahorrar cuota; el Flatpak (+ repo en
+# Los paquetes .deb/.rpm y el tar.gz se retiraron; el Flatpak (+ repo en
 # GitHub Pages) volverá más adelante.
 
 permissions:
@@ -296,10 +297,8 @@ jobs:
         run: rm -rf dist/DraggyEncoder/bin dist/DraggyEncoder/personal
 
       # Los símbolos de depuración de Python/PySide6/FFmpeg no le sirven al
-      # usuario final. Stripeamos el árbol entero antes de empaquetar:
-      # bundles (tar.gz y AppImage) más pequeños, lo que además reduce el
-      # consumo de la cuota de artifacts. Los binarios stripeados ejecutan
-      # igual.
+      # usuario final. Stripeamos el árbol entero antes de empaquetar: el
+      # AppImage sale más pequeño y arranca igual.
       - name: Strip debug symbols from the bundle
         shell: bash
         run: |
@@ -307,14 +306,6 @@ jobs:
           find dist/DraggyEncoder -type f \( -name '*.so' -o -name '*.so.*' \) -print0 \
             | xargs -0 -r strip --strip-unneeded
           strip --strip-unneeded dist/DraggyEncoder/DraggyEncoder
-
-      - name: Create portable archive
-        shell: bash
-        run: |
-          set -euo pipefail
-          version="${GITHUB_REF_NAME#v}"
-          if [[ "$GITHUB_REF" != refs/tags/v* ]]; then version="1"; fi
-          tar -czf "DraggyEncoder-Linux-x86_64-${version}.tar.gz" -C dist DraggyEncoder
 
       - name: Create AppImage
         shell: bash
@@ -335,39 +326,16 @@ jobs:
           chmod +x /tmp/appimagetool.AppImage
           ARCH=x86_64 APPIMAGE_EXTRACT_AND_RUN=1 /tmp/appimagetool.AppImage "$appdir" "DraggyEncoder-Linux-x86_64-${version}.AppImage"
 
-      # Los pushes suben SOLO el instalador de Windows (ver build-installer.yml):
-      # la cuota de artifacts es de 500 MB en el plan Free y el medidor de
-      # GitHub tarda 6-12 h en recalcularse, así que dos o tres pushes seguidos
-      # subiendo además el tar.gz agotaban la cuota y la subida fallaba. El
-      # tar.gz portable se sube en ejecuciones manuales (workflow_dispatch); en
-      # tags no se crea artifact: la Release es la descarga permanente.
-      - name: Upload Linux portable artifact
-        id: upload_linux_artifact
-        if: always() && github.event_name == 'workflow_dispatch' && hashFiles('DraggyEncoder-Linux-x86_64-*.tar.gz') != ''
-        uses: actions/upload-artifact@v7
-        with:
-          name: DraggyEncoder-Linux-packages
-          path: DraggyEncoder-Linux-x86_64-*.tar.gz
-          if-no-files-found: error
-          retention-days: 1
-          compression-level: 0
-        # La cuota de artifacts es un servicio independiente del build.
-        # Si está agotada, el paquete sigue siendo válido y la Release (en
-        # tags) no debe quedar bloqueada por este almacenamiento temporal.
-        continue-on-error: true
-
-      - name: Report Linux artifact quota issue
-        if: steps.upload_linux_artifact.outcome == 'failure'
-        shell: bash
-        run: |
-          echo "::warning::No se pudo subir DraggyEncoder-Linux-packages porque la cuota de GitHub Actions está agotada. Ejecuta Manage GitHub Actions artifacts en modo delete, espera el recálculo de GitHub (6-12 h) y relanza el workflow."
-
+      # Solo se publica el AppImage. En pushes/manuales queda en la release
+      # rodante "latest" y en tags en la Release versionada (ver más abajo):
+      # los assets de Releases NO cuentan contra la cuota de artifacts, así
+      # que no hace falta subir nada a la cuota de Actions.
+      #
       # En pushes/manuales el AppImage queda descargable en la release
-      # rodante "latest": los assets de Releases NO cuentan contra la cuota
-      # de artifacts, así que no hay riesgo de agotarla. Movemos la tag
-      # latest a HEAD para que la release apunte al último commit (la crea
-      # softprops automáticamente la primera vez). En tags no se toca: la
-      # Release versionada de abajo es la descarga permanente.
+      # rodante "latest": Movemos la tag latest a HEAD para que la release
+      # apunte al último commit (la crea softprops automáticamente la primera
+      # vez). En tags no se toca: la Release versionada de abajo es la
+      # descarga permanente.
       - name: Move rolling latest tag to HEAD
         if: github.ref_type != 'tag'
         shell: bash
@@ -389,13 +357,18 @@ jobs:
 
             - Windows: `DraggyEncoder-Setup-*.exe` (instalador Inno Setup)
             - Linux: `DraggyEncoder-Linux-x86_64-*.AppImage`
-          files: DraggyEncoder-Linux-x86_64-*.AppImage
+          # Las capturas van aquí porque el metainfo de AppStream las
+          # referencia por su URL de la release "latest"
+          # (releases/latest/download/DraggyEncoder-screenshot-*.png): sin
+          # adjuntarlas, el centro de software mostraría imágenes roscadas.
+          files: |
+            DraggyEncoder-Linux-x86_64-*.AppImage
+            screenshots/*.png
 
-      - name: Attach Linux packages to release
+      - name: Attach AppImage to release
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v3
         with:
           files: |
-            DraggyEncoder-Linux-x86_64-*.tar.gz
             DraggyEncoder-Linux-x86_64-*.AppImage
             screenshots/*.png

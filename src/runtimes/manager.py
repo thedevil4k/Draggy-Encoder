@@ -1560,8 +1560,8 @@ def _build_pytorch_command(variant: str, plan: dict | None = None,
     index_url = _INDEX_URLS.get(used_variant, _INDEX_URLS["cpu"])
 
     # ``--index-url`` apunta SOLO al índice de CUDA/CPU de PyTorch, así que
-    # hay que añadir PyPI como ``--extra-index-url``: ``onnx`` y ``onnxscript``
-    # únicamente existen en PyPI y, sin él, pip falla con
+    # hay que añadir PyPI como ``--extra-index-url``: ``onnx``, ``onnxscript``
+    # y ``safetensors`` únicamente existen en PyPI y, sin él, pip falla con
     # "No matching distribution found for onnx".
     return [
         *_pip_command_prefix(), "install",
@@ -1572,7 +1572,7 @@ def _build_pytorch_command(variant: str, plan: dict | None = None,
         "--upgrade",
         "--index-url", index_url,
         "--extra-index-url", "https://pypi.org/simple",
-        *pytorch_requirements(plan), "onnx", "onnxscript",
+        *pytorch_requirements(plan), "onnx", "onnxscript", "safetensors",
     ]
 
 
@@ -2915,10 +2915,14 @@ def install_pytorch(
 
     # El plan debe fijar las tres piezas para que no se mezclen familias
     # (una torchvision nueva puede arrastrar un torch viejo).
-    requirements = [*pytorch_requirements(plan), "onnx", "onnxscript"]
+    # ``safetensors`` va con PyTorch: es lo que hace falta para cargar los
+    # modelos .safetensors (OmniSR, RIFE, FILM...) con ``safetensors.torch``.
+    requirements = [*pytorch_requirements(plan), "onnx", "onnxscript",
+                    "safetensors"]
     _staged_install(
         report,
-        packages=("torch", "torchvision", "torchaudio", "onnx", "onnxscript"),
+        packages=("torch", "torchvision", "torchaudio", "onnx", "onnxscript",
+                  "safetensors"),
         requirements=requirements,
         index_url=_INDEX_URLS.get(used_variant, _INDEX_URLS["cpu"]),
         kind="pytorch",
@@ -3146,8 +3150,10 @@ def install_runtimes(
     # 1. PyTorch (la parte más grande)
     _staged_install(
         report,
-        packages=("torch", "torchvision", "torchaudio", "onnx", "onnxscript"),
-        requirements=[*pytorch_requirements(plan), "onnx", "onnxscript"],
+        packages=("torch", "torchvision", "torchaudio", "onnx", "onnxscript",
+                  "safetensors"),
+        requirements=[*pytorch_requirements(plan), "onnx", "onnxscript",
+                      "safetensors"],
         index_url=_INDEX_URLS.get(used_variant, _INDEX_URLS["cpu"]),
         kind="all",
         variant=used_variant,
@@ -3361,11 +3367,14 @@ def _runtime_group_prefixes(dep_id: str) -> tuple[str, ...]:
     quien ejecute el resultado, así que se van con CUALQUIERA de los dos: es
     preferible quedarse corto de paquetes (la siguiente instalación los trae)
     que dejar cientos de MB huérfanos.
+
+    ``safetensors`` se va SOLO con PyTorch: es la librería que lee los pesos
+    ``.safetensors`` (OmniSR, RIFE, FILM) y sin torch no sirve para nada.
     """
     onnx_stack = ("onnx", "onnxscript", "onnx_ir")
     groups = {
         "torch": ("torch", "torchvision", "torchaudio", "torchgen",
-                  "functorch", *onnx_stack),
+                  "functorch", "safetensors", *onnx_stack),
         "onnxruntime": ("onnxruntime", "onnxruntime_gpu", *onnx_stack),
     }
     return groups.get(dep_id, ())

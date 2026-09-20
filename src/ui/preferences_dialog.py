@@ -76,6 +76,9 @@ _HEALTH_CHECK_PROMPT_KEY = "ffmpeg_health_check_prompt"
 _REMEMBER_CODEC_KEY = "remember_last_codec_device"
 _EXEC_PROVIDER_KEY = "execution_provider"
 _INSECURE_CHECKPOINT_KEY = "allow_insecure_checkpoint_load"
+# Rendimiento de IA (P1/P2): post-proceso en GPU + precisión de inferencia.
+_GPU_POST_KEY = "gpu_post_process"
+_PRECISION_KEY = "inference_precision"
 
 
 # ---------------------------------------------------------------------------
@@ -313,6 +316,60 @@ class PreferencesDialog(QDialog):
         self.cmb_exec_provider.setMinimumWidth(180)
         provider_group_layout.addWidget(self.cmb_exec_provider)
         layout.addWidget(provider_group)
+
+        # --------- Section: AI performance (P1 + P2) ---------
+        perf_group = self._build_section(
+            "AI performance",
+            "Dos ajustes independientes, los dos apagados/conservadores por "
+            "defecto.\n\n"
+            "GPU post-processing: mueve a la tarjeta gráfica el trabajo que "
+            "hoy hace el procesador DESPUÉS de la IA (pasar el resultado a "
+            "uint8, invertir canales y encogerlo al tamaño de salida). Medido "
+            "en una RTX 3060 con RealESR AnimeVideo v3 y 720x480 -> 720p: "
+            "7,1 fps -> 15,2 fps (fp32) y -> 22,3 fps con FP16, con la misma "
+            "imagen (la diferencia media es de 0,17 niveles sobre 255). La app "
+            "comprueba el resultado contra el camino clásico antes de usarlo "
+            "y, si algo no cuadra, sigue por el camino de siempre y te avisa "
+            "en el panel de tareas.\n\n"
+            "Inference precision: 'Model default' no convierte nada (es lo de "
+            "siempre). 'FP16' calcula a media precisión y 'FP32' fuerza "
+            "precisión completa. En el backend ONNX la ganancia de FP16 se "
+            "aprovecha sobre todo CON GPU post-processing activado; en "
+            "PyTorch ya se usa media precisión por defecto.",
+        )
+        perf_group_layout = perf_group.layout()
+        self.chk_gpu_post = QCheckBox(
+            "GPU post-processing (experimental, validates itself before use)"
+        )
+        self.chk_gpu_post.setToolTip(
+            "Pre/post-proceso dentro del grafo ONNX y reescalado en la GPU.\n"
+            "Si la autocomprobación falla, el render usa el camino clásico."
+        )
+        perf_group_layout.addWidget(self.chk_gpu_post)
+
+        precision_row = QHBoxLayout()
+        precision_row.setSpacing(8)
+        precision_label = QLabel("Inference precision:")
+        precision_label.setStyleSheet("color: #a0a0b0; font-size: 11px;")
+        precision_row.addWidget(precision_label)
+        self.cmb_precision = QComboBox()
+        self.cmb_precision.addItem("Model default (no conversion)", "model")
+        self.cmb_precision.addItem("FP16 (half precision, faster)", "fp16")
+        self.cmb_precision.addItem("FP32 (full precision)", "fp32")
+        self.cmb_precision.setMinimumWidth(240)
+        self.cmb_precision.setToolTip(
+            "Precisión de los cálculos de IA.\n"
+            "  Model default: usa el modelo tal como está instalado.\n"
+            "  FP16: convierte una copia a media precisión (no toca el modelo\n"
+            "        instalado). Más rápido; la imagen puede cambiar en el\n"
+            "        último decimal. En ONNX, actívalo junto con GPU\n"
+            "        post-processing para aprovechar toda la ganancia.\n"
+            "  FP32: fuerza precisión completa aunque el archivo sea fp16."
+        )
+        precision_row.addWidget(self.cmb_precision)
+        precision_row.addStretch()
+        perf_group_layout.addLayout(precision_row)
+        layout.addWidget(perf_group)
 
         # --------- Section: Checkpoint security ---------
         security_group = self._build_section(
@@ -723,6 +780,22 @@ class PreferencesDialog(QDialog):
             self.chk_insecure_checkpoint.setChecked(
                 bool(preferences.get(_INSECURE_CHECKPOINT_KEY, False))
             )
+            # Rendimiento IA: ambos conservadores por defecto.
+            self.chk_gpu_post.setChecked(
+                bool(preferences.get(_GPU_POST_KEY, False))
+            )
+            precision = str(preferences.get(_PRECISION_KEY, "model") or "model")
+            precision = precision.strip().lower()
+            if precision in ("fp16", "half", "16", "float16"):
+                precision = "fp16"
+            elif precision in ("fp32", "full", "32", "float32", "single"):
+                precision = "fp32"
+            else:
+                precision = "model"
+            precision_index = self.cmb_precision.findData(precision)
+            self.cmb_precision.setCurrentIndex(
+                precision_index if precision_index >= 0 else 0
+            )
             self.txt_hf_token.setText(_get_hf_token())
         except Exception:
             self.chk_auto_update.setChecked(False)
@@ -730,6 +803,8 @@ class PreferencesDialog(QDialog):
             self.chk_health_check.setChecked(True)
             self.chk_remember_codec.setChecked(True)
             self.chk_insecure_checkpoint.setChecked(False)
+            self.chk_gpu_post.setChecked(False)
+            self.cmb_precision.setCurrentIndex(0)
             self.txt_hf_token.setText("")
 
     def _on_accept(self):
@@ -762,6 +837,14 @@ class PreferencesDialog(QDialog):
             preferences.set(
                 _INSECURE_CHECKPOINT_KEY,
                 bool(self.chk_insecure_checkpoint.isChecked()),
+            )
+            preferences.set(
+                _GPU_POST_KEY,
+                bool(self.chk_gpu_post.isChecked()),
+            )
+            preferences.set(
+                _PRECISION_KEY,
+                str(self.cmb_precision.currentData() or "model"),
             )
             _set_hf_token(str(self.txt_hf_token.text() or ""))
             # Limpiamos la clave legacy si estaba presente para que no

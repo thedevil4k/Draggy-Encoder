@@ -22,6 +22,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 from typing import Optional
 
 import numpy as np
@@ -158,10 +159,72 @@ class AIInferenceEngine:
         # x2 aunque el peso sea x4). None → usar la escala nativa del
         # modelo detectada en load().
         self._target_scale = None
+        # Telemetría (P0): acumulado por frame, para que el pipeline pida el
+        # total una sola vez al terminar el render.
+        self._timing_totals = {"pre_ms": 0.0, "infer_ms": 0.0, "post_ms": 0.0}
+        self._timing_calls = 0
+        # Post-proceso en GPU (P1): None = no configurado o inactivo.
+        self._gpu_post = None
 
     @property
     def is_loaded(self) -> bool:
         return self._loaded
+
+    # ------------------------------------------------------------ telemetría
+    def _add_timing(self, pre_ms: float, infer_ms: float, post_ms: float) -> None:
+        """Suma los ms de las tres fases de un frame. Nunca lanza."""
+        try:
+            self._timing_totals["pre_ms"] += float(pre_ms)
+            self._timing_totals["infer_ms"] += float(infer_ms)
+            self._timing_totals["post_ms"] += float(post_ms)
+            self._timing_calls += 1
+        except Exception:
+            pass
+
+    def get_cumulative_timing(self) -> dict:
+        """Milisegundos acumulados por fase + nº de frames procesados (P0)."""
+        return {
+            "frames": self._timing_calls,
+            "pre_ms": round(self._timing_totals.get("pre_ms", 0.0), 3),
+            "infer_ms": round(self._timing_totals.get("infer_ms", 0.0), 3),
+            "post_ms": round(self._timing_totals.get("post_ms", 0.0), 3),
+        }
+
+    def reset_cumulative_timing(self) -> None:
+        """Descarta lo acumulado (los frames de la autocomprobación no cuentan)."""
+        self._timing_totals = {"pre_ms": 0.0, "infer_ms": 0.0, "post_ms": 0.0}
+        self._timing_calls = 0
+
+    # --------------------------------------------------------- post GPU (P1)
+    def configure_gpu_post(self, width=None, height=None, resize_fn=None,
+                           input_size=None) -> dict:
+        """Activa el pre/post-proceso en GPU si el usuario lo pidió (P1).
+
+        Devuelve ``{"active": bool, "reason": str, ...}``. La implementación
+        por defecto no ofrece este camino; las subclases que sí lo soportan lo
+        sobrescriben. Nunca lanza: ante cualquier problema se devuelve
+        ``active=False`` y el pipeline sigue con el camino de siempre.
+        """
+        return {"active": False, "reason": "not-supported"}
+
+    def gpu_post_active(self) -> bool:
+        """True si esta engine está usando el camino de post-proceso en GPU."""
+        try:
+            return bool(self._gpu_post and self._gpu_post.get("active"))
+        except Exception:
+            return False
+
+    def disable_gpu_post(self) -> None:
+        """Vuelve al camino clásico. Las subclases lo sobrescriben."""
+        self._gpu_post = None
+
+    def describe_execution(self) -> dict:
+        """Cómo está corriendo realmente la engine (para el log del render)."""
+        return {
+            "engine_id": self.engine_id,
+            "backend": type(self).__name__,
+            "gpu_post": self.gpu_post_active(),
+        }
 
     def load(self) -> bool:
         raise NotImplementedError
@@ -193,6 +256,80 @@ class ONNXRUNTIMEInferenceEngine(AIInferenceEngine):
         self._exec_mode = "Auto"
         self._is_first_frame = True
         self._cpu_fallback_done = False
+        # Precisión (P2) y ruta real del .onnx de la sesión. Si el usuario
+        # pide fp16/fp32 y el archivo es de otra precisión, la sesión se crea
+        # a partir de una copia convertida (en la caché de sesión, nunca
+        # tocando el modelo instalado); si la conversión no es viable se usa
+        # el modelo tal cual.
+        self._precision_pref = "model"
+        self._precision = "fp32"
+        self._native_dtype = "fp32"
+        self._session_model_path = model_path
+        self._input_dtype = np.float32
+        self._gpu_post_conversion_note = ""
+        # Aviso si el .onnx trae un tamaño de entrada fijo (export mal hecho).
+        self._fixed_input_note = ""
+        # Motivo por el que el camino GPU se abandonó a mitad de render (si
+        # pasó). El pipeline lo lee al terminar para avisar en la UI.
+        self._gpu_post_failure = None
+
+    def _resolve_precision(self, ort) -> None:
+        """Resuelve la precisión efectiva antes de crear la sesión (P2)."""
+        try:
+            from src.ai import gpu_post
+            self._precision_pref = gpu_post.get_precision_preference()
+            self._native_dtype = gpu_post.model_float_dtype(self.model_path)
+        except Exception as exc:
+            logger.debug("Precision preference unavailable: %s", exc)
+            self._precision_pref, self._native_dtype = "model", "fp32"
+
+        target = (self._precision_pref if self._precision_pref in ("fp16", "fp32")
+                  else self._native_dtype)
+        self._precision = self._native_dtype
+        self._session_model_path = self.model_path
+        self._gpu_post_conversion_note = ""
+        if target == self._native_dtype:
+            return
+        try:
+            from src.ai import gpu_post
+            path, info = gpu_post.build_precision_model(self.model_path, target)
+        except Exception as exc:
+            path, info = None, {"reason": str(exc)}
+        if path:
+            self._session_model_path = path
+            self._precision = target
+            self._gpu_post_conversion_note = (
+                f"converted {self._native_dtype}->{target}"
+            )
+            logger.info("ONNX precision: %s -> %s (%s)", self._native_dtype,
+                        target, os.path.basename(path))
+            if target == "fp16":
+                try:
+                    from src.ai import gpu_post as _gpu_post
+                    if not _gpu_post.gpu_post_enabled():
+                        # Honestidad medida: fp16 acelera la inferencia, pero
+                        # el post-proceso clásico en numpy sobre un tensor fp16
+                        # se come la ganancia (numpy no tiene SIMD para fp16).
+                        logger.warning(
+                            "FP16 is selected without GPU post-processing: the "
+                            "numpy post-process offsets most of the gain on the "
+                            "ONNX backend. Enable 'GPU post-processing' in "
+                            "Preferences for the full speed-up."
+                        )
+                except Exception:
+                    pass
+        else:
+            # Rechazo explícito y visible: el usuario pidió una precisión que
+            # no se pudo preparar, así que corremos la nativa y lo decimos.
+            self._gpu_post_conversion_note = (
+                f"precision {target} unavailable ({info.get('reason', '?')})"
+            )
+            logger.warning(
+                "Requested precision %s could not be prepared for %s (%s); "
+                "using the model as installed (%s).",
+                target, os.path.basename(self.model_path),
+                info.get("reason", "unknown"), self._native_dtype,
+            )
 
     def load(self) -> bool:
         """Carga el modelo ONNX. Devuelve True si tiene éxito."""
@@ -228,9 +365,11 @@ class ONNXRUNTIMEInferenceEngine(AIInferenceEngine):
             else:
                 self._providers = ["CPUExecutionProvider"]
 
+        self._resolve_precision(ort)
+
         try:
             self._session = ort.InferenceSession(
-                self.model_path,
+                self._session_model_path,
                 providers=self._providers,
             )
         except Exception as exc:
@@ -248,7 +387,7 @@ class ONNXRUNTIMEInferenceEngine(AIInferenceEngine):
                 self._providers = ["CPUExecutionProvider"]
                 try:
                     self._session = ort.InferenceSession(
-                        self.model_path,
+                        self._session_model_path,
                         providers=self._providers,
                     )
                 except Exception as cpu_exc:
@@ -283,11 +422,35 @@ class ONNXRUNTIMEInferenceEngine(AIInferenceEngine):
                     os.path.basename(self.model_path), in_ch,
                 )
                 return False
+        # Altura/anchura fijas distintas de la del vídeo = .onnx mal exportado
+        # (visto en el catálogo: un modelo con 64x64 fijos). Se avisa AL CARGAR
+        # con la salida accionable, en vez de dejar que reviente en cada frame
+        # del render (allí el motor se desactiva y el vídeo sale sin upscale).
+        try:
+            fixed_h = self._input_shape[2] if len(self._input_shape) > 2 else None
+            fixed_w = self._input_shape[3] if len(self._input_shape) > 3 else None
+            if isinstance(fixed_h, int) and isinstance(fixed_w, int) and fixed_h > 0 and fixed_w > 0:
+                self._fixed_input_note = (
+                    f"model has a FIXED {fixed_w}x{fixed_h} input; it can only "
+                    f"process frames of that exact size"
+                )
+                logger.warning(
+                    "ONNX model %s declares a fixed %dx%d input. Renders at any "
+                    "other resolution will fail; re-convert the weights from the "
+                    ".pth in Manage Dependencies to get a dynamic-shape export.",
+                    os.path.basename(self.model_path), fixed_w, fixed_h,
+                )
+        except Exception:
+            pass
 
         # En modo Auto con CUDA, hacemos una inferencia de prueba para
         # forzar el fallo de cuDNN (si existe) ANTES de que el pipeline
         # comience. Si falla, recreamos la sesión con CPU. Así el usuario
         # no ve el error en mitad del procesamiento real.
+        # El dtype de alimentación se fija ANTES del warmup: con un modelo
+        # fp16, alimentar float32 hace fallar la sesión
+        # ("Unexpected input data type. Actual: tensor(float)").
+        self._input_dtype = np.float16 if self._precision == "fp16" else np.float32
         if self._exec_mode == "Auto" and "CUDAExecutionProvider" in self._providers:
             try:
                 self._dummy_inference()
@@ -296,11 +459,15 @@ class ONNXRUNTIMEInferenceEngine(AIInferenceEngine):
                     return False
 
         self._loaded = True
+        # Reafirmado tras el fallback a CPU (por si cambió la precisión).
+        self._input_dtype = np.float16 if self._precision == "fp16" else np.float32
         # Log which providers are ACTUALLY in use (ORT may silently drop one).
         actual = self._session.get_providers()
         logger.info(
-            "ONNX model loaded: %s (requested: %s, active: %s)",
+            "ONNX model loaded: %s (requested: %s, active: %s, precision: %s%s)",
             os.path.basename(self.model_path), self._providers, actual,
+            self._precision,
+            f", {self._gpu_post_conversion_note}" if self._gpu_post_conversion_note else "",
         )
         if "CUDAExecutionProvider" not in actual and "CUDAExecutionProvider" in self._providers:
             logger.warning(
@@ -332,7 +499,7 @@ class ONNXRUNTIMEInferenceEngine(AIInferenceEngine):
             self._providers = ["CPUExecutionProvider"]
             self._cpu_fallback_done = True
             self._session = ort.InferenceSession(
-                self.model_path,
+                self._session_model_path,
                 providers=self._providers,
             )
             # Refresh input/output metadata after recreating session
@@ -383,7 +550,7 @@ class ONNXRUNTIMEInferenceEngine(AIInferenceEngine):
                 dummy_shape = tuple(dummy_shape[:4])
 
         dummy = np.ascontiguousarray(
-            np.zeros(dummy_shape, dtype=np.float32)
+            np.zeros(dummy_shape, dtype=getattr(self, "_input_dtype", np.float32))
         )
         return self._session.run(
             [self._output_name],
@@ -414,14 +581,21 @@ class ONNXRUNTIMEInferenceEngine(AIInferenceEngine):
         if frame.ndim != 3 or frame.shape[2] != 3:
             raise ValueError(f"Expected BGR frame (H, W, 3), got shape {frame.shape}")
 
+        if self.gpu_post_active():
+            return self._process_frame_gpu_post(frame)
+
         h, w = frame.shape[:2]
 
+        t_pre = time.perf_counter()
         # BGR uint8 → RGB float32 [0,1] NCHW contiguous.
         # ``[:, :, ::-1]`` invierte el eje de canales (BGR ↔ RGB).
         rgb = np.ascontiguousarray(frame[:, :, ::-1])
         input_data = np.transpose(rgb, (2, 0, 1)).astype(np.float32) / 255.0
         input_data = np.expand_dims(input_data, axis=0)  # NCHW
         input_data = np.ascontiguousarray(input_data)
+        if getattr(self, "_input_dtype", np.float32) != np.float32:
+            input_data = input_data.astype(self._input_dtype)
+        t_run = time.perf_counter()
 
         # Inferencia. En 'Auto' con CUDA, si cuDNN o el driver no están
         # disponibles (aunque get_available_providers reporte CUDA),
@@ -462,16 +636,237 @@ class ONNXRUNTIMEInferenceEngine(AIInferenceEngine):
                 )
                 raise
 
+        t_post = time.perf_counter()
         self._is_first_frame = False
 
         # NCHW → CHW → HWC → uint8 → BGR
         output = outputs[0]
+        # numpy no tiene SIMD para float16: multiplicar/recortar un tensor
+        # fp16 en numpy cuesta ~3x más que en float32 (medido: el post-proceso
+        # clásico pasaba de 68 a 180 ms/frame con un modelo fp16). Se sube a
+        # float32 antes de operar, que es una conversión vectorizada barata.
+        if output.dtype == np.float16:
+            output = output.astype(np.float32)
         output = np.squeeze(output, axis=0)  # CHW
         output = np.transpose(output, (1, 2, 0))  # HWC
         output = np.clip(output * 255.0, 0, 255).astype(np.uint8)
         # RGB → BGR (invierte canales) y fija contigüidad para el pipe.
         output = np.ascontiguousarray(output[:, :, ::-1])
+        self._add_timing((t_run - t_pre) * 1000.0,
+                         (t_post - t_run) * 1000.0,
+                         (time.perf_counter() - t_post) * 1000.0)
         return output
+
+    # ------------------------------------------------- post-proceso GPU (P1)
+    def _process_frame_gpu_post(self, frame: np.ndarray) -> np.ndarray:
+        """Camino con cabeza/cola dentro del grafo (P1).
+
+        La entrada va por ``session.run`` (numpy) y no por IO binding: en este
+        build de ONNX Runtime (1.30 + CUDA) cualquier binding de ENTRADA por
+        CPU (``bind_cpu_input``/``bind_input``/``bind_ortvalue_input`` con un
+        OrtValue reutilizado) entrega ceros al grafo y la salida sale plana
+        —verificado con el grafo envuelto—. ``session.run`` sí entrega el dato
+        y además se queda con la única copia que hace falta: 1 MB de entrada y
+        2.3 MB de salida uint8 ya al tamaño del encoder.
+        """
+        state = self._gpu_post or {}
+        session = state.get("session")
+        if session is None:
+            # Estado incompleto: no es un fallo del render, es "vuelve al
+            # camino de siempre" (nunca se desactiva la engine por esto).
+            self.disable_gpu_post()
+            return self.process_frame(frame)
+
+        expected = state.get("input_size") or (0, 0)
+        if expected[0] and tuple(frame.shape[:2]) != tuple(expected):
+            # El grafo derivado está atado a un tamaño de entrada y a uno de
+            # salida. Si llega otro tamaño (p. ej. otro nodo de la cadena
+            # cambió la resolución) se vuelve al camino clásico: mejor perder
+            # velocidad que dejar el frame sin procesar.
+            self._gpu_post_failure = (
+                f"input size changed ({frame.shape[1]}x{frame.shape[0]} vs "
+                f"{expected[1]}x{expected[0]})"
+            )
+            logger.warning("gpu_post: %s; volviendo al camino clásico",
+                           self._gpu_post_failure)
+            self.disable_gpu_post()
+            return self.process_frame(frame)
+
+        t_pre = time.perf_counter()
+        input_data = frame[None, ...]
+        t_run = time.perf_counter()
+        try:
+            outputs = session.run([state["output_name"]],
+                                  {state["input_name"]: input_data})
+        except Exception as exc:
+            # Cualquier fallo del grafo envuelto (memoria, kernel, dtype) cae
+            # al camino clásico en vez de propagarse: el frame se procesa
+            # igual, sólo que más despacio.
+            self._gpu_post_failure = f"{type(exc).__name__}: {exc}"
+            logger.error("gpu_post: falló el grafo envuelto (%s); volviendo al "
+                         "camino clásico para el resto del render",
+                         self._gpu_post_failure)
+            self.disable_gpu_post()
+            return self.process_frame(frame)
+        t_post = time.perf_counter()
+        output = outputs[0]
+        if output.ndim == 4:
+            output = output[0]
+        self._add_timing((t_run - t_pre) * 1000.0,
+                         (t_post - t_run) * 1000.0,
+                         (time.perf_counter() - t_post) * 1000.0)
+        self._is_first_frame = False
+        return output
+
+    def _build_gpu_post_session(self, model_path):
+        """Sesión CUDA del grafo envuelto (opciones prudentes, sin CUDA Graph)."""
+        ort = import_local_runtime("onnxruntime")
+        options = {
+            "cudnn_conv_algo_search": "HEURISTIC",
+            "arena_extend_strategy": "kSameAsRequested",
+        }
+        providers = [("CUDAExecutionProvider", options), "CPUExecutionProvider"]
+        return ort.InferenceSession(model_path, providers=providers)
+
+    def configure_gpu_post(self, width=None, height=None, resize_fn=None,
+                           input_size=None) -> dict:
+        """Construye y valida el grafo con cabeza/cola (P1).
+
+        Devuelve ``{"active": bool, "reason": str, ...}``. Sólo se activa si:
+          - el usuario lo pidió en Preferences (apagado por defecto),
+          - hay CUDA activo,
+          - el grafo derivado se construye, se ejecuta y su salida coincide
+            con el camino actual dentro de tolerancia.
+
+        Cualquier fallo devuelve ``active=False`` con el motivo, y el render
+        continúa con el camino de siempre.
+        """
+        from src.ai import gpu_post
+
+        if not gpu_post.gpu_post_enabled():
+            return {"active": False, "reason": "preference-off"}
+        if not self._loaded or self._session is None:
+            return {"active": False, "reason": "not-loaded"}
+        if "CUDAExecutionProvider" not in (self.get_active_providers() or []):
+            return {"active": False, "reason": "no-cuda"}
+
+        in_h, in_w = 0, 0
+        if input_size:
+            in_h, in_w = int(input_size[1]), int(input_size[0])
+        if in_h <= 0 or in_w <= 0:
+            return {"active": False, "reason": "input-size-unknown"}
+
+        source = getattr(self, "_session_model_path", self.model_path)
+        target = None
+        if width and height:
+            target = (int(width), int(height))
+        path, info = gpu_post.build_wrapped_model(
+            source, out_size=target, precision=self._precision,
+        )
+        if not path:
+            return {"active": False, "reason": info.get("reason", "build-failed"),
+                    "detail": info}
+
+        try:
+            session = self._build_gpu_post_session(path)
+            state = {
+                "session": session,
+                "input_name": session.get_inputs()[0].name,
+                "output_name": session.get_outputs()[0].name,
+                "input_size": (in_h, in_w),
+                "out_size": target,
+            }
+            # Prueba en frío: si el grafo no puede ejecutarse con este tamaño,
+            # mejor enterarse aquí (antes del render) que en el frame 1.
+            session.run([state["output_name"]],
+                        {state["input_name"]: np.zeros((1, in_h, in_w, 3),
+                                                       dtype=np.uint8)})
+        except Exception as exc:
+            return {"active": False, "reason": "session-failed",
+                    "detail": f"{type(exc).__name__}: {exc}"}
+
+        frames = gpu_post.sample_frames(in_h, in_w)
+
+        def fast(fr):
+            return self._run_with_state(state, fr)
+
+        def reference(fr):
+            out = self.process_frame(fr)
+            if target and resize_fn:
+                if (out.shape[1], out.shape[0]) != target:
+                    out = resize_fn(out, target[0], target[1])
+            return out
+
+        ok, details = gpu_post.run_self_check(fast, reference, frames=frames)
+        if not ok:
+            logger.warning(
+                "gpu_post: autocomprobación fallida (%s); se sigue con el "
+                "camino de siempre", details.get("reason"),
+            )
+            return {"active": False, "reason": "check-failed", "detail": details}
+
+        state["active"] = True
+        state["precision"] = self._precision
+        state["check"] = details
+        self._gpu_post = state
+        # Los frames de la autocomprobación no son frames del render.
+        self.reset_cumulative_timing()
+        logger.info(
+            "gpu_post: ACTIVO (%s, salida %s, coarse_diff %.2f, channel_diff "
+            "%.2f, max_diff %.1f)", self._precision, target or "sin resize",
+            details.get("worst_coarse", 0.0), details.get("worst_channel", 0.0),
+            details.get("worst_max", 0.0),
+        )
+        return {
+            "active": True,
+            "reason": "ok",
+            "precision": self._precision,
+            "out_size": target,
+            "max_diff": round(float(details.get("worst_max", 0.0)), 2),
+            "mean_diff": round(float(details.get("worst_mean", 0.0)), 3),
+            "coarse_diff": round(float(details.get("worst_coarse", 0.0)), 2),
+            "channel_diff": round(float(details.get("worst_channel", 0.0)), 2),
+            "converted": bool(info.get("converted")),
+            "cached": bool(info.get("cached")),
+        }
+
+    def _run_with_state(self, state, frame):
+        """Ejecuta un frame con un estado de post-proceso concreto."""
+        outputs = state["session"].run(
+            [state["output_name"]], {state["input_name"]: frame[None, ...]},
+        )
+        output = outputs[0]
+        return output[0] if output.ndim == 4 else output
+
+    def disable_gpu_post(self) -> None:
+        """Vuelve al camino clásico (lo usa el pipeline si algo se tuerce)."""
+        self._gpu_post = None
+
+    def describe_execution(self) -> dict:
+        info = {
+            "engine_id": self.engine_id,
+            "backend": "onnxruntime",
+            "provider": ",".join(self.get_active_providers() or []),
+            "precision": self._precision,
+            "precision_preference": self._precision_pref,
+            "native_dtype": self._native_dtype,
+            "gpu_post": self.gpu_post_active(),
+        }
+        if self._gpu_post_conversion_note:
+            info["precision_note"] = self._gpu_post_conversion_note
+        if getattr(self, "_fixed_input_note", ""):
+            info["model_note"] = self._fixed_input_note
+        if self.gpu_post_active():
+            info["gpu_post_detail"] = {
+                "out_size": list(self._gpu_post.get("out_size") or []),
+                "max_diff": round(float(
+                    (self._gpu_post.get("check") or {}).get("worst_max", 0.0)), 2),
+                "coarse_diff": round(float(
+                    (self._gpu_post.get("check") or {}).get("worst_coarse", 0.0)), 2),
+                "channel_diff": round(float(
+                    (self._gpu_post.get("check") or {}).get("worst_channel", 0.0)), 2),
+            }
+        return info
 
     def get_scale_factor(self) -> int:
         """Intenta determinar el factor de escala del modelo."""
@@ -506,6 +901,23 @@ class PyTorchInferenceEngine(AIInferenceEngine):
         self._model = None
         self._device = None
         self._scale = 4
+        # Precisión (P2): "model" mantiene el comportamiento de siempre
+        # (autocast fp16 en GPU), "fp16" lo fuerza y "fp32" lo desactiva.
+        self._precision_pref = "model"
+        self._autocast = True
+        self._gpu_resize = None
+        self._last_phases = (0.0, 0.0, 0.0)
+
+    def _resolve_precision(self) -> None:
+        """Lee la precisión elegida por el usuario (P2)."""
+        try:
+            from src.ai import gpu_post
+            self._precision_pref = gpu_post.get_precision_preference()
+        except Exception:
+            self._precision_pref = "model"
+        # "model" conserva el comportamiento histórico (autocast fp16 en GPU
+        # cuando el modelo está en fp32): no cambiamos nada por defecto.
+        self._autocast = self._precision_pref != "fp32"
 
     def load(self) -> bool:
         try:
@@ -529,6 +941,7 @@ class PyTorchInferenceEngine(AIInferenceEngine):
             self._device = torch.device("cuda")
         else:
             self._device = torch.device("cpu")
+        self._resolve_precision()
 
         try:
             from src.ai.architectures import build_model_from_state_dict
@@ -593,14 +1006,25 @@ class PyTorchInferenceEngine(AIInferenceEngine):
 
     def process_frame(self, frame: np.ndarray) -> np.ndarray:
         """Procesa un fotograma BGR uint8 (H, W, 3) y devuelve BGR uint8
-        con el upscale aplicado."""
+        con el upscale aplicado.
+
+        Con el post-proceso en GPU activo (P1) la salida llega ya al tamaño
+        del encoder: el reescalado se hace en la tarjeta, evitando el viaje de
+        ida y vuelta a PIL (medido: 34 ms por frame en 2880x1920 -> 1080x720).
+        """
+        t_pre = time.perf_counter()
+        output = self._forward(frame, resize=self._gpu_resize if self.gpu_post_active() else None)
+        self._add_timing(*self._last_phases)
+        return output
+
+    def _forward(self, frame: np.ndarray, resize=None) -> np.ndarray:
+        """Inferencia completa; ``resize`` = (w, h) para reescalar en la GPU."""
         torch = import_local_runtime("torch")
 
         if not self._loaded or self._model is None:
             raise RuntimeError("Model not loaded")
 
-        h, w = frame.shape[:2]
-
+        t0 = time.perf_counter()
         # BGR → RGB, HWC → CHW, float32 [0,1]
         rgb = frame[:, :, ::-1].copy()
         input_data = np.transpose(rgb, (2, 0, 1)).astype(np.float32) / 255.0
@@ -608,21 +1032,106 @@ class PyTorchInferenceEngine(AIInferenceEngine):
         input_data = np.ascontiguousarray(input_data)
 
         input_tensor = torch.from_numpy(input_data).to(self._device)
+        t1 = time.perf_counter()
 
-        autocast = (torch.cuda.is_available() and self._device.type == "cuda")
+        autocast = (self._autocast and torch.cuda.is_available()
+                    and self._device.type == "cuda")
         with torch.no_grad():
             if autocast:
                 with torch.autocast("cuda", dtype=torch.float16):
                     output_tensor = self._model(input_tensor)
             else:
                 output_tensor = self._model(input_tensor)
+        t2 = time.perf_counter()
 
         # CHW → HWC, clamp, scale and convert on device (fp16 numpy ops are
         # extremely slow), then RGB → BGR, uint8
-        output = (output_tensor.squeeze(0).clamp(0, 1) * 255.0).to(torch.uint8)
+        output = output_tensor.squeeze(0).clamp(0, 1) * 255.0
+        if resize:
+            width, height = int(resize[0]), int(resize[1])
+            if (output.shape[2], output.shape[1]) != (width, height):
+                output = torch.nn.functional.interpolate(
+                    output.unsqueeze(0), size=(height, width),
+                    mode="bilinear", align_corners=False,
+                ).squeeze(0)
+        output = output.to(torch.uint8)
         output = output.permute(1, 2, 0).cpu().numpy()
         output = np.ascontiguousarray(output[:, :, ::-1])  # RGB → BGR
+        self._last_phases = ((t1 - t0) * 1000.0, (t2 - t1) * 1000.0,
+                             (time.perf_counter() - t2) * 1000.0)
         return output
+
+    def configure_gpu_post(self, width=None, height=None, resize_fn=None,
+                           input_size=None) -> dict:
+        """Reescalado en la GPU dentro del propio motor PyTorch (P1).
+
+        Aquí no hay grafo que envolver: la conversión a uint8 ya se hacía en
+        la tarjeta, así que lo único que se mueve es el reescalado final. Se
+        valida igual que en ONNX (comparación contra el camino actual) antes
+        de darlo por bueno.
+        """
+        from src.ai import gpu_post
+
+        if not gpu_post.gpu_post_enabled():
+            return {"active": False, "reason": "preference-off"}
+        if not self._loaded or self._model is None:
+            return {"active": False, "reason": "not-loaded"}
+        if self._device is None or self._device.type != "cuda":
+            return {"active": False, "reason": "no-cuda"}
+        if not width or not height:
+            return {"active": False, "reason": "no-target-size"}
+        target = (int(width), int(height))
+
+        in_h, in_w = (int(input_size[1]), int(input_size[0])) if input_size else (0, 0)
+        if in_h <= 0 or in_w <= 0:
+            in_h, in_w = 96, 128
+        frames = gpu_post.sample_frames(in_h, in_w)
+
+        def fast(fr):
+            return self._forward(fr, resize=target)
+
+        def reference(fr):
+            out = self._forward(fr, resize=None)
+            if (out.shape[1], out.shape[0]) != target:
+                if resize_fn:
+                    out = resize_fn(out, target[0], target[1])
+            return out
+
+        ok, details = gpu_post.run_self_check(fast, reference, frames=frames)
+        if not ok:
+            logger.warning("gpu_post (torch): autocomprobación fallida (%s)",
+                           details.get("reason"))
+            return {"active": False, "reason": "check-failed", "detail": details}
+        self._gpu_resize = target
+        self._gpu_post = {"active": True, "out_size": target, "check": details}
+        self.reset_cumulative_timing()
+        logger.info("gpu_post (torch): ACTIVO (salida %s, max_diff %.1f, "
+                    "mean_diff %.2f)", target, details.get("worst_max", 0.0),
+                    details.get("worst_mean", 0.0))
+        return {
+            "active": True, "reason": "ok", "precision": self._precision_pref,
+            "out_size": target, "cuda_graph": False,
+            "max_diff": round(float(details.get("worst_max", 0.0)), 2),
+            "mean_diff": round(float(details.get("worst_mean", 0.0)), 3),
+        }
+
+    def disable_gpu_post(self) -> None:
+        self._gpu_post = None
+        self._gpu_resize = None
+
+    def describe_execution(self) -> dict:
+        return {
+            "engine_id": self.engine_id,
+            "backend": "torch",
+            "device": str(self._device),
+            "precision": self._precision_pref,
+            "autocast": bool(self._autocast),
+            "gpu_post": self.gpu_post_active(),
+            "gpu_post_detail": (
+                {"out_size": list(self._gpu_resize or [])}
+                if self.gpu_post_active() else {}
+            ),
+        }
 
     def get_scale_factor(self) -> int:
         # Si el usuario pidió una escala menor que la nativa del peso
@@ -802,6 +1311,36 @@ def convert_pth_to_onnx(pth_path: str) -> Optional[str]:
     return path
 
 
+#: Versión del grafo que produce ``torch.onnx.export``. Se sube cuando un
+#: arreglo de arquitectura cambia lo que la red calcula: un ``.onnx`` exportado
+#: con una versión anterior se RE-EXPORTA, porque si no seguiría dando una
+#: imagen equivocada (oscura, borrosa) sin que nadie se enterase.
+#: v2 = arreglo de RRDBNet (LeakyReLU de más tras la suma residual + orden
+#:      incorrecto de conv_up/interpolate).
+ONNX_EXPORT_VERSION = 2
+
+
+def _export_marker_path(onnx_path: str) -> str:
+    return onnx_path + ".export-version"
+
+
+def _read_export_marker(onnx_path: str) -> int:
+    """Versión con la que se exportó ese ``.onnx`` (0 si no hay marca)."""
+    try:
+        with open(_export_marker_path(onnx_path), "r", encoding="utf-8") as handle:
+            return int(str(handle.read()).strip() or 0)
+    except Exception:
+        return 0
+
+
+def _write_export_marker(onnx_path: str) -> None:
+    try:
+        with open(_export_marker_path(onnx_path), "w", encoding="utf-8") as handle:
+            handle.write(str(ONNX_EXPORT_VERSION))
+    except Exception as exc:
+        logger.debug("could not write the ONNX export marker: %s", exc)
+
+
 def convert_pth_to_onnx_ex(pth_path: str) -> tuple[Optional[str], str]:
     """Like :func:`convert_pth_to_onnx` but reports the failure reason.
 
@@ -814,6 +1353,22 @@ def convert_pth_to_onnx_ex(pth_path: str) -> tuple[Optional[str], str]:
         return None, f"Model weight file not found:\n{pth_path}"
 
     onnx_path = os.path.splitext(pth_path)[0] + ".onnx"
+    stale_backup = None
+
+    def _restore_stale():
+        """Devuelve el .onnx viejo a su sitio si la re-exportación falló."""
+        if not stale_backup:
+            return
+        try:
+            if not os.path.exists(onnx_path) and os.path.exists(stale_backup):
+                os.replace(stale_backup, onnx_path)
+                logger.warning(
+                    "Re-export failed; keeping the previous (outdated) ONNX "
+                    "file at %s", onnx_path,
+                )
+        except Exception:
+            logger.debug("could not restore the previous ONNX file", exc_info=True)
+
     if os.path.exists(onnx_path):
         # Reutilizar el .onnx solo si es compatible con el pipeline: un
         # .onnx huérfano (convertido desde el archivo equivocado, p.ej. con
@@ -823,12 +1378,30 @@ def convert_pth_to_onnx_ex(pth_path: str) -> tuple[Optional[str], str]:
         # reconvertir dejaría al usuario sin ONNX. Solo se borra cuando se
         # prueba POSITIVAMENTE que el canal fijo no es 3.
         probe = _onnx_input_channels_ok(onnx_path)
-        if probe is not False:
+        marker = _read_export_marker(onnx_path)
+        if probe is not False and marker >= ONNX_EXPORT_VERSION:
             return onnx_path, ""
-        try:
-            os.remove(onnx_path)
-        except OSError as exc:
-            return None, f"Could not replace the existing ONNX file: {exc}"
+        if probe is False:
+            try:
+                os.remove(onnx_path)
+            except OSError as exc:
+                return None, f"Could not replace the existing ONNX file: {exc}"
+        else:
+            # Grafo exportado con una versión anterior de la app (o sin marca):
+            # puede calcular mal. Se aparta y se re-exporta; si la
+            # re-exportación falla se restaura, porque un ONNX viejo es mejor
+            # que quedarse sin ninguno.
+            try:
+                stale_backup = onnx_path + ".stale"
+                os.replace(onnx_path, stale_backup)
+                logger.info(
+                    "ONNX export version %s < %s: re-exporting %s",
+                    marker, ONNX_EXPORT_VERSION, os.path.basename(onnx_path),
+                )
+            except OSError as exc:
+                logger.warning("Could not move the outdated ONNX aside (%s); "
+                               "keeping it as is", exc)
+                return onnx_path, ""
 
     try:
         torch = import_local_runtime("torch")
@@ -967,8 +1540,15 @@ def convert_pth_to_onnx_ex(pth_path: str) -> tuple[Optional[str], str]:
                     os.remove(onnx_path)
             except Exception:
                 pass
+            _restore_stale()
             return None, error_msg
 
+        _write_export_marker(onnx_path)
+        if stale_backup and os.path.exists(stale_backup):
+            try:
+                os.remove(stale_backup)
+            except Exception:
+                pass
         logger.info("ONNX conversion saved: %s", onnx_path)
         return onnx_path, ""
     except Exception as exc:
@@ -979,6 +1559,7 @@ def convert_pth_to_onnx_ex(pth_path: str) -> tuple[Optional[str], str]:
                 os.remove(onnx_path)
         except Exception:
             pass
+        _restore_stale()
         return None, f"Unexpected error during conversion: {exc}"
 
 
