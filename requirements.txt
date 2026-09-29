@@ -9,3 +9,9 @@ psutil>=5.9.0
 requests>=2.28.0
 huggingface_hub>=0.20.0
 numpy>=1.24.0
+# Lectura de uso de la GPU en vivo para el desplegable de la bandeja. Es el
+# paquete de NVIDIA; se importa con el nombre ``pynvml``. Es puro Python
+# (ctypes) y carga el nvml.dll del driver: no arrastra CUDA ni ningun
+# runtime. En un equipo sin NVIDIA el import falla y la app sigue igual,
+# solo sin la linea de GPU (ver src/hardware/metrics.py).
+nvidia-ml-py>=12.535.0

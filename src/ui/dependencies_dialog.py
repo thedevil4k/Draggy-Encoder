@@ -3,24 +3,21 @@
 Muestra una lista de dependencias (FFmpeg real, más placeholders de runtimes y
 ranuras de modelos) con su estado, versión instalada y acciones disponibles
 (instalar / reinstalar, abrir carpeta, abrir logs).
+
+Cada fila se monta en ``src.ui.dep_row``, junto con el texto que decide qué
+pone cada botón. Aquí queda el panel, los hilos y la pestaña de motores.
 """
 
 from __future__ import annotations
 
 import logging
 import os
-import platform
-import subprocess
 import threading
 import traceback
-from datetime import datetime, timezone
-
 from PySide6.QtCore import Qt, QThread, QTimer, Signal
-from PySide6.QtGui import QColor, QFont
+from PySide6.QtGui import QFont
 from PySide6.QtWidgets import (
-    QComboBox,
     QDialog,
-    QFrame,
     QHBoxLayout,
     QLabel,
     QMessageBox,
@@ -32,8 +29,10 @@ from PySide6.QtWidgets import (
 )
 
 import src.dependencies as dependencies
+from src import fsops
+from src.ffmpeg import build_fit, builds
+from src.ffmpeg.upstream import clear_cache
 from src.ai.bus import bus as _state_bus
-from src.runtimes.manager import get_python_support_info as _get_python_support_info
 from src.ai.engines_state import (
     get_state as engines_state_get,
     mark_failed as engines_mark_failed,
@@ -50,9 +49,14 @@ from src.ai.fetcher import (
     OnnxConvertWorker,
     is_hf_hub_available,
 )
-from src.ai.registry import CATALOG, get_engine_dir
+from src.ai.registry import get_engine_dir
 from src.ai.engines_state import dir_has_weights
 from src.config import get_logs_dir
+from src.ui.dialog_utils import fit_to_screen, open_folder
+from src.ui.engines_tab import EnginesTab
+from src.ui.dep_row import DepRow
+
+logger = logging.getLogger(__name__)
 
 
 # Fases del worker de conversión a mensajes amigables para la fila del
@@ -69,19 +73,6 @@ def _friendly_convert_status(raw: str) -> str:
     return _CONVERT_STATUS_MAP.get(str(raw or "").strip(), str(raw or ""))
 
 
-from src.ffmpeg.upstream import clear_cache
-from src.ui.dialog_utils import fit_to_screen
-from src.ui.engines_tab import EnginesTab
-
-
-_STATUS_COLORS = {
-    dependencies.STATUS_INSTALLED: ("#00d2d3", "#0f0f1a"),      # turquesa (sobre fondo claro)
-    dependencies.STATUS_MISSING: ("#e74c3c", "#ffffff"),         # rojo
-    dependencies.STATUS_ERROR: ("#f39c12", "#0f0f1a"),           # ámbar
-    dependencies.STATUS_COMING_SOON: ("#5f27cd", "#ffffff"),     # lila (coming soon)
-}
-
-
 def _fmt_bytes(n):
     """Formatea bytes a una unidad legible (B/KB/MB/GB/TB)."""
     try:
@@ -93,36 +84,6 @@ def _fmt_bytes(n):
             return f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}"
         n /= 1024.0
     return f"{n:.1f} PB"
-
-
-def _format_latest_line(info):
-    """Devuelve el texto "Latest: … · last check: …" para la columna Latest."""
-    fp = info.get("latest_fingerprint") or {}
-    last_mod = fp.get("last_modified_iso")
-    checked_at = fp.get("checked_at")
-    if not last_mod:
-        if info.get("upstream_error"):
-            return "Latest: — (offline) · last check: never"
-        return "Latest: — · last check: never"
-    # Mostrar solo la fecha (YYYY-MM-DD) para no saturar la línea
-    short = last_mod.split("T", 1)[0]
-    # Edad del check en horas
-    age_text = "—"
-    if checked_at:
-        try:
-            dt = datetime.fromisoformat(checked_at)
-            if dt.tzinfo is None:
-                dt = dt.replace(tzinfo=timezone.utc)
-            hours = (datetime.now(timezone.utc) - dt).total_seconds() / 3600.0
-            if hours < 1:
-                age_text = f"{int(hours * 60)} min ago"
-            elif hours < 24:
-                age_text = f"{hours:.1f} h ago"
-            else:
-                age_text = f"{hours / 24:.1f} d ago"
-        except Exception:
-            pass
-    return f"Latest upstream build: {short}  ·  last check: {age_text}"
 
 
 class _ReinstallWorker(QThread):
@@ -142,6 +103,8 @@ class _ReinstallWorker(QThread):
     def __init__(self, dep_id, parent=None):
         super().__init__(parent)
         self.dep_id = dep_id
+        # Qué versión se reinstala lo decide la preferencia de FFmpeg; aquí
+        # no hay ningún build_id que reenviar.
         self.abort_event = threading.Event()
 
     def cancel(self):
@@ -257,6 +220,8 @@ class _UpstreamCheckWorker(QThread):
         super().__init__(parent)
         # Cuando ``force`` es True se ignora el cache de 24h (Refresh manual).
         # Cuando es False, sólo se hace HEAD si el cache tiene más de 24h.
+        # La huella es la de la build ELEGIDA: comparar un binario 6.0
+        # contra el upstream de master daría siempre "update available".
         self.force = force
 
     def run(self):
@@ -270,285 +235,6 @@ class _UpstreamCheckWorker(QThread):
             # el último estado conocido.
             pass
         self.done.emit()
-
-
-class _DepRow(QFrame):
-    """Una fila con el estado + versión + acciones de una dependencia."""
-
-    redownload_requested = Signal(str)
-    uninstall_requested = Signal(str)
-
-    def __init__(self, info, parent=None):
-        super().__init__(parent)
-        self.info = info
-        self.setObjectName("DepRow")
-        self.setStyleSheet(self._stylesheet())
-        self._build(info)
-
-    def _stylesheet(self):
-        return """
-        #DepRow {
-            background-color: #16213e;
-            border: 1px solid #2c3e50;
-            border-radius: 8px;
-        }
-        #DepRow QPushButton {
-            background-color: #1f2c4c;
-            color: #e0e0e0;
-            border: 1px solid #2c3e50;
-            border-radius: 6px;
-            padding: 6px 12px;
-        }
-        #DepRow QPushButton:hover {
-            background-color: #00d2d3;
-            color: #0f0f1a;
-        }
-        #DepRow QPushButton:disabled {
-            background-color: #2c3e50;
-            color: #5f6f7f;
-        }
-        #DepRow QPushButton#uninstallBtn {
-            background-color: #3a1620;
-            color: #ff6b6b;
-            border: 1px solid #6e2233;
-        }
-        #DepRow QPushButton#uninstallBtn:hover {
-            background-color: #e74c3c;
-            color: #ffffff;
-        }
-        #DepRow QPushButton#uninstallBtn:disabled {
-            background-color: #2c3e50;
-            color: #5f6f7f;
-        }
-        #StatusBadge {
-            border-radius: 9px;
-            padding: 2px 10px;
-            font-weight: bold;
-            font-size: 11px;
-        }
-        """
-
-    def _build(self, info):
-        outer = QHBoxLayout(self)
-        outer.setSpacing(14)
-        outer.setContentsMargins(14, 12, 14, 12)
-
-        # Columna izquierda: nombre + versión + ruta
-        left = QVBoxLayout()
-        left.setSpacing(4)
-        title = QLabel(info.get("display_name", "—"))
-        title_font = QFont()
-        title_font.setPointSize(12)
-        title_font.setBold(True)
-        title.setFont(title_font)
-        title.setStyleSheet("color: #ffffff;")
-        left.addWidget(title)
-
-        kind_label = info.get("kind", "").upper()
-        version_text = info.get("version") or "—"
-        meta = QLabel(f"{kind_label}  ·  version: {version_text}")
-        meta.setStyleSheet("color: #a0a0b0; font-size: 11px;")
-        left.addWidget(meta)
-
-        path_label = QLabel(
-            info.get("install_dir") or "(no install dir)"
-        )
-        path_label.setStyleSheet(
-            "color: #707080; font-size: 10px; font-family: Consolas, monospace;"
-        )
-        path_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        left.addWidget(path_label)
-
-        if info.get("source_url"):
-            url_label = QLabel(info["source_url"])
-            url_label.setStyleSheet(
-                "color: #00d2d3; font-size: 10px;"
-            )
-            url_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-            left.addWidget(url_label)
-
-        # Línea "Latest <fecha>" cuando hay datos de upstream (sólo BINARY)
-        if info.get("kind") == dependencies.KIND_BINARY:
-            latest_text = _format_latest_line(info)
-            if latest_text:
-                latest_label = QLabel(latest_text)
-                latest_label.setStyleSheet("color: #00d2d3; font-size: 11px;")
-                latest_label.setTextInteractionFlags(
-                    Qt.TextInteractionFlag.TextSelectableByMouse
-                )
-                left.addWidget(latest_label)
-
-        if info.get("detail"):
-            detail = QLabel(info["detail"])
-            detail.setStyleSheet("color: #c0c0d0; font-size: 11px;")
-            detail.setWordWrap(True)
-            left.addWidget(detail)
-
-        # AI runtime compatibility warning (Python 3.14, etc.)
-        support = self._ai_runtime_support_info(info)
-        if support and not support["supported"]:
-            warn = QLabel(support["message"])
-            warn.setStyleSheet("color: #f39c12; font-size: 11px; font-weight: bold;")
-            warn.setWordWrap(True)
-            left.addWidget(warn)
-
-        outer.addLayout(left, stretch=1)
-
-        # Columna derecha: badge principal + (opcional) "Update available"
-        right = QVBoxLayout()
-        right.setSpacing(6)
-
-        badge_row = QHBoxLayout()
-        badge_row.setSpacing(6)
-        badge_row.setAlignment(Qt.AlignmentFlag.AlignRight)
-
-        badge = QLabel(self._badge_text(info.get("status")))
-        status = info.get("status")
-        fg_bg = _STATUS_COLORS.get(status, ("#a0a0b0", "#0f0f1a"))
-        badge.setStyleSheet(
-            f"#StatusBadge {{ background-color: {fg_bg[0]}; color: {fg_bg[1]}; }}"
-        )
-        badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        badge.setObjectName("StatusBadge")
-        badge.setMaximumWidth(140)
-        badge_row.addWidget(badge)
-
-        # Insignia secundaria "Update available" cuando aplica
-        if info.get("update_available") is True:
-            ua = QLabel("UPDATE AVAILABLE")
-            ua.setObjectName("UpdateBadge")
-            ua.setStyleSheet(
-                "#UpdateBadge { background-color: #f39c12; color: #0f0f1a; "
-                "border-radius: 9px; padding: 2px 10px; font-weight: bold; font-size: 11px; }"
-            )
-            ua.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            badge_row.addWidget(ua)
-        elif info.get("upstream_error"):
-            ua = QLabel("OFFLINE")
-            ua.setObjectName("UpdateBadge")
-            ua.setStyleSheet(
-                "#UpdateBadge { background-color: #2c3e50; color: #a0a0b0; "
-                "border-radius: 9px; padding: 2px 10px; font-weight: bold; font-size: 11px; }"
-            )
-            ua.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            ua.setToolTip("Could not reach the upstream URL.\n" + str(info["upstream_error"]))
-            badge_row.addWidget(ua)
-
-        right.addLayout(badge_row)
-
-        btn_row = QHBoxLayout()
-        btn_row.setSpacing(6)
-
-        primary_label = self._primary_label(info)
-        support = self._ai_runtime_support_info(info)
-        self.btn_primary = QPushButton(primary_label)
-        self.btn_primary.setEnabled(self._primary_enabled(info, support=support))
-        if info.get("kind") == dependencies.KIND_MODEL:
-            self.btn_primary.setToolTip(
-                "Add or remove individual engines from the 'AI Engines' tab."
-            )
-        if info.get("update_available") is True:
-            self.btn_primary.setStyleSheet(
-                "QPushButton { background-color: #f39c12; color: #0f0f1a; "
-                "border: none; border-radius: 6px; padding: 6px 12px; font-weight: bold; }"
-                "QPushButton:hover { background-color: #f5b041; }"
-                "QPushButton:disabled { background-color: #2c3e50; color: #5f6f7f; }"
-            )
-        self.btn_primary.clicked.connect(
-            lambda: self.redownload_requested.emit(info.get("id") or info.get("display_name"))
-        )
-        btn_row.addWidget(self.btn_primary)
-
-        self.btn_open = QPushButton("Open folder")
-        self.btn_open.setEnabled(bool(info.get("install_dir")))
-        self.btn_open.clicked.connect(lambda: self._open_path(info.get("install_dir")))
-        btn_row.addWidget(self.btn_open)
-
-        # Desinstalar / borrar lo instalado (binarios, runtimes, modelos).
-        can_uninstall = bool(info.get("deletable")) and info.get(
-            "status"
-        ) == dependencies.STATUS_INSTALLED
-        self.btn_uninstall = QPushButton("Uninstall")
-        self.btn_uninstall.setObjectName("uninstallBtn")
-        self.btn_uninstall.setEnabled(can_uninstall)
-        if not can_uninstall:
-            self.btn_uninstall.setToolTip(
-                "Nothing installed to remove, or it cannot be removed from the app."
-            )
-        self.btn_uninstall.clicked.connect(
-            lambda: self.uninstall_requested.emit(
-                info.get("id") or info.get("display_name")
-            )
-        )
-        btn_row.addWidget(self.btn_uninstall)
-
-        right.addLayout(btn_row)
-        right.addStretch()
-        outer.addLayout(right)
-
-    def _badge_text(self, status):
-        return {
-            dependencies.STATUS_INSTALLED: "INSTALLED",
-            dependencies.STATUS_MISSING: "MISSING",
-            dependencies.STATUS_ERROR: "ERROR",
-            dependencies.STATUS_COMING_SOON: "COMING SOON",
-        }.get(status, status or "—")
-
-    def _primary_label(self, info):
-        # Ranuras que no tienen instalador automático desde este panel:
-        # los modelos se gestionan en la pestaña AI Engines.
-        if not info.get("is_updatable"):
-            return "No disponible"
-        # Si upstream sugiere build más reciente y está instalado,
-        # el botón principal pasa a ser "Update" en lugar de "Reinstall".
-        if (
-            info.get("status") == dependencies.STATUS_INSTALLED
-            and info.get("update_available") is True
-        ):
-            return "Actualizar"
-        if info.get("status") == dependencies.STATUS_INSTALLED:
-            return "Reinstalar"
-        if info.get("status") == dependencies.STATUS_MISSING:
-            return "Instalar"
-        if info.get("status") == dependencies.STATUS_ERROR:
-            return "Reintentar"
-        return "No disponible"
-
-    def _primary_enabled(self, info, support=None):
-        if not info.get("is_updatable"):
-            return False
-        # AI runtimes cannot be installed on Python versions without wheels.
-        if support is None:
-            support = self._ai_runtime_support_info(info)
-        if support and not support["supported"]:
-            return False
-        return True
-
-    def _ai_runtime_support_info(self, info):
-        """Return support info for AI runtime rows (torch/onnxruntime)."""
-        if info.get("kind") != dependencies.KIND_RUNTIME:
-            return None
-        dep_id = info.get("id") or ""
-        if dep_id in ("torch", "onnxruntime"):
-            return _get_python_support_info()
-        return None
-
-    def _open_path(self, path):
-        if not path:
-            return
-        try:
-            os.makedirs(path, exist_ok=True)
-        except Exception:
-            pass
-        try:
-            if platform.system() == "Windows":
-                os.startfile(path)  # noqa: S606
-            elif platform.system() == "Darwin":
-                subprocess.Popen(["open", path])
-            else:
-                subprocess.Popen(["xdg-open", path])
-        except Exception as exc:
-            QMessageBox.warning(self, "Open folder", f"No se pudo abrir la carpeta:\n{exc}")
 
 
 class DependenciesDialog(QDialog):
@@ -775,11 +461,70 @@ class DependenciesDialog(QDialog):
         for info in dependencies.list_all():
             if info.get("kind") == dependencies.KIND_MODEL:
                 continue
-            row = _DepRow(info, parent=self.container)
+            if info.get("id") == "ffmpeg":
+                self._annotate_build_options(info)
+            row = DepRow(info, parent=self.container)
             row.redownload_requested.connect(self._on_redownload_requested)
             row.uninstall_requested.connect(self._on_uninstall_requested)
             self.container_layout.insertWidget(self.container_layout.count() - 1, row)
             self._row_widgets.append(row)
+
+    def _hardware_info(self):
+        """Hardware de este equipo, según el módulo que lo detecta.
+
+        No se le pregunta al padre a propósito. Depender de la ventana que
+        abrió este diálogo convertía "no lo sé" en "no hay GPU" en cuanto el
+        diálogo no venía de esa ventana (el self-check de ``qt_check``, por
+        ejemplo), y el selector acababa pintando seis neutros que parecen una
+        elección cuando en realidad nadie había mirado el hardware. El dueño es
+        ``src.hardware.detector``; que devuelva ``None`` significa que no se
+        ha detectado nada todavía, y eso se ve como "sin comprobar".
+        """
+        from src.hardware.detector import get_known_hardware
+
+        return get_known_hardware()
+
+    def _annotate_build_options(self, info):
+        """Añade a la fila de FFmpeg las versiones y su veredicto de GPU.
+
+        La lista sale de ``src.ffmpeg.build_fit``: verde sólo si la GPU está
+        identificada en el mapa de códecs y el driver instalado supera el
+        mínimo que exige esa build; ámbar si no hay dato suficiente; rojo si el
+        driver no llega.
+
+        Lo que se guarda es el carrier de ``build_fit.evaluate_build_list``,
+        que lleva la plataforma **junto a** la lista. No es adorno: el
+        selector compone su texto a partir de ahí, y si la plataforma no
+        viajara en los datos tendría que averiguarla por su cuenta, con lo
+        que el texto podría nombrar la plataforma de la máquina en vez de la
+        de la lista que tiene delante.
+        """
+        try:
+            info["build_options"] = build_fit.evaluate_build_list(
+                self._hardware_info())
+        except Exception:
+            logger.exception("Could not evaluate the FFmpeg build list")
+            info["build_options"] = build_fit.failed_build_list()
+        return info
+
+    def _row_for(self, dep_id):
+        """La fila montada de esa dependencia, o ``None`` si no hay."""
+        for row in self._row_widgets:
+            if getattr(row, "dep_id", None) == dep_id:
+                return row
+        return None
+
+    def _build_id_for(self, dep_id):
+        """Build elegida en el desplegable de esa dependencia (o ``None``)."""
+        row = self._row_for(dep_id)
+        picker = getattr(row, "build_picker", None) if row else None
+        return picker.selected_build_id if picker else None
+
+    def _build_warning_for(self, dep_id):
+        """Aviso de incompatibilidad de la versión elegida (o ``None``)."""
+        row = self._row_for(dep_id)
+        picker = getattr(row, "build_picker", None) if row else None
+        return picker.incompatibility_warning() if picker else None
 
     def _schedule_upstream_check(self, delay_ms=1500, force=False):
         """(Re)programa un único check upstream.
@@ -807,7 +552,7 @@ class DependenciesDialog(QDialog):
         if self._upstream_worker and self._upstream_worker.isRunning():
             return
         self._upstream_worker = _UpstreamCheckWorker(
-            force=self._check_force_next, parent=self
+            force=self._check_force_next, parent=self,
         )
         self._upstream_worker.done.connect(self._on_check_finished)
         # finished = QThread terminado correctamente (cleanup)
@@ -822,26 +567,30 @@ class DependenciesDialog(QDialog):
         # Libera referencia una vez el QThread queda idle.
         self._upstream_worker = None
 
+    def repopulate(self):
+        """Repinta las filas con el estado actual, sin cerrar el diálogo.
+
+        Es el mismo ``_populate`` que usa el botón Refresh, expuesto para
+        que quien redetecta el hardware desde otra ventana repinte un panel
+        que ya está abierto. La nota del selector de builds manda al usuario
+        a 'Re-detect Hardware & Codecs'; si al terminar el panel siguiera
+        enseñando el fallo, el botón parecería no hacer nada y el usuario
+        tendría que cerrarlo y volverlo a abrir para enterarse.
+
+        A diferencia de ``_refresh`` no fuerza el HEAD contra el upstream:
+        aquí solo ha cambiado el hardware, y la caché de versiones no tiene
+        nada que ver con eso.
+        """
+        self._populate()
+
     def _refresh(self):
         # Refresh manual: repobla inmediatamente + fuerza un HEAD fresco.
         self._populate()
         self._schedule_upstream_check(delay_ms=0, force=True)
 
     def _open_logs(self):
-        log_dir = get_logs_dir()
-        try:
-            os.makedirs(log_dir, exist_ok=True)
-        except Exception:
-            pass
-        try:
-            if platform.system() == "Windows":
-                os.startfile(log_dir)  # noqa: S606
-            elif platform.system() == "Darwin":
-                subprocess.Popen(["open", log_dir])
-            else:
-                subprocess.Popen(["xdg-open", log_dir])
-        except Exception as exc:
-            QMessageBox.warning(self, "Open logs", f"No se pudo abrir la carpeta de logs:\n{exc}")
+        open_folder(get_logs_dir(), self, "Open logs",
+                     "No se pudo abrir la carpeta de logs")
 
     @staticmethod
     def _dep_display_name(dep_id):
@@ -860,11 +609,42 @@ class DependenciesDialog(QDialog):
             QMessageBox.information(self, "Ocupado", "Otra descarga está en curso. Espera a que termine.")
             return
         display = self._dep_display_name(dep_id)
+        # Si esta plataforma no tiene mirror para ninguna build de FFmpeg, no
+        # se puede descargar: decirlo aquí y no ofrecer la reinstalación es
+        # mejor que prometer una versión y dejar que falle al bajar. Es la
+        # misma política que deja el selector vacío, para que los tres no
+        # puedan discrepar.
+        #
+        # Sólo para FFmpeg. PyTorch y ONNX Runtime se reinstalan con su propio
+        # instalador (pip), no con los mirrors del catálogo, así que en una
+        # plataforma sin mirrors de FFmpeg ellos SÍ se pueden reinstalar y
+        # negárselo sería mentira por el motivo contrario.
+        sin_descarga = None
+        if dep_id == "ffmpeg":
+            sin_descarga = builds.nothing_to_offer_reason(
+                builds.current_platform())
+        if sin_descarga:
+            QMessageBox.warning(
+                self,
+                "Reinstalar dependencia",
+                f"No se puede reinstalar '{display}' en este sistema: "
+                f"{sin_descarga}.",
+            )
+            return
+        # Si la fila trae selector de versión, se dice exactamente cuál se va
+        # a descargar: sin sorpresas antes de borrar la instalación actual. El
+        # rótulo lo compone el catálogo desde lo que hay realmente guardado, así
+        # que si esa preferencia no es una build real, avisa aquí en vez de
+        # decir una versión que el usuario nunca eligió.
+        extra = f"\n\nSe descargará la versión: {builds.chosen_build_label()}."
+        warning = self._build_warning_for(dep_id)
+        if warning:
+            extra += f"\n\nAviso: {warning}"
         # Confirmación rápida
         confirm = QMessageBox.question(
             self,
             "Reinstalar dependencia",
-            f"¿Volver a descargar e instalar '{display}'?\n"
+            f"¿Volver a descargar e instalar '{display}'?{extra}\n"
             "La instalación actual será reemplazada.",
         )
         if confirm != QMessageBox.StandardButton.Yes:
@@ -904,8 +684,17 @@ class DependenciesDialog(QDialog):
         except Exception:
             pass
         display = self._dep_display_name(dep_id)
+        # Tras cambiar de build, la lista de códecs que probó el arranque
+        # corresponde al binario anterior: se recuerda cómo volver a probarla.
+        hint = ""
+        if dep_id == "ffmpeg":
+            hint = (
+                "\n\nLa lista de códecs se midió con la build anterior. "
+                "Pulsa 'Re-detect Hardware & Codecs' en la ventana de Hardware "
+                "Info para comprobarla con esta versión."
+            )
         QMessageBox.information(
-            self, "Listo", f"'{display}' se instaló correctamente."
+            self, "Listo", f"'{display}' se instaló correctamente.{hint}"
         )
         self._populate()
         # Tras reinstalar queremos comparar la nueva build contra el upstream
@@ -1614,21 +1403,8 @@ class DependenciesDialog(QDialog):
         engine = self._find_engine(engine_id)
         if not engine:
             return
-        path = get_engine_dir(engine_id)
-        try:
-            os.makedirs(path, exist_ok=True)
-        except Exception:
-            pass
-        try:
-            if platform.system() == "Windows":
-                os.startfile(path)  # noqa: S606
-            elif platform.system() == "Darwin":
-                subprocess.Popen(["open", path])
-            else:
-                subprocess.Popen(["xdg-open", path])
-        except Exception as exc:
-            QMessageBox.warning(self, "Open folder",
-                                f"Could not open the engine folder:\n{exc}")
+        open_folder(get_engine_dir(engine_id), self, "Open folder",
+                     "Could not open the engine folder")
 
     # -----------------------------------------------------------------
     # Remove engine (borrar modelos / FFmpeg full desde la app)
@@ -1661,7 +1437,7 @@ class DependenciesDialog(QDialog):
         affected = [engine_id]
         extra = ""
 
-        size = dependencies._safe_dir_size(target_dir)
+        size = fsops.safe_dir_size(target_dir)
         size_txt = f" (~{_fmt_bytes(size)})" if size else ""
 
         confirm = QMessageBox.question(

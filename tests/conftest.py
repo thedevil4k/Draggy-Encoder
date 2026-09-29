@@ -15,9 +15,18 @@ tests instead of protecting anything.
 """
 import os
 import shutil
+import sys
 
 # Must run before any PySide6 import.
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
+# Los datos de referencia de los tests (p. ej. ``tests/data/nvidia_matrix.py``,
+# la matriz de NVENC transcrita) son módulos sueltos, no código de la app: por eso
+# viven fuera de ``src/``. Se añaden al path aquí para que el contraste pueda
+# importarlos por nombre sin depender del modo de import de pytest.
+_DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
+if _DATA_DIR not in sys.path:
+    sys.path.insert(0, _DATA_DIR)
 
 import pytest
 

@@ -22,6 +22,7 @@ from src.config import (
     get_ffprobe_executable_name,
     get_logs_dir,
 )
+from src.ffmpeg.builds import build_mirrors, get_preferred_build_id
 
 
 # ---------------------------------------------------------------------------
@@ -375,7 +376,7 @@ def _find_executables(root_dir):
 # ---------------------------------------------------------------------------
 
 def download_ffmpeg(progress_callback=None, parent=None, abort_event=None,
-                    timeout=None):
+                    timeout=None, dest_dir=None):
     """Descarga FFmpeg para la plataforma actual.
 
     Estrategia:
@@ -395,6 +396,14 @@ def download_ffmpeg(progress_callback=None, parent=None, abort_event=None,
          ``FFMPEG_DOWNLOAD_URLS`` antes de rendirse. La cancelación del
          usuario y el vencimiento del timeout NO prueban el siguiente
          mirror: se propagan.
+
+    Qué versión se descarga lo decide la preferencia ``ffmpeg_build_id``
+    (``src.ffmpeg.builds``): es la build elegida en el panel, o la de siempre si
+    nunca se eligió ninguna.
+
+    ``dest_dir`` instala los binarios en ese directorio en vez de en
+    ``bin/ffmpeg/``. Lo usa la reinstalación, que descarga a un staging aparte
+    para no tocar la instalación que funciona hasta saber que la nueva sirve.
 
     ``abort_event`` (``threading.Event``) detiene la descarga y lanza
     ``RuntimeError("cancelled by user")``; ``timeout`` (segundos, default
@@ -420,29 +429,25 @@ def download_ffmpeg(progress_callback=None, parent=None, abort_event=None,
     if system not in FFMPEG_DOWNLOAD_URLS:
         raise RuntimeError("Plataforma no soportada: {}".format(system))
 
-    info = FFMPEG_DOWNLOAD_URLS[system]
-    candidates = [
-        (info["url"], info["archive_type"], "primary"),
-    ]
-    if info.get("backup_url"):
-        candidates.append(
-            (
-                info["backup_url"],
-                info.get("backup_archive_type", info["archive_type"]),
-                "backup",
-            )
+    candidates = build_mirrors(get_preferred_build_id(), system)
+    if not candidates:
+        raise RuntimeError(
+            "No hay mirror disponible para FFmpeg en {}.".format(system)
         )
 
-    bin_dir = get_ffmpeg_dir()
+    bin_dir = dest_dir or get_ffmpeg_dir()
     os.makedirs(bin_dir, exist_ok=True)
 
     last_error = None
     dest_ffmpeg = None
 
     with tempfile.TemporaryDirectory() as tmpdir:
-        for idx, (url, archive_type, label) in enumerate(candidates):
+        for idx, (url, archive_type) in enumerate(candidates):
             _deadline_check(abort_event, deadline)
-            _emit(progress_callback, 0, "Connecting to upstream ({} mirror)...".format(label))
+            mirror = "mirror {}/{}".format(idx + 1, len(candidates))
+            _emit(progress_callback, 0,
+                  "Connecting to upstream ({})...".format(mirror))
+
             archive_path = os.path.join(tmpdir, "ffmpeg_download.{}.{}".format(idx, archive_type))
             try:
                 # Probe de capacidad (HEAD). En el caso típico (BtbN /
@@ -558,7 +563,7 @@ def download_ffmpeg(progress_callback=None, parent=None, abort_event=None,
                 _emit(
                     progress_callback,
                     0,
-                    "Download failed ({} mirror): {}; trying next mirror...".format(label, exc),
+                    "Download failed ({}): {}; trying next mirror...".format(mirror, exc),
                 )
                 continue
 

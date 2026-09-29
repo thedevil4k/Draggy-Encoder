@@ -254,3 +254,69 @@ def test_panel_preview_is_debounced_and_cancellable(qapp):
     panel._preview_timer.timeout.emit()
     assert len(requests) == 2
     panel.deleteLater()
+
+
+def test_la_vista_previa_lee_el_loudness_por_la_declaracion(qapp, monkeypatch,
+                                                           tmp_path):
+    """El preview y el render tienen que leer la misma clave del loudness.
+
+    El render la saca de ``LOUDNORM_MEDIDAS`` a traves de
+    ``LOUDNORM_CLAVE_LOUDNESS``. Si el preview la leyera a mano, bastaria un
+    renombrado en la tabla para que el preview soltase la ganancia y el
+    compresor sin decir nada: se oiria una cosa y el render haria otra, que es
+    justo lo que un preview no puede hacer. Aqui se cambia la clave que declara
+    el modulo y el preview tiene que seguir a la nueva.
+    """
+    import shutil
+    import threading
+
+    import src.ui.audio_preview as preview
+    from src.ffmpeg import audio_fx
+    from src.ffmpeg.runner import (
+        LOUDNORM_CLAVES_OBLIGATORIAS,
+        LOUDNORM_CLAVE_LOUDNESS,
+    )
+
+    otras_claves = [c for c in LOUDNORM_CLAVES_OBLIGATORIAS
+                    if c != LOUDNORM_CLAVE_LOUDNESS]
+    assert len(otras_claves) >= 2, (
+        "hacen falta al menos dos claves mas: con una sola, un hardcode de esa "
+        "misma clave pasaria el test sin querer")
+
+    medicion = {"input_i": "-26.75", "input_tp": "-40.00", "input_lra": "8.70",
+                "input_thresh": "-36.77", "target_offset": "-0.03"}
+    assert len(set(medicion[c] for c in LOUDNORM_CLAVES_OBLIGATORIAS)) == \
+        len(LOUDNORM_CLAVES_OBLIGATORIAS), "las claves necesitan valores distintos"
+
+    engine = preview.AudioPreviewEngine()
+    try:
+        engine._cleanup_clip = lambda: None
+        monkeypatch.setattr(engine, "_pick_offset", lambda *a, **k: 0.0)
+        monkeypatch.setattr(engine, "_render_clip", lambda *a, **k: True)
+        monkeypatch.setattr(preview, "measure_loudness",
+                            lambda *a, **k: medicion)
+
+        for declarada in otras_claves:
+            # El modulo declara la clave; aqui se le da otra a proposito.
+            monkeypatch.setattr(preview, "LOUDNORM_CLAVE_LOUDNESS", declarada)
+            vistos = []
+
+            def build(cfg, measured_i=None, target_lufs=None):
+                vistos.append(measured_i)
+                return ["anull"]
+
+            monkeypatch.setattr(preview.audio_fx, "build_effects_chain", build)
+
+            cancel = threading.Event()
+            engine._generate_and_play(cancel, "ffmpeg", "clip.mkv",
+                                      audio_fx.default_effects(), None, 0,
+                                      1.0, None)
+            assert len(vistos) == 1, "el preview no llego a construir la cadena"
+            assert vistos[0] == float(medicion[declarada]), (
+                "con la clave declarada %r el preview leyo %r: esta leyendo "
+                "una clave fija, no la declaracion"
+                % (declarada, vistos[0]))
+            assert vistos[0] != float(medicion[LOUDNORM_CLAVE_LOUDNESS])
+    finally:
+        engine.stop()
+        shutil.rmtree(engine._clip_dir, ignore_errors=True)

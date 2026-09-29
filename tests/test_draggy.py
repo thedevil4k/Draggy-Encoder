@@ -6454,6 +6454,548 @@ def test_settings_panel_exposes_selected_audio_track(qapp):
     assert "Español" in settings["audio_stream_label"]
 
 
+# ==----------------------------------------------------------------------
+# Boost con TODAS las pistas: cada pista con su medicion
+# ==----------------------------------------------------------------------
+
+def test_el_filtro_y_el_validador_salen_de_la_misma_tabla():
+    """Anadir un valor al boost no puede tocar dos sitios.
+
+    La tabla ``LOUDNORM_MEDIDAS`` es lo unico que sabe que clave de la medicion
+    se escribe en que parametro del filtro y en que rango la acepta ffmpeg. El
+    filtro y el validador la miran a los dos, asi que no pueden separarse: este
+    test se genera desde la tabla, de modo que una fila nueva queda cubierta
+    sin tocar el test.
+    """
+    from src.ffmpeg.runner import (
+        LOUDNORM_CLAVES_OBLIGATORIAS,
+        LOUDNORM_MEDIDAS,
+        _build_loudnorm_filter,
+        measurement_is_usable,
+    )
+
+    # Las obligatorias se derivan de la tabla (las que no tienen defecto), no
+    # de una lista escrita a mano que se pueda quedar corta.
+    assert set(LOUDNORM_CLAVES_OBLIGATORIAS) == {
+        clave for clave, fila in LOUDNORM_MEDIDAS.items() if fila[2] is None}
+    assert LOUDNORM_CLAVES_OBLIGATORIAS, "el boost de dos pasadas no puede "
+    # quedarse sin claves obligatorias"
+
+    dentro = {}
+    for clave, (parametro, (bajo, alto), defecto) in LOUDNORM_MEDIDAS.items():
+        dentro[clave] = 0.0 if defecto is not None else bajo
+
+    # 1) El escritor escribe cada parametro de la tabla, con ese nombre.
+    filtro = _build_loudnorm_filter(dentro)
+    for clave, (parametro, _rango, _defecto) in LOUDNORM_MEDIDAS.items():
+        assert "%s=" % parametro in filtro, (
+            "el filtro no escribe %s (clave %s): %s" % (parametro, clave, filtro))
+    assert "linear=true" in filtro
+
+    # 2) El validador acepta lo que el escritor sabe escribir...
+    assert measurement_is_usable(dentro) is True
+    # ...y rechaza, para cada clave, lo que ffmpeg rechazaria.
+    for clave, (parametro, (bajo, alto), _defecto) in LOUDNORM_MEDIDAS.items():
+        for valor, debe_pasar in ((alto, True), (bajo, True),
+                                  (alto + 1.0, False), (bajo - 1.0, False),
+                                  (float("inf"), False), (float("-inf"), False),
+                                  (float("nan"), False)):
+            medicion = dict(dentro)
+            medicion[clave] = valor
+            assert measurement_is_usable(medicion) is debe_pasar, (
+                "%s=%s deberia %s ser utilizable"
+                % (parametro, valor, "" if debe_pasar else "no"))
+
+    # 3) Una clave obligatoria que no viene no se inventa: se cae al
+    #    loudnorm de una pasada.
+    for clave in LOUDNORM_CLAVES_OBLIGATORIAS:
+        medicion = dict(dentro)
+        medicion.pop(clave)
+        assert _build_loudnorm_filter(medicion) == "loudnorm=I=-16:TP=-1.5:LRA=11"
+
+    # 4) La clave del loudness tambien sale de la tabla. No va al filtro: la
+    #    consume la cadena de efectos para su ganancia, y por eso estaba
+    #    escrita a mano y se perdia en silencio. Ahora cambiar el valor de ESA
+    #    clave cambia la ganancia, que es la prueba de que se lee de aqui.
+    from src.ffmpeg import audio_fx
+    from src.ffmpeg.runner import LOUDNORM_CLAVE_LOUDNESS, build_boost_filter
+
+    assert LOUDNORM_CLAVE_LOUDNESS in LOUDNORM_MEDIDAS
+    cfg = audio_fx.default_effects()
+    cfg["enabled"] = True
+    cfg["compressor"]["enabled"] = True
+    con_una = build_boost_filter(
+        {"audio_fx": cfg}, dict(dentro, **{LOUDNORM_CLAVE_LOUDNESS: -26.75}))
+    con_otra = build_boost_filter(
+        {"audio_fx": cfg}, dict(dentro, **{LOUDNORM_CLAVE_LOUDNESS: -55.55}))
+    assert "volume=" in con_una and "volume=" in con_otra
+    assert con_una != con_otra, (
+        "la cadena de efectos no lee la clave del loudness de la tabla")
+
+
+MEDIDA = {
+    "input_i": "-25.40", "input_tp": "-9.30", "input_lra": "8.70",
+    "input_thresh": "-35.40", "target_offset": "0.0000",
+}
+
+
+def test_los_rangos_de_la_tabla_son_los_que_acepta_ffmpeg(tmp_path):
+    """La tabla no dice lo que le parece: lo comprueba con el binario.
+
+    Un rango equivocado en la tabla significa dos Landing Page distintas: el
+    validador da por buena una medicion que ffmpeg va a rechazar, y el render
+    entero se cae. Asi que por cada clave se mete un valor justo dentro del
+    rango y otro justo fuera, y los dos tienen que coincidir con el veredicto
+    de ffmpeg. Se genera desde la tabla, asi que una fila nueva se comprueba
+    sola.
+    """
+    ffmpeg_path = _local_ffmpeg()
+    if not ffmpeg_path:
+        pytest.skip("sin ffmpeg local")
+
+    from src.ffmpeg.loudnorm import measure_loudness
+    from src.ffmpeg.runner import (
+        LOUDNORM_MEDIDAS,
+        _build_loudnorm_filter,
+        measurement_is_usable,
+    )
+
+    tono = tmp_path / "tono.mkv"
+    subprocess.run([ffmpeg_path, "-y", "-hide_banner", "-loglevel", "error",
+                    "-f", "lavfi", "-i", "sine=frequency=440:duration=1",
+                    "-c:a", "aac", str(tono)], capture_output=True, timeout=120)
+    base = measure_loudness(ffmpeg_path, str(tono), timeout_seconds=120)
+    assert isinstance(base, dict), base
+
+    def ffmpeg_acepta(medicion):
+        salida = tmp_path / "prueba.mkv"
+        r = subprocess.run(
+            [ffmpeg_path, "-y", "-hide_banner", "-loglevel", "error",
+             "-i", str(tono), "-af", _build_loudnorm_filter(medicion),
+             "-c:a", "aac", str(salida)], capture_output=True, timeout=120)
+        return r.returncode == 0
+
+    for clave, (parametro, (bajo, alto), defecto) in LOUDNORM_MEDIDAS.items():
+        for valor, debe_pasar in ((alto, True), (bajo, True),
+                                  (alto + 1.0, False), (bajo - 1.0, False)):
+            medicion = dict(base)
+            medicion[clave] = valor
+            assert measurement_is_usable(medicion) is debe_pasar, (
+                "el validador y la tabla no coinciden en %s=%s"
+                % (parametro, valor))
+            assert ffmpeg_acepta(medicion) is debe_pasar, (
+                "ffmpeg y la tabla no coinciden en %s=%s (rango %r)"
+                % (parametro, valor, (bajo, alto)))
+
+
+def _medida(loudness):
+    m = dict(MEDIDA)
+    m["input_i"] = loudness
+    return m
+
+
+def test_cada_pista_lleva_su_propia_medicion_en_el_filtro():
+    """Conservar todas + boost = un loudnorm por pista, no uno para todas.
+
+    Este era el agujero: se media la pista 0, se horneaba esa medicion en un
+    unico ``-af`` y ese filtro lo recibian todas. En un mkv de dos pistas
+    separadas 30 dB la segunda salia en -44.85 LUFS en vez de -16, sin error
+    ni aviso.
+    """
+    from src.ffmpeg.runner import build_args
+
+    args = build_args("/in.mkv", "/out.mkv", {
+        "codec": "libx264", "bitrate": 1500, "audio": "copy",
+        "audio_boost": True, "audio_stream_index": -1, "format": "mkv",
+    }, loudnorm_meas=[_medida("-26.75"), _medida("-55.55")])
+
+    cadena = args[args.index("-filter_complex") + 1]
+    assert "[0:a:0]loudnorm=" in cadena, cadena
+    assert "[0:a:1]loudnorm=" in cadena, cadena
+    # Cada cadena lleva SU medicion: la de -26.75 y la de -55.55.
+    assert "measured_I=-26.7500" in cadena
+    assert "measured_I=-55.5500" in cadena
+    assert cadena.count("linear=true") == 2, "los dos son dos pasadas"
+    # Una salida por pista, y el video sigue en su sitio.
+    assert [args[i + 1] for i, a in enumerate(args) if a == "-map"] == [
+        "0:v:0", "[a0]", "[a1]"]
+    assert "-af" not in args, "el -af de una sola medicion no debe estar"
+    assert args[args.index("-c:a") + 1] == "aac"
+    assert args[-1] == "/out.mkv"
+
+
+def test_una_sola_pista_no_cambia_nada_de_lo_que_hacia_ayer():
+    """Byte a byte: con una medicion, el comando es el de siempre.
+
+    El cambio solo puede notarse cuando hay varias pistas. Si este test se
+    rompe, se ha tocado el caso de un video normal, que es el 99% de los
+    renders.
+    """
+    from src.ffmpeg.runner import build_args
+
+    assert build_args("/in.mkv", "/out.mkv", {
+        "codec": "libx264", "bitrate": 1500, "audio": "copy",
+        "audio_boost": True, "audio_stream_index": 0, "format": "mp4",
+    }, loudnorm_meas=MEDIDA) == [
+        "-y", "-i", "/in.mkv", "-c:v", "libx264", "-pix_fmt", "yuv420p",
+        "-b:v", "1500k", "-map", "0:v:0", "-map", "0:a:0?",
+        "-c:a", "aac", "-b:a", "192k",
+        "-af",
+        "loudnorm=I=-16:TP=-1.5:LRA=11:measured_I=-25.4000:measured_TP=-9.3000"
+        ":measured_LRA=8.7000:measured_thresh=-35.4000:offset=0.0000:linear=true",
+        "/out.mkv",
+    ]
+
+
+def test_una_pista_sin_medicion_no_arrastra_a_las_demas(monkeypatch):
+    """Una pista no medible se degrada ella sola, no el archivo entero.
+
+    Antes de este arreglo, una pista que no se podia medir (por ejemplo en
+    silencio digital, que mide ``-inf``) hacia que ``measure_loudness_all_tracks``
+    devolviera ``None`` para todo el archivo, y el boost caia al single-pass
+    para todas. Ahora la lista lleva un ``None`` solo en esa pista: la buena
+    conserva su medicion de dos pasadas y la muda se queda con el
+    loudnorm de una pasada, que si la aguanta. Si no se puede medir NINGUNA,
+    ahi si vuelve a ser ``None`` y manda el ``-af`` de siempre.
+    """
+    import src.ffmpeg.loudnorm as ln
+    from src.ffmpeg.runner import build_args
+
+    llamadas = []
+
+    def falsa(ffmpeg_path, input_path, **kwargs):
+        indice = kwargs.get("audio_stream_index")
+        llamadas.append(indice)
+        return None if indice == 1 else _medida("-26.75")
+
+    monkeypatch.setattr(ln, "measure_loudness", falsa)
+    mediciones = ln.measure_loudness_all_tracks("f", "v", track_count=2)
+    assert llamadas == [0, 1], "se midieron las dos antes de rendirse"
+    assert isinstance(mediciones, list) and len(mediciones) == 2
+    assert mediciones[1] is None, "la pista sin medir se marca, no se inventa"
+    assert ln.measurement_is_usable(mediciones[0])
+
+    args = build_args("/in.mkv", "/out.mkv", {
+        "codec": "libx264", "bitrate": 1500, "audio": "copy",
+        "audio_boost": True, "audio_stream_index": -1, "format": "mkv",
+    }, loudnorm_meas=mediciones)
+    cadena = args[args.index("-filter_complex") + 1]
+    # La buena con dos pasadas; la muda con el loudnorm de una pasada, que
+    # es el unico que acepta una pista en silencio.
+    assert "measured_I=-26.7500" in cadena
+    assert "[0:a:1]loudnorm=I=-16:TP=-1.5:LRA=11[a1]" in cadena, cadena
+
+    # Si NINGUNA pista se puede medir, no hay nada por pista que hacer.
+    monkeypatch.setattr(ln, "measure_loudness", lambda *a, **k: None)
+    assert ln.measure_loudness_all_tracks("f", "v", track_count=2) is None
+
+    # Sin pistas de audio no hay nada que medir por pista.
+    assert ln.measure_loudness_all_tracks("f", "v", track_count=0) is None
+
+    args = build_args("/in.mkv", "/out.mkv", {
+        "codec": "libx264", "bitrate": 1500, "audio": "copy",
+        "audio_boost": True, "audio_stream_index": -1, "format": "mkv",
+    }, loudnorm_meas=None)
+    assert "-filter_complex" not in args
+    assert args[args.index("-af") + 1] == "loudnorm=I=-16:TP=-1.5:LRA=11"
+
+
+def test_medir_por_pista_solo_cuando_se_conservan_todas(monkeypatch):
+    """La decision de medir N pistas y la de aplicar N filtros, la misma."""
+    import src.processing.pipeline as pl
+
+    settings = {"audio_boost": True, "audio": "copy", "format": "mp4"}
+    vistos = []
+
+    def todas(*args, **kwargs):
+        vistos.append(("todas", kwargs.get("track_count")))
+        return [_medida("-26.75"), _medida("-55.55")]
+
+    def una(*args, **kwargs):
+        vistos.append(("una", kwargs.get("audio_stream_index")))
+        return _medida("-26.75")
+
+    monkeypatch.setattr(pl, "measure_loudness_all_tracks", todas)
+    monkeypatch.setattr(pl, "measure_loudness", una)
+    monkeypatch.setattr(pl, "_get_duration_seconds", lambda *a, **k: 30.0)
+
+    assert pl._measure_if_needed("f", "v", dict(settings, audio_stream_index=-1))
+    assert vistos.pop() == ("todas", None), "con keep-all se mide cada pista"
+
+    assert pl._measure_if_needed("f", "v", dict(settings, audio_stream_index=1))
+    assert vistos.pop() == ("una", 1), "con una pista se mide solo esa"
+
+    # El preview no ve mas de una pista: medir N ahi es trabajo tirado.
+    assert pl._measure_if_needed("f", "v", dict(settings, audio_stream_index=-1),
+                                 per_track=False)
+    assert vistos.pop() == ("una", -1)
+
+
+def test_el_boost_real_normaliza_cada_pista(tmp_path):
+    """Con ffmpeg de verdad: las dos pistas del mkv terminan en -16 LUFS."""
+    ffmpeg_path = _local_ffmpeg()
+    if not ffmpeg_path:
+        pytest.skip("sin ffmpeg local")
+
+    import src.processing.pipeline as pl
+    from src.ffmpeg.loudnorm import measure_loudness
+    from src.ffmpeg.runner import build_args
+
+    # Dos pistas a 30 dB de diferencia: si el boost se aplica a cada una, las
+    # dos llegan al objetivo; si se aplica la de la primera, la segunda se
+    # queda donde estaba.
+    entrada = tmp_path / "dos-pistas.mkv"
+    subprocess.run([
+        ffmpeg_path, "-y", "-hide_banner", "-loglevel", "error",
+        "-f", "lavfi", "-i", "testsrc2=size=320x240:rate=10:duration=3",
+        "-f", "lavfi", "-i", "sine=frequency=440:duration=3",
+        "-f", "lavfi", "-i", "sine=frequency=1200:duration=3",
+        "-filter_complex", "[1:a]volume=-5dB[a0];[2:a]volume=-35dB[a1]",
+        "-map", "0:v", "-map", "[a0]", "-map", "[a1]",
+        "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac",
+        str(entrada),
+    ], capture_output=True, timeout=180)
+    assert entrada.exists()
+
+    settings = {"codec": "libx264", "bitrate": 1500, "audio": "copy",
+                "audio_boost": True, "audio_stream_index": -1, "format": "mkv"}
+    medicion = pl._measure_if_needed(ffmpeg_path, str(entrada), settings)
+    assert isinstance(medicion, list) and len(medicion) == 2, medicion
+    # La medicion de la segunda pista es la suya, no la de la primera.
+    assert float(medicion[1]["input_i"]) < float(medicion[0]["input_i"]) - 10
+
+    salida = tmp_path / "salida.mkv"
+    subprocess.run(
+        [ffmpeg_path] + build_args(str(entrada), str(salida), settings,
+                                   loudnorm_meas=medicion),
+        capture_output=True, timeout=300)
+    assert salida.exists(), "ffmpeg no produjo salida"
+
+    niveles = []
+    for indice in (0, 1):
+        medido = measure_loudness(ffmpeg_path, str(salida),
+                                  audio_stream_index=indice)
+        assert isinstance(medido, dict), "la pista %d no se pudo medir" % indice
+        niveles.append(float(medido["input_i"]))
+    assert all(abs(n + 16.0) <= 1.0 for n in niveles), (
+        "las dos pistas deberian quedar en -16 LUFS: %r" % (niveles,))
+
+
+def test_el_boost_real_normaliza_cada_pista_en_la_ruta_ia(tmp_path):
+    """La ruta IA tambien: el temporal lleva las dos pistas ya normalizadas.
+
+    Aqui el audio se codifica aparte a un .mka y luego se copia al contenedor
+    final, asi que un -af por pista tiene que hornearse ahi. Si se dejase el
+    -af de una sola medicion, la segunda pista perdiere la normalizacion igual
+    que en la ruta estandar.
+    """
+    ffmpeg_path = _local_ffmpeg()
+    if not ffmpeg_path:
+        pytest.skip("sin ffmpeg local")
+
+    import src.processing.pipeline as pl
+    from src.ffmpeg.loudnorm import measure_loudness
+
+    entrada = tmp_path / "dos-pistas.mkv"
+    subprocess.run([
+        ffmpeg_path, "-y", "-hide_banner", "-loglevel", "error",
+        "-f", "lavfi", "-i", "testsrc2=size=320x240:rate=10:duration=3",
+        "-f", "lavfi", "-i", "sine=frequency=440:duration=3",
+        "-f", "lavfi", "-i", "sine=frequency=1200:duration=3",
+        "-filter_complex", "[1:a]volume=-5dB[a0];[2:a]volume=-35dB[a1]",
+        "-map", "0:v", "-map", "[a0]", "-map", "[a1]",
+        "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac",
+        str(entrada),
+    ], capture_output=True, timeout=180)
+    assert entrada.exists()
+
+    # El "video escalado" de la ruta IA: mismo contenido, otro contenedor.
+    escalado = tmp_path / "escalado.mkv"
+    subprocess.run([ffmpeg_path, "-y", "-hide_banner", "-loglevel", "error",
+                    "-i", str(entrada), "-c:v", "copy", "-c:a", "copy",
+                    str(escalado)], capture_output=True, timeout=180)
+    assert escalado.exists()
+
+    settings = {"codec": "libx264", "bitrate": 1500, "audio": "copy",
+                "audio_boost": True, "audio_stream_index": -1, "format": "mp4"}
+    audio_file = pl._encode_audio_parallel(ffmpeg_path, str(entrada),
+                                           settings=settings)
+    assert audio_file, "la ruta IA tiene que codificar el audio"
+    assert audio_file.endswith(".mka"), (
+        "con varias pistas el temporal es multi-pista: %s" % audio_file)
+    try:
+        ok = pl._mux_audio(ffmpeg_path, str(entrada), str(escalado),
+                           audio_codec="copy", audio_boost=True,
+                           container_format="mp4", audio_file=audio_file,
+                           audio_stream_index=-1, settings=settings)
+        assert ok, "el mux del audio no llego a hacerse"
+        niveles = []
+        for indice in (0, 1):
+            medido = measure_loudness(ffmpeg_path, str(escalado),
+                                      audio_stream_index=indice)
+            assert isinstance(medido, dict), "la pista %d no salio" % indice
+            niveles.append(float(medido["input_i"]))
+        assert all(abs(n + 16.0) <= 1.0 for n in niveles), (
+            "las dos pistas deberian quedar en -16 LUFS: %r" % (niveles,))
+    finally:
+        if audio_file and os.path.exists(audio_file):
+            os.remove(audio_file)
+
+
+def _mkv_de_pistas(ffmpeg_path, ruta, volumes, etiquetas=()):
+    """Mkv con una pista de audio por volumen, opcionalmente etiquetadas.
+
+    Un volumen de -120 dB es silencio digital: es la pista que antes tumbaba
+    el render entero.
+    """
+    cmd = [ffmpeg_path, "-y", "-hide_banner", "-loglevel", "error",
+           "-f", "lavfi", "-i", "testsrc2=size=320x240:rate=10:duration=2"]
+    for n in range(len(volumes)):
+        cmd += ["-f", "lavfi", "-i",
+                "sine=frequency=%d:duration=2" % (440 + n * 400)]
+    grafo = ";".join("[%d:a]volume=%ddB[a%d]" % (n + 1, v, n)
+                     for n, v in enumerate(volumes))
+    cmd += ["-filter_complex", grafo, "-map", "0:v"]
+    for n in range(len(volumes)):
+        cmd += ["-map", "[a%d]" % n]
+    cmd += ["-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac"]
+    for n, (lenguaje, titulo) in enumerate(etiquetas):
+        cmd += ["-metadata:s:a:%d" % n, "language=%s" % lenguaje,
+                "-metadata:s:a:%d" % n, "title=%s" % titulo]
+    cmd += [str(ruta)]
+    subprocess.run(cmd, capture_output=True, timeout=180)
+    assert ruta.exists()
+    return ruta
+
+
+def _etiquetas_de_audio(ffmpeg_path, ruta):
+    import json
+
+    from src.ffmpeg.runner import get_ffprobe_path
+
+    p = subprocess.run([get_ffprobe_path(), "-v", "error",
+                        "-select_streams", "a", "-show_entries",
+                        "stream=index:stream_tags=language,title",
+                        "-of", "json", str(ruta)], capture_output=True, text=True,
+                       encoding="utf-8", errors="replace")
+    return [(s.get("tags") or {}).get("language", "")
+            for s in json.loads(p.stdout or "{}").get("streams", [])]
+
+
+def _ajustes_de_boost(**extra):
+    ajustes = {"codec": "libx264", "bitrate": 1500, "mode": "Standard",
+               "resolution": "original", "audio": "copy", "audio_boost": True,
+               "audio_stream_index": -1, "format": "mkv"}
+    ajustes.update(extra)
+    return ajustes
+
+
+def test_una_pista_muda_no_tumba_el_render_ni_deja_sin_normalizar_a_las_otras(
+        tmp_path):
+    """Una pista muda se salta; la otra sigue saliendo normalizada.
+
+    Una pista en silencio digital mide ``-inf``, y ese valor horneado en
+    ``measured_I`` hace que ffmpeg rechace el comando entero: antes el render
+    terminaba sin escribir nada, y el usuario se perdia tambien las pistas
+    buenas. Aqui la muda se queda con el loudnorm de una pasada (que si la
+    aguanta) y la otra conserva su medicion de dos pasadas.
+    """
+    ffmpeg_path = _local_ffmpeg()
+    if not ffmpeg_path:
+        pytest.skip("sin ffmpeg local")
+
+    import src.processing.pipeline as pl
+    from src.ffmpeg.loudnorm import measure_loudness
+    from src.ffmpeg.runner import measurement_is_usable
+
+    entrada = _mkv_de_pistas(ffmpeg_path, tmp_path / "con-muda.mkv", [-5, -120])
+    medicion = pl._measure_if_needed(ffmpeg_path, str(entrada),
+                                    _ajustes_de_boost())
+    assert isinstance(medicion, list) and len(medicion) == 2, medicion
+    # La pista buena se mide; la muda se marca como no medible, no se inventa.
+    assert measurement_is_usable(medicion[0])
+    assert not measurement_is_usable(medicion[1]), (
+        "una medicion -inf no puede entrar en un filtro loudnorm: %r"
+        % (medicion[1],))
+
+    salida = tmp_path / "salida.mkv"
+    ok = pl.compress_video(ffmpeg_path, str(entrada), str(salida),
+                           _ajustes_de_boost())
+    assert ok, "una pista muda no puede costar el render entero"
+    assert salida.exists(), "no se escribio ninguna salida"
+
+    buena = measure_loudness(ffmpeg_path, str(salida), audio_stream_index=0)
+    assert isinstance(buena, dict)
+    assert abs(float(buena["input_i"]) + 16.0) <= 1.0, (
+        "la pista buena sigue normalizandose: %r" % buena["input_i"])
+
+
+def test_las_pistas_conservadas_conservan_su_idioma_y_su_titulo(tmp_path):
+    """Guardar pistas para elegirlas no sirve si ya no se distinguen.
+
+    Un stream filtrado no hereda los metadatos del stream de entrada, asi que
+    sin el mapeo explicito las dos pistas salen sin idioma ni titulo: dos
+    "Track 1" iguales en el reproductor, con el render "correcto".
+    """
+    ffmpeg_path = _local_ffmpeg()
+    if not ffmpeg_path:
+        pytest.skip("sin ffmpeg local")
+
+    import src.processing.pipeline as pl
+
+    import json
+
+    entrada = _mkv_de_pistas(ffmpeg_path, tmp_path / "etiquetado.mkv", [-5, -35],
+                             etiquetas=(("eng", "Original"),
+                                        ("spa", "Comentario")))
+    assert _etiquetas_de_audio(ffmpeg_path, entrada) == ["eng", "spa"]
+
+    salida = tmp_path / "salida.mkv"
+    ok = pl.compress_video(ffmpeg_path, str(entrada), str(salida),
+                           _ajustes_de_boost())
+    assert ok and salida.exists()
+    assert _etiquetas_de_audio(ffmpeg_path, salida) == ["eng", "spa"], (
+        "las pistas conservadas tienen que seguir siendo identificables")
+
+    # Y el titulo tambien, no solo el idioma.
+    from src.ffmpeg.runner import get_ffprobe_path
+
+    p = subprocess.run([get_ffprobe_path(), "-v", "error",
+                        "-select_streams", "a", "-show_entries",
+                        "stream=index:stream_tags=title", "-of", "json",
+                        str(salida)], capture_output=True, text=True,
+                       encoding="utf-8", errors="replace")
+    titulos = [(s.get("tags") or {}).get("title", "")
+               for s in json.loads(p.stdout or "{}").get("streams", [])]
+    assert titulos == ["Original", "Comentario"], titulos
+
+
+def test_el_mapeo_de_metadatos_usa_el_mismo_indice_que_el_filtro():
+    """Cada ``-map_metadata`` empareja la pista i de salida con la i de entrada.
+
+    Los tres sitios que pintan el grafo de filtros usan entradas distintas
+    (la ruta estandar codifica el audio en la 0, el mux lo toma de la 1), asi
+    que el indice de la entrada no puede estar escrito a mano.
+    """
+    from src.ffmpeg.runner import build_per_stream_boost_args
+
+    args = build_per_stream_boost_args({}, [_medida("-26.75"), _medida("-55.55")],
+                                      audio_input="0")
+    assert args[args.index("-map_metadata:s:a:0") + 1] == "0:s:a:0"
+    assert args[args.index("-map_metadata:s:a:1") + 1] == "0:s:a:1"
+
+    args_mux = build_per_stream_boost_args(
+        {}, [_medida("-26.75"), _medida("-55.55")], audio_input="1")
+    assert args_mux[args_mux.index("-map_metadata:s:a:0") + 1] == "1:s:a:0"
+    assert args_mux[args_mux.index("-map_metadata:s:a:1") + 1] == "1:s:a:1"
+
+    # El mapeo de cada pista va DESPUES de su propio -map, y hay uno por pista.
+    # (El -map del video lo pone build_args, que es quien lo pone siempre.)
+    mapeos = [a for a in args if a.startswith("-map_metadata:s:a:")]
+    assert len(mapeos) == 2, mapeos
+    assert args.count("-map") == 2, "una salida por pista de audio"
+
+
 def test_ai_rendered_bitrate_is_hidden_without_active_ai_and_shown_when_active():
     """A default model selection must not imply an active AI pipeline."""
     from types import SimpleNamespace
@@ -6677,3 +7219,592 @@ def test_coerce_output_switches_container_for_mp4_incompatible_codecs():
 if __name__ == "__main__":
     import pytest as _pytest
     sys.exit(_pytest.main([__file__, "-v"]))
+
+
+def test_the_gui_thread_never_waits_for_the_disk_to_persist_a_phase(tmp_path,
+                                                                  monkeypatch):
+    """Anotar una fase no toca el disco; el escritor es quien va al fsync.
+
+    Antes, ``_on_phase_event`` llamaba a ``task_history.update_phase`` desde el
+    hilo de la GUI, y eso releia el historial entero y lo reescribia entero con
+    ``fsync``: una vez por fase y por fotograma, con el disco ya ocupado por el
+    render. Medido, eran 19 escrituras por segundo y el bucle de eventos se
+    retrasaba justo en proporción a la latencia del disco.
+
+    Aquí se comprueba lo que de verdad importa: la anotación no llama a
+    ``_save_raw`` ni una vez, y ``flush`` es lo que garantiza el disco.
+    """
+    import src.task_history as th
+    from src.task_persist import _PhaseWriter
+
+    monkeypatch.setattr(th, "_path", lambda: str(tmp_path / "tasks.json"))
+    th.start_task("t1", "a.mp4")
+
+    saves = []
+    real_save = th._save_raw
+    monkeypatch.setattr(th, "_save_raw", lambda tasks: saves.append(1) or real_save(tasks))
+
+    writer = _PhaseWriter()
+    # 200 eventos de progreso: lo que son 40 fotogramas de IA con dos motores.
+    for pct in range(200):
+        writer.note_phase_event("t1", {"id": "engine-a", "ev": "progress", "pct": pct})
+    assert saves == [], "anotar una fase no puede escribir a disco"
+
+    assert writer.flush(timeout=10) is True
+    # 200 eventos de progreso de la MISMA fase son una escritura: lo que se
+    # guarda es el ultimo, no los 200.
+    assert len(saves) == 1, "las 200 anotaciones debian fundirse en una escritura"
+    task = [t for t in th._load_raw() if t["task_id"] == "t1"][0]
+    phases = task["phases"]
+    assert len(phases) == 1
+    assert phases[0]["phase_id"] == "engine-a"
+    assert phases[0]["pct"] == 199, "lo que se guarda es el ultimo, no la lista"
+
+
+def test_the_phase_order_and_the_queue_transitions_survive_the_writer(tmp_path,
+                                                                    monkeypatch):
+    """El escritor aplana el progreso, pero no el orden ni las transiciones.
+
+    Son las dos cosas de las que depende el resto: el orden en que se pintan las
+    fases de una tarea, y la cadena de estados de la cola. ``task_queue``
+    valida las transiciones, asi que saltarse "muxing" dejaria un "publishing"
+    invalido y el item atascado. Los repetidos se tiran; los distintos no.
+    """
+    import src.task_history as th
+    import src.task_queue as tq
+    from src.task_persist import _PhaseWriter
+
+    monkeypatch.setattr(th, "_path", lambda: str(tmp_path / "tasks.json"))
+    monkeypatch.setattr(tq, "_path", lambda: str(tmp_path / "queue.json"))
+    th.start_task("t1", "a.mp4")
+    qid = tq.enqueue(name="a.mp4", input_path="in", output_path="out", settings={})
+    tq.set_status(qid, "running")
+
+    writer = _PhaseWriter()
+    # Las fases llegan en este orden y asi se tienen que guardar.
+    for phase_id, ev in (("probe", "start"), ("engine-a", "start"),
+                         ("engine-a", "progress"), ("mux", "start")):
+        writer.note_phase_event("t1", {"id": phase_id, "ev": ev, "pct": 0})
+
+    # Diez "muxing" seguidos desde el progreso del mux, y despues "publishing".
+    for _ in range(10):
+        writer.note_phase_event("t1", {"id": "mux", "ev": "progress", "pct": 50})
+        writer.note_queue_status(qid, "muxing")
+    writer.note_queue_status(qid, "publishing")
+
+    assert writer.flush(timeout=10) is True
+
+    task = [t for t in th._load_raw() if t["task_id"] == "t1"][0]
+    assert [p["phase_id"] for p in task["phases"]] == \
+        ["probe", "engine-a", "mux"], "el orden es el de primera aparicion"
+    mux = [p for p in task["phases"] if p["phase_id"] == "mux"][0]
+    assert mux["pct"] == 50, "gana el ultimo progreso, no el primero"
+
+    item = tq.get_item(qid)
+    assert item["status"] == "publishing", "la cadena de estados se respeta"
+    estados = [h["to"] for h in item["state_history"]]
+    assert estados == ["running", "muxing", "publishing"], \
+        "los repetidos se tiran, los distintos no"
+
+
+def test_a_queue_status_never_skips_a_step_and_never_gets_stuck(tmp_path,
+                                                                monkeypatch):
+    """``muxing`` y ``publishing`` van uno detrás de otro, porque la cola los valida.
+
+    Es el motivo de que el escritor no pueda aplicar "último gana" a la cola: si
+    dos eventos se fundieran en uno y se perdiera el intermedio, el
+    ``publishing`` llegaria desde ``running``, que no es una transicion
+    valida, y el item se quedaria encolado para siempre sin que nadie lo dijera.
+    """
+    import src.task_queue as tq
+    from src.task_persist import _PhaseWriter
+
+    monkeypatch.setattr(tq, "_path", lambda: str(tmp_path / "queue.json"))
+    qid = tq.enqueue(name="a.mp4", input_path="in", output_path="out", settings={})
+    tq.set_status(qid, "running")
+
+    writer = _PhaseWriter()
+    writer.note_queue_status(qid, "muxing")
+    writer.note_queue_status(qid, "publishing")
+    writer.note_queue_status(qid, "publishing")  # repetido: fuera
+    assert writer.flush(timeout=10) is True
+
+    item = tq.get_item(qid)
+    assert item["status"] == "publishing"
+    assert [h["to"] for h in item["state_history"]] == ["running", "muxing", "publishing"]
+
+
+def test_a_failed_write_is_retried_and_the_queue_recovers(tmp_path, monkeypatch):
+    """Un fallo de escritura no puede dejar el item de la cola atascado.
+
+    El deduplicador tiene que comparar contra lo ultimo que se **escribio**,
+    no contra lo ultimo que se pidio. Si compara contra lo pedido, un solo
+    fallo —disco lleno a mitad de un render— basta para que todos los
+    reintentos identicos se descarten como repetidos, y el item se queda en
+    "running" para siempre. Al reiniciar, ``recover_interrupted`` reencolaba un
+    render que ya estaba hecho.
+
+    Las fases no tienen ese problema porque cada evento vuelve a pedirlas, asi
+    que el defecto es de la cola y aqui se queda en la cola.
+    """
+    import src.task_queue as tq
+    from src.task_persist import _PhaseWriter
+
+    monkeypatch.setattr(tq, "_path", lambda: str(tmp_path / "queue.json"))
+    qid = tq.enqueue(name="a.mp4", input_path="i", output_path="o", settings={})
+    assert tq.set_status(qid, "running")
+
+    intentos = [0]
+    real = tq._save_raw
+
+    def falla_el_primero(items):
+        intentos[0] += 1
+        if intentos[0] <= 1:
+            raise OSError("disco lleno")
+        return real(items)
+
+    monkeypatch.setattr(tq, "_save_raw", falla_el_primero)
+
+    writer = _PhaseWriter()
+    writer.note_queue_status(qid, "muxing")
+    assert writer.flush(timeout=10) is True
+    assert tq.get_item(qid)["status"] == "running", "el primer intento se perdio"
+
+    # El render sigue mandando el mismo estado en cada evento de progreso del
+    # mux. Antes estos cinco se descartaban como repetidos y no pasaba nada.
+    for _ in range(5):
+        writer.note_queue_status(qid, "muxing")
+    assert writer.flush(timeout=10) is True
+    assert tq.get_item(qid)["status"] == "muxing", (
+        "tras el fallo, el siguiente evento debió reintentar y salir bien")
+
+    # Y de ahi sigue avanzando solo, con la cadena de transiciones intacta.
+    writer.note_queue_status(qid, "publishing")
+    assert writer.flush(timeout=10) is True
+    item = tq.get_item(qid)
+    assert item["status"] == "publishing"
+    assert [h["to"] for h in item["state_history"]] == \
+        ["running", "muxing", "publishing"]
+    assert intentos[0] >= 3, "hubo que reintentar de verdad"
+
+
+def test_a_closing_phase_is_written_as_a_close_and_not_merged_away(tmp_path,
+                                                                 monkeypatch):
+    """Un cierre se escribe entero, aunque llegue con un progreso colgando.
+
+    El worker cierra cada fase con un ``end`` como ultimo evento, y para el mux
+    es un ``progress`` al 100 seguido de ese ``end`` (pipeline.py). Si el
+    escritor aplicara "gana el ultimo" sin mas, el ``end`` se escribiria como
+    un progreso mas y la fase quedaria en "running" para siempre en el archivo,
+    que es lo unico que se lee al abrir el programa.
+
+    Y no se defiende del progreso que llegase *despues* de un cierre, porque el
+    worker no lo emite: hacerlo exigiria llevar el registro de que fases estan
+    cerradas, que es estado que nadie usaria.
+    """
+    import src.task_history as th
+    from src.task_persist import _PhaseWriter
+
+    monkeypatch.setattr(th, "_path", lambda: str(tmp_path / "tasks.json"))
+    th.start_task("t1", "a.mp4")
+
+    writer = _PhaseWriter()
+    # La secuencia real del mux: progreso al 100 y luego el cierre.
+    writer.note_phase_event("t1", {"id": "mux", "ev": "progress", "pct": 100,
+                                   "label": "Finalizing / Mux"})
+    writer.note_phase_event("t1", {"id": "mux", "ev": "end"})
+    assert writer.flush(timeout=10) is True
+
+    fases = {p["phase_id"]: p for p in
+             [t for t in th._load_raw() if t["task_id"] == "t1"][0]["phases"]}
+    assert fases["mux"]["status"] == "done", "el cierre gana al progreso al 100"
+    # El 'end' va sin etiqueta ni porcentaje, igual que antes de este cambio:
+    # la etiqueta se conserva y el porcentaje queda en 0.
+    assert fases["mux"]["label"] == "Finalizing / Mux", "el cierre no borra la etiqueta"
+    assert fases["mux"]["pct"] == 0
+
+    # Un fallo es el otro cierre, y tambien se escribe entero.
+    writer.note_phase_event("t1", {"id": "engine-b", "ev": "progress", "pct": 30,
+                                   "label": "SwinIR"})
+    writer.note_phase_event("t1", {"id": "engine-b", "ev": "failed",
+                                   "msg": "out of memory"})
+    assert writer.flush(timeout=10) is True
+    fases = {p["phase_id"]: p for p in
+             [t for t in th._load_raw() if t["task_id"] == "t1"][0]["phases"]}
+    assert fases["engine-b"]["status"] == "failed"
+    assert fases["engine-b"]["label"] == "SwinIR"
+
+
+def test_a_watcher_that_looks_alive_but_is_not_watching_still_gets_the_work(
+        tmp_path, monkeypatch):
+    """"Hay vigilante?" tiene que ser un dato, no una suposición.
+
+    El fallo medido no era un error de tecleo. ``_start`` decidía con
+    ``Thread.is_alive()``, y un hilo que ya ha decidido retirarse sigue vivo:
+    durante esa ventana la nota se quedaba sin vigilante y ``flush`` se comía
+    el tiempo de espera entero. Pasaba en 2 de 400 volcados, con el hilo de la
+    GUI parado, que es justo lo que este módulo vino a arreglar.
+
+    Aquí esa condición se provoca en vez de esperarla. Se coloca un hilo vivo
+    que no vigila nada, que es exactamente el estado que el código no sabía
+    distinguir de "hay alguien mirando". Si la pregunta vuelve a deducirse del
+    hilo, este test se cuelga y falla.
+    """
+    import threading
+
+    import src.task_history as th
+    from src.task_persist import _PhaseWriter
+
+    monkeypatch.setattr(th, "_path", lambda: str(tmp_path / "tasks.json"))
+    th.start_task("t1", "a.mp4")
+
+    escritor = _PhaseWriter()
+    # El hilo tonto: vivo, y completamente ajeno al escritor. Es el intruso que
+    # el código anterior tomaba por su propio vigilante.
+    parado = threading.Event()
+    intruso = threading.Thread(target=parado.wait, daemon=True,
+                               name="intruso")
+    intruso.start()
+    # Los dos nombres que ha usado el atributo del vigilante. Se ponen los dos
+    # para que el test valga tanto si se deduce del hilo como si no.
+    escritor._watcher = intruso
+    escritor._thread = intruso
+
+    escritor.note_phase_event("t1", {"id": "engine-a", "ev": "progress",
+                                     "pct": 7})
+
+    assert escritor.flush(timeout=2) is True, (
+        "el intruso se compro como vigilante y la nota se quedo sin escribir")
+    fases = [t for t in th._load_raw() if t["task_id"] == "t1"][0]["phases"]
+    assert fases[0]["pct"] == 7, "la nota tiene que haber llegado al disco"
+    # Y la pregunta, respondida como dato: hay vigilante.
+    assert escritor._watching is True, "la vida del vigilante tiene que ser un dato"
+    parado.set()
+
+
+def test_cerrar_espera_a_lo_que_ya_esta_escribiendo_y_no_espera_para_siempre(
+        tmp_path, monkeypatch):
+    """``flush`` espera a un volcado en curso, y se rinde si el vigilante se atasca.
+
+    ``flush`` se llama en el hilo de la GUI al terminar un render, al terminar
+    su preview y al cerrar. Con una escritura en curso tiene que esperarla: si
+    no, el "listo" que dice y el archivo no coinciden, y el ``finish_task`` de
+    justo detrás escribiría un cierre sobre fases que aún no están en disco.
+
+    Y si el vigilante no vuelve —disco colgado, un ``fsync`` que no termina—
+    tiene que rendirse pronto. Diez segundos de hilo de la GUI parado son
+    exactamente el "no responde" que esto vino a quitar, y un volcado que no
+    se puede escribir no se va a escribir por esperar más.
+    """
+    import threading
+    import time
+
+    import src.task_history as th
+    from src.task_persist import _PhaseWriter
+
+    monkeypatch.setattr(th, "_path", lambda: str(tmp_path / "tasks.json"))
+    th.start_task("t1", "a.mp4")
+    real = th._save_raw
+
+    escritor = _PhaseWriter()
+    puerta = threading.Event()
+
+    def bloqueado(tasks):
+        puerta.wait(30)
+        return real(tasks)
+
+    monkeypatch.setattr(th, "_save_raw", bloqueado)
+
+    # 1) Con una escritura en curso, flush NO dice que ya esta todo escrito.
+    escritor.note_phase_event("t1", {"id": "engine-a", "ev": "progress",
+                                     "pct": 12})
+    assert escritor.flush(timeout=0.3) is False, (
+        "flush dio por escrito algo que el vigilante tenia en la mano")
+
+    # 2) Cuando el volcado termina, flush lo confirma y los datos estan ahi.
+    puerta.set()
+    assert escritor.flush(timeout=10) is True
+    fases = [t for t in th._load_raw() if t["task_id"] == "t1"][0]["phases"]
+    assert fases[0]["pct"] == 12, "el volcado en curso tiene que haber aterrizado"
+
+    # 3) Si el vigilante se atasca de verdad, flush se rinde en un rato.
+    atasco = threading.Event()
+    monkeypatch.setattr(th, "_save_raw", lambda tasks: atasco.wait(30))
+    escritor.note_phase_event("t1", {"id": "mux", "ev": "progress", "pct": 50})
+    t0 = time.perf_counter()
+    listo = escritor.flush()          # sin timeout: usa el que trae
+    dt = time.perf_counter() - t0
+    assert listo is False, "no puede decir que esta listo si el vigilante no volvio"
+    assert dt < 3.5, (
+        "flush se paro %.1f s en el hilo de la GUI; tiene que rendirse antes" % dt)
+    atasco.set()
+    monkeypatch.setattr(th, "_save_raw", real)
+    assert escritor.flush(timeout=10) is True, "y luego se recupera solo"
+
+
+def test_cerrar_la_ventana_con_una_escritura_que_no_llega_no_dice_que_si(
+        qapp, tmp_path, monkeypatch, caplog):
+    """Se cierra la ventana de verdad, con el disco negandose a guardar.
+
+    Todo lo demas del escritor se comprueba con el escritor de-alone. Esta es
+    la prueba de lo que el usuario nota: la ventana, el boton de cerrar, y un
+    render a media escribir. Antes, esto se perdia en silencio —el archivo se
+    quedaba sin la fase, el cierre se daba por bueno y no decia nada— porque
+    ``_write`` se comia el ``False`` de ``update_phase`` mientras miraba con
+    cuidado el de ``set_status``.
+
+    El sabotaje es el de verdad: ``_save_raw`` devuelve ``False``, que es lo
+    que hace la de ``task_history`` cuando el fsync falla.
+    """
+    import logging
+    import time
+
+    import src.task_history as th
+    from src.ui.main_window import MainWindow
+    from src.task_persist import phase_writer
+
+    monkeypatch.setattr(th, "_path", lambda: str(tmp_path / "tasks.json"))
+    th.start_task("t1", "clip.mkv")
+
+    ventana = MainWindow("C:/fake/ffmpeg.exe", {"gpus": []}, {})
+    real = th._save_raw
+    # Se acepta el trabajo y se rechaza la escritura.
+    monkeypatch.setattr(th, "_save_raw", lambda tasks: False)
+    phase_writer.note_phase_event("t1", {"id": "mux", "ev": "progress", "pct": 88,
+                                        "label": "Finalizing / Mux"})
+    try:
+        with caplog.at_level(logging.WARNING, logger="src.ui.main_window"):
+            t0 = time.perf_counter()
+            ventana.close()
+            dt = time.perf_counter() - t0
+
+        # 1) Cierra igual, y sin quedarse mirando el reloj. Acotar la espera
+        #    no es rendirse: lo que no se escribio sigue pendiente.
+        assert dt < 4.0, "el cierre se paró %.1f s en el hilo de la GUI" % dt
+
+        # 2) Y no se pierde calladito. Esto es lo que antes fallaba.
+        tarea = [t for t in th._load_raw() if t["task_id"] == "t1"][0]
+        assert not tarea.get("phases"), "no puede haber fase si no se escribio"
+        assert tarea.get("status") != "success", (
+            "un cierre sin sus fases no puede decir que la tarea se guardo")
+        assert any("sin escribir" in r.getMessage() for r in caplog.records), (
+            "el usuario se queda sin saber que su render no se guardo: %s"
+            % [r.getMessage() for r in caplog.records])
+
+        # 3) Y el veredicto es el que vale para contarselo a alguien. Aqui se
+        #    separa lo que antes se confundia: ``flush`` dice que al vigilante
+        #    no le queda nada en la mano —correcto, porque la fase se dejo de
+        #    recordar en vez de reintentarse sola— y ``take_unwritten`` dice que si hay
+        #    algo que avisar, porque hay algo que se perdio. Un disco lento no
+        #    pierde nada y no llegaria aqui.
+        assert phase_writer.flush(timeout=2) is True, (
+            "rechazar la escritura no es dejar trabajo pendiente")
+
+        # Y se avisa una sola vez. El cierre de arriba ya se llevo la perdida:
+        # la dijo —el warning del paso 2— y la olvido, porque ``take_unwritten``
+        # pregunta y olvida a proposito. Sin eso, la misma fase se volvia a
+        # anunciar en cada cierre posterior de la aplicacion.
+        assert phase_writer.take_unwritten(task_id="t1") is False, (
+            "la perdida ya se aviso al cerrar; no se repite")
+
+        # 4) La fase vuelve cuando el render la vuelve a pedir, que es lo
+        #    unico que la recupera —igual que la cola— y no un reintento del
+        #    vigilante. Medido: un vigilante que reintenta solo se come un
+        #    nucleo entero contra un disco que no vuelve.
+        monkeypatch.setattr(th, "_save_raw", real)
+        phase_writer.note_phase_event("t1", {"id": "mux", "ev": "progress",
+                                            "pct": 90})
+        assert phase_writer.take_unwritten(task_id="t1") is False, (
+            "el siguiente evento de la fase tiene que dejarla como escrita")
+        tarea = [t for t in th._load_raw() if t["task_id"] == "t1"][0]
+        fases = {p["phase_id"]: p for p in tarea.get("phases", [])}
+        assert fases["mux"]["pct"] == 90
+    finally:
+        # phase_writer es un singleton: lo que queda sin escribir lo hereda
+        # el siguiente test. ``take_unwritten`` se lo lleva, asi que no hay que tocar
+        # nada privado desde aqui.
+        monkeypatch.setattr(th, "_save_raw", real)
+        phase_writer.flush(timeout=10)
+        phase_writer.take_unwritten()
+
+
+def _ventana_con_tarea_en_render(qapp, tmp_path, monkeypatch, task_id):
+    """MainWindow de verdad, con una tarea a medio render y su tarjeta.
+
+    Los dos call sites de tarea no se pueden probar con el escritor solo:
+    lo que tienen que hacer ademas de cerrar en disco es dejar la tarjeta en
+    su estado final, y eso solo existe en una ventana de verdad.
+    """
+    import src.task_history as th
+    from src.ui.main_window import MainWindow
+
+    monkeypatch.setattr(th, "_path", lambda: str(tmp_path / "tasks.json"))
+    ventana = MainWindow("C:/fake/ffmpeg.exe", {"gpus": []}, {})
+
+    # La ventana marca como "interrupted" lo que encuentra running de una
+    # sesion anterior, asi que la tarea se crea despues de construirla.
+    th.start_task(task_id, "clip.mkv")
+    for tarea in th._load_raw():
+        if tarea["task_id"] == task_id:
+            tarea["status"] = "running"
+            tarea["finished_at"] = None
+    th._save_raw(th._load_raw())
+
+    ventana.tasks_panel.get_or_create(task_id, "clip.mkv")
+    ventana.tasks_panel._cards[task_id].set_running()
+    return ventana
+
+
+def _poner_tarea_a_render(th, ventana, task_id, nombre):
+    """Segunda tarea a mitad de render, para la rama en la que se pierde."""
+    th.start_task(task_id, nombre)
+    for tarea in th._load_raw():
+        if tarea["task_id"] == task_id:
+            tarea["status"] = "running"
+            tarea["finished_at"] = None
+    th._save_raw(th._load_raw())
+    ventana.tasks_panel.get_or_create(task_id, nombre)
+    ventana.tasks_panel._cards[task_id].set_running()
+
+
+def _espiar_finish_task(monkeypatch, phase_writer):
+    """Anota a quien se le pide cerrar una tarea, sin cambiar el resultado."""
+    llamadas = []
+    real = phase_writer.finish_task
+
+    def contando(task_id, status):
+        llamadas.append((task_id, status))
+        return real(task_id, status)
+
+    monkeypatch.setattr(phase_writer, "finish_task", contando)
+    return llamadas
+
+
+def test_al_terminar_un_render_la_tarjeta_llega_a_su_estado_final(
+        qapp, tmp_path, monkeypatch, caplog):
+    """La tarjeta termina igual se pueda guardar o no: el panel no lleva la cuenta.
+
+    Estos dos call sites no tenian ni un test, y por ahi pasaron las dos
+    regresiones de las ultimas pasadas con la suite en verde. La que se
+    comprueba aqui es la que mas dolio: poner la tarjeta detras del veredicto
+    del escritor dejaba un render que si habia terminado showing "running"
+    para el resto de la sesion, con el unico aviso en un log que nadie lee.
+
+    Asi que el panel se mueve como se movia antes de este trabajo, y lo que se
+    dice es otra cosa: que el archivo no llego.
+    """
+    import logging
+
+    import src.task_history as th
+    from src.task_persist import phase_writer
+
+    ventana = _ventana_con_tarea_en_render(qapp, tmp_path, monkeypatch, "t1")
+    llamadas = _espiar_finish_task(monkeypatch, phase_writer)
+    real_save = th._save_raw
+    try:
+        # --- Rama sana: la tarjeta termina y el archivo tambien.
+        phase_writer.note_phase_event("t1", {"id": "probe", "ev": "start"})
+        phase_writer.note_phase_event("t1", {"id": "engine-a", "ev": "progress",
+                                            "pct": 60})
+        phase_writer.note_phase_event("t1", {"id": "mux", "ev": "end"})
+        ventana._current_task_id = "t1"
+        ventana._mark_task_finished("success")
+
+        tarjeta = ventana.tasks_panel._cards["t1"]
+        assert tarjeta._status == "completed", (
+            "un render que acaba tiene que verse completado")
+        assert tarjeta._status_label.text() == "COMPLETED"
+        assert llamadas == [("t1", "success")], (
+            "el cierre se pide una vez, y para la tarea que termino: %r" % llamadas)
+        assert ventana._current_task_id is None, "la tarea ya no es la actual"
+
+        tarea = [t for t in th._load_raw() if t["task_id"] == "t1"][0]
+        assert tarea["status"] == "success"
+        assert tarea.get("finished_at"), "el cierre se escribe con su fecha"
+        fases = [(p["phase_id"], p["status"]) for p in tarea["phases"]]
+        assert fases == [("probe", "pending"), ("engine-a", "running"),
+                         ("mux", "done")], "las fases van en su orden: %r" % (fases,)
+
+        # --- Rama que se pierde: la tarjeta termina igual, y se avisa.
+        _poner_tarea_a_render(th, ventana, "t2", "otro.mkv")
+        caplog.clear()
+        monkeypatch.setattr(th, "_save_raw", lambda tasks: False)
+        with caplog.at_level(logging.WARNING, logger="src.task_persist"):
+            phase_writer.note_phase_event("t2", {"id": "mux", "ev": "end"})
+            ventana._current_task_id = "t2"
+            ventana._mark_task_finished("success")
+        monkeypatch.setattr(th, "_save_raw", real_save)
+
+        tarjeta2 = ventana.tasks_panel._cards["t2"]
+        assert tarjeta2._status == "completed", (
+            "el panel no se queda en running por un fallo de disco: eso deja "
+            "un render terminado pareciendose a uno que sigue")
+        assert [r.getMessage() for r in caplog.records], (
+            "pero lo que no se guardo se dice")
+        tarea2 = [t for t in th._load_raw() if t["task_id"] == "t2"][0]
+        assert tarea2["status"] != "success", (
+            "el archivo no puede decir success si no se escribio")
+    finally:
+        monkeypatch.setattr(th, "_save_raw", real_save)
+        ventana._current_task_id = None
+        phase_writer.take_unwritten()
+        phase_writer.flush(timeout=10)
+
+
+def test_al_terminar_la_vista_previa_se_libera_el_id_y_se_avisa_si_no_hubo_cierre(
+        qapp, tmp_path, monkeypatch, caplog):
+    """La vista previa cierra igual, y su id se suelta pase lo que pase.
+
+    Es el mismo call site con otro nombre de tarea, y por eso tiene su propio
+    test: si se rompiera uno, el otro no se entera. Y aqui el detalle que
+    mas se pasa: ``_preview_task_id`` tiene que quedar en None aunque el
+    escritor falle, porque si se queda puesto el siguiente preview hereda el
+    id de la tarea anterior.
+    """
+    import logging
+
+    import src.task_history as th
+    from src.task_persist import phase_writer
+
+    ventana = _ventana_con_tarea_en_render(qapp, tmp_path, monkeypatch, "pv1")
+    llamadas = _espiar_finish_task(monkeypatch, phase_writer)
+    real_save = th._save_raw
+    try:
+        phase_writer.note_phase_event("pv1", {"id": "engine-a", "ev": "progress",
+                                             "pct": 55})
+        ventana._preview_task_id = "pv1"
+        ventana._mark_preview_task_finished("success")
+
+        tarjeta = ventana.tasks_panel._cards["pv1"]
+        assert tarjeta._status == "completed"
+        assert llamadas == [("pv1", "success")], (
+            "el cierre se pide para la tarea de la vista previa: %r" % llamadas)
+        assert ventana._preview_task_id is None, "el id se suelta siempre"
+        tarea = [t for t in th._load_raw() if t["task_id"] == "pv1"][0]
+        assert tarea["status"] == "success"
+        assert tarea.get("finished_at")
+        assert [p["phase_id"] for p in tarea["phases"]] == ["engine-a"]
+
+        # Rama que se pierde: el id se suelta igual y se avisa.
+        _poner_tarea_a_render(th, ventana, "pv2", "otro.mkv")
+        caplog.clear()
+        monkeypatch.setattr(th, "_save_raw", lambda tasks: False)
+        with caplog.at_level(logging.WARNING, logger="src.task_persist"):
+            phase_writer.note_phase_event("pv2", {"id": "mux", "ev": "end"})
+            ventana._preview_task_id = "pv2"
+            ventana._mark_preview_task_finished("success")
+        monkeypatch.setattr(th, "_save_raw", real_save)
+
+        assert ventana.tasks_panel._cards["pv2"]._status == "completed"
+        assert [r.getMessage() for r in caplog.records], (
+            "un cierre que no se pudo escribir se dice")
+        assert ventana._preview_task_id is None, (
+            "el id se suelta aunque el escritor falle; si no, el siguiente "
+            "preview hereda el de la tarea anterior")
+        tarea2 = [t for t in th._load_raw() if t["task_id"] == "pv2"][0]
+        assert tarea2["status"] != "success"
+    finally:
+        monkeypatch.setattr(th, "_save_raw", real_save)
+        ventana._preview_task_id = None
+        phase_writer.take_unwritten()
+        phase_writer.flush(timeout=10)

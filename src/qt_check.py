@@ -33,7 +33,13 @@ def check_qapplication_offscreen() -> Tuple[bool, str]:
     try:
         from PySide6.QtWidgets import QApplication, QWidget
 
+        from src.ui.selectable import install_text_selection
+
         qt_app = QApplication.instance() or QApplication(["draggy-qt-check"])
+        # La app real instala esta política al arrancar; el self-check tiene
+        # que instalarla también o estaría comprobando una interfaz que el
+        # usuario no ve.
+        install_text_selection(qt_app)
         platform = qt_app.platformName()
         if platform != "offscreen":
             return (

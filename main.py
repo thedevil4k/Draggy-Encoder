@@ -132,8 +132,14 @@ except Exception:
 
 # Completar borrados pendientes (archivos DLL bloqueados por Windows en la
 # sesión anterior) ANTES de que nada importe torch/onnxruntime.
+#
+# Entra por ``src.fsops`` y no por el registro de dependencias a proposito:
+# ese modulo arrastra los dos managers que aqui hay que liberar de sus
+# DLL. ``fsops`` solo importa os/json/shutil, asi que la garantia de
+# "primero limpiar, luego cargar" es del sitio de la llamada y no del
+# orden en que casualmente se importen las cosas.
 try:
-    from src.dependencies import process_pending_cleanup
+    from src.fsops import process_pending_cleanup
     process_pending_cleanup()
 except Exception:
     pass

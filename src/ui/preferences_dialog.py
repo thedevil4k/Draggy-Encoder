@@ -645,9 +645,6 @@ class PreferencesDialog(QDialog):
 
         self._logs_dir = get_logs_dir()
         self.lbl_logs_dir = QLabel(self._logs_dir)
-        self.lbl_logs_dir.setTextInteractionFlags(
-            Qt.TextInteractionFlag.TextSelectableByMouse
-        )
         self.lbl_logs_dir.setWordWrap(True)
         self.lbl_logs_dir.setStyleSheet(
             "color: #e0e0e0; font-size: 12px; background-color: #16213e;"
@@ -769,7 +766,6 @@ class PreferencesDialog(QDialog):
             f"Packaged (PyInstaller): "
             f"{'yes' if getattr(sys, 'frozen', False) else 'no'}"
         )
-        info.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         info.setStyleSheet(
             "color: #e0e0e0; font-size: 12px; background-color: #16213e;"
             "padding: 8px; border-radius: 6px;"

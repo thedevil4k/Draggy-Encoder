@@ -17,15 +17,17 @@ import numpy as np
 
 from src.ai.registry import get_engine_meta
 from src.config import get_codec_entry, get_logs_dir, resolve_codec
-from src.ffmpeg.loudnorm import measure_loudness
+from src.ffmpeg.loudnorm import measure_loudness, measure_loudness_all_tracks
 from src.ffmpeg.runner import (
     KEEP_ALL_AUDIO,
     _parse_time_to_seconds,
     build_args,
     build_boost_filter,
+    build_per_stream_boost_args,
     extract_frame,
     get_video_info,
     health_check_ffmpeg,
+    keeps_all_audio,
     parse_audio_stream_index,
     run_ffmpeg,
 )
@@ -58,6 +60,24 @@ def _emit_phase(phase_cb, ev, phase_id, label="", pct=0, msg=""):
         })
     except Exception as exc:
         logger.warning("phase_cb error: %s", exc)
+
+
+def _emit_metrics(metrics_cb, **fields):
+    """Publica cifras de throughput en un dict plano. Nunca lanza.
+
+    El canal de métricas es **plano** a propósito, y por eso se parece al que
+    ya usa ``run_ffmpeg``: quien lo consume (el desplegable de la bandeja) lo
+    mezcla tal cual llega, sin tener que saber de qué render salió cada
+    número. Envolverlo en ``{"metric": ..., "value": ...}`` —que es lo que
+    necesita una fase, porque tiene nombre e historia— aquí solo añadía una
+    forma más que el consumidor tenía que adivinar.
+    """
+    if not metrics_cb:
+        return
+    try:
+        metrics_cb(dict(fields))
+    except Exception as exc:
+        logger.debug("metrics_cb error: %s", exc)
 
 
 def _get_duration_seconds(ffmpeg_path, video_path):
@@ -285,7 +305,8 @@ def _coerce_output_for_codec(output_path, settings):
 
 def _measure_if_needed(ffmpeg_path, input_path, settings, status_callback=None,
                        start_time=None, end_time=None, abort_event=None,
-                       supervisor: ProcessSupervisor | None = None):
+                       supervisor: ProcessSupervisor | None = None,
+                       per_track=True):
     """Mide loudness solo si audio_boost=True y vamos a re-codificar audio.
 
     Devuelve el dict medido (modulo de loudnorm) o None si no aplica / falla.
@@ -293,6 +314,15 @@ def _measure_if_needed(ffmpeg_path, input_path, settings, status_callback=None,
     únicamente el trozo que se va a codificar. Para clips muy largos la
     medición se acota a una ventana central (``_measure_bounds``) para no
     serializar minutos de análisis de audio antes del encode.
+
+    Si el usuario conserva TODAS las pistas, devuelve una lista con una
+    medición por pista: el boost de dos pasadas hornea los valores medidos en
+    el filtro, así que medir solo la primera y aplicar ese filtro a todas deja
+    a las demás con la ganancia de otra pista. Con una sola pista el resultado
+    es el mismo dict de siempre, y el comando no cambia ni un byte.
+
+    ``per_track=False`` es para quien solo muestra u oye una pista (el
+    preview): ahí una medición por pista sería trabajo tirado.
     """
     if not settings.get("audio_boost"):
         return None
@@ -307,16 +337,25 @@ def _measure_if_needed(ffmpeg_path, input_path, settings, status_callback=None,
     if duration_s is None:
         duration_s = _get_duration_seconds(ffmpeg_path, input_path) or 0
     ms_start, ms_end = _measure_bounds(start_time, end_time, duration_s, cap)
+    indice = settings.get("audio_stream_index", 0)
     if status_callback:
         status_callback("Analyzing audio levels (first pass)...")
     try:
+        if per_track and keeps_all_audio(indice):
+            return measure_loudness_all_tracks(
+                ffmpeg_path, input_path,
+                start_time=ms_start, end_time=ms_end,
+                status_callback=status_callback,
+                abort_event=abort_event,
+                supervisor=supervisor,
+            )
         return measure_loudness(
             ffmpeg_path, input_path,
             start_time=ms_start, end_time=ms_end,
             status_callback=status_callback,
             abort_event=abort_event,
             supervisor=supervisor,
-            audio_stream_index=settings.get("audio_stream_index", 0),
+            audio_stream_index=indice,
         )
     except Exception:
         return None
@@ -325,7 +364,8 @@ def _measure_if_needed(ffmpeg_path, input_path, settings, status_callback=None,
 def compress_video(ffmpeg_path, input_path, output_path, settings,
                    progress_callback=None, status_callback=None, abort_event=None,
                    ai_engines=None, on_process=None, phase_cb=None,
-                   supervisor: ProcessSupervisor | None = None):
+                   supervisor: ProcessSupervisor | None = None,
+                   metrics_cb=None):
     """Comprime un vídeo completo. Audio boost usa two-pass loudnorm.
 
     ``ai_engines`` is an optional mapping ``{"Upscale": "engine_id",
@@ -433,6 +473,12 @@ def compress_video(ffmpeg_path, input_path, output_path, settings,
             else:
                 status_callback("Compressing video...")
 
+        # El kwarg de metricas solo se pasa si hay alguien escuchando. Pasarlo
+        # siempre —aunque valiese None— cambiaria la forma de la llamada para
+        # todos los llamantes de siempre, y hay dobles de test que comprueban
+        # la firma exacta. Asi, quien no quiere metricas ve una llamada
+        # identica a la de antes, y no se nota que esta opcion existe.
+        extra = {"metrics_callback": metrics_cb} if metrics_cb else {}
         result = run_ffmpeg(
             ffmpeg_path,
             args,
@@ -440,6 +486,7 @@ def compress_video(ffmpeg_path, input_path, output_path, settings,
             abort_event=abort_event,
             on_process=on_process,
             supervisor=supervisor,
+            **extra,
         )
         valid, detail = validate_render_output(
             ffmpeg_path,
@@ -467,7 +514,7 @@ def generate_preview(ffmpeg_path, input_path, settings, progress_callback=None,
                      status_callback=None, abort_event=None, ai_engines=None,
                      inference_engines=None, on_process=None, on_processes=None,
                      phase_cb=None, supervisor: ProcessSupervisor | None = None,
-                     preview_time=None):
+                     preview_time=None, metrics_cb=None):
     """Genera un preview: codifica un clip corto y extrae un frame.
 
     Devuelve una tupla ``(original_bytes, compressed_bytes, artifacts)`` con
@@ -556,12 +603,15 @@ def generate_preview(ffmpeg_path, input_path, settings, progress_callback=None,
         rng = random.Random(input_path)
         frame_offset = rng.uniform(0.1, max(0.2, clip_length - 0.1))
 
-    # Medimos loudness SOBRE EL MISMO CLIP que se va a codificar.
+    # Medimos loudness SOBRE EL MISMO CLIP que se va a codificar. El preview
+    # solo enseña una imagen (y el fragmento de audio lo mide su propio
+    # worker), asi que medir pista por pista aqui seria tiempo tirado.
     loudnorm_meas = _measure_if_needed(
         ffmpeg_path, input_path, settings, status_callback=status_callback,
         start_time=start, end_time=end,
         abort_event=abort_event,
         supervisor=supervisor,
+        per_track=False,
     )
 
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -594,6 +644,7 @@ def generate_preview(ffmpeg_path, input_path, settings, progress_callback=None,
                 on_processes=on_processes,
                 phase_cb=phase_cb,
                 supervisor=supervisor,
+                metrics_cb=metrics_cb,
             )
         else:
             args = build_args(input_path, compressed_path, preview_settings, loudnorm_meas=loudnorm_meas)
@@ -693,6 +744,7 @@ def compress_video_with_ai(
     inference_engines=None,
     phase_cb=None,
     supervisor: ProcessSupervisor | None = None,
+    metrics_cb=None,
 ):
     """Decode -> AI chain -> encode in a single pass (frame-by-frame).
 
@@ -1436,14 +1488,23 @@ def compress_video_with_ai(
                 elapsed = time.time() - t_start
                 pct = min(95, int((elapsed / duration) * 50))  # rough estimate
                 progress_callback(pct)
-            if status_callback and frame_num % 30 == 0:
+            if frame_num % 30 == 0 and (metrics_cb or status_callback):
                 elapsed = time.time() - t_start
                 speed = frame_num / elapsed if elapsed > 0 else 0
-                mode_label = "AI upscale+interp" if do_interpolate else "AI upscale"
-                status_callback(
-                    f"{mode_label}: frame {frame_num}/{total_frames or '?'} "
-                    f"({speed:.1f} fps)"
-                )
+                if metrics_cb:
+                    # El MISMO numero que el texto de abajo, pero como dato.
+                    # Maquetado en una frase no sirve: el desplegable de la
+                    # bandeja no puede parsear una cadena que ademas esta
+                    # escrita en ingles y puede cambiar de un dia para otro.
+                    _emit_metrics(metrics_cb, fps=speed or None,
+                                  frame=frame_num,
+                                  total_frames=total_frames)
+                if status_callback:
+                    mode_label = "AI upscale+interp" if do_interpolate else "AI upscale"
+                    status_callback(
+                        f"{mode_label}: frame {frame_num}/{total_frames or '?'} "
+                        f"({speed:.1f} fps)"
+                    )
 
     except Exception as exc:
         logger.error("AI pipeline frame %d failed: %s", frame_num, exc)
@@ -2167,7 +2228,10 @@ def _audio_mux_args(audio_codec, loudnorm_meas, audio_boost, container_format="m
     else:
         enc_a = "aac"
     args = ["-c:a", enc_a, "-b:a", "192k"]
-    if audio_boost:
+    if audio_boost and not isinstance(loudnorm_meas, (list, tuple)):
+        # Con una medición por pista el filtro lo pone quien tiene los mapas
+        # (-filter_complex), porque aquí no se sabe de qué entrada sale el
+        # audio: en el encode en paralelo es la 0 y en el mux la 1.
         af = build_boost_filter(settings or {}, loudnorm_meas)
         if af:
             args.extend(["-af", af])
@@ -2257,14 +2321,22 @@ def _encode_audio_parallel(ffmpeg_path, input_path, settings,
         audio_map = "0:a?"
     else:
         audio_map = f"0:a:{audio_stream_index}?"
+    # Con una medición por pista, cada una lleva su filtro: un único -af con
+    # la medición de la primera dejaba a las demás con la ganancia de otra.
+    por_pista = []
+    if audio_boost:
+        por_pista = build_per_stream_boost_args(settings, loudnorm_meas)
+    if por_pista:
+        cmd.extend(por_pista)
+    else:
+        cmd.extend(["-map", audio_map])
     cmd.extend([
-        "-map", audio_map,
         "-vn",
         "-threads", "0",
         "-c:a", enc_a,
         "-b:a", "192k",
     ])
-    if audio_boost and len(mux_args) >= 4:
+    if audio_boost and not por_pista and "-af" in mux_args:
         af = mux_args[mux_args.index("-af") + 1]
         cmd.extend(["-af", af])
     if enc_a == "libopus":
@@ -2472,15 +2544,27 @@ def _mux_audio(ffmpeg_path, input_path, output_path, audio_codec="copy",
             source_audio_map = "1:a:0?"
         else:
             source_audio_map = f"1:a:{audio_stream_index}?"
+        # Cuando el boost llega medido por pista, el audio de aquí es la
+        # segunda entrada y cada pista lleva su filtro. Con ``audio_file`` el
+        # filtro ya viene horneado en el temporal y aqui solo se copia.
+        por_pista = []
+        if not audio_file:
+            por_pista = build_per_stream_boost_args(
+                settings or {}, loudnorm_meas, audio_input="1")
         cmd = [
         ffmpeg_path,
         "-hide_banner", "-loglevel", "warning",
         "-i", output_path,
         "-i", (audio_file or input_path),
         "-map", "0:v:0",
-        "-map", source_audio_map,
-        "-c:v", "copy",
         ]
+        if por_pista:
+            cmd.extend(por_pista)
+        else:
+            cmd.extend(["-map", source_audio_map])
+        cmd.extend([
+        "-c:v", "copy",
+        ])
         if audio_file:
             # Audio pre-codificado en paralelo: solo copiamos la pista.
             cmd.extend(["-c:a", "copy"])

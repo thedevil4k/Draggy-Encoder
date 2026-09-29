@@ -32,7 +32,11 @@ from PySide6.QtCore import QObject, QUrl, Signal
 from src.ffmpeg import audio_fx
 from src.ffmpeg.loudnorm import measure_loudness
 from src.ffmpeg.process_supervisor import process_group_popen_kwargs
-from src.ffmpeg.runner import _parse_time_to_seconds, _run_kwargs
+from src.ffmpeg.runner import (
+    LOUDNORM_CLAVE_LOUDNESS,
+    _parse_time_to_seconds,
+    _run_kwargs,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -179,7 +183,11 @@ class AudioPreviewEngine(QObject):
             measured_i = None
             if isinstance(measured, dict):
                 try:
-                    measured_i = float(measured.get("input_i"))
+                    # La clave del loudness sale de la declaración de
+                    # ``runner`` (LOUDNORM_MEDIDAS), no de aquí: es la misma
+                    # que lee el render, y si se leen de dos maneras el
+                    # preview puede sonar a una cosa y el render hacer otra.
+                    measured_i = float(measured.get(LOUDNORM_CLAVE_LOUDNESS))
                 except (TypeError, ValueError):
                     measured_i = None
 

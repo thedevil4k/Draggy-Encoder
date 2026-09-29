@@ -201,7 +201,6 @@ class ModelSearchResult(QFrame):
         if eng.get("hf_url"):
             url_lbl = QLabel(eng["hf_url"])
             url_lbl.setObjectName("url")
-            url_lbl.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
             left.addWidget(url_lbl)
 
         # LFS warning

@@ -8,7 +8,8 @@ program cannot start" infrastructure. AI engines are different: they
 are *optional* quality-restoration building blocks organised by
 domain (category). Mixing them into the binary/runtime registry would
 overload its schema (binary vs model semantics are different) and
-force the existing ``_DepRow`` widget to keep growing.
+force the existing ``DepRow`` widget (in ``src.ui.dep_row``) to keep
+growing.
 
 This module exposes:
 

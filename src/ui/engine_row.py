@@ -297,7 +297,6 @@ class EngineRow(QFrame):
 
         url_lbl = QLabel(link)
         url_lbl.setObjectName("url")
-        url_lbl.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         left.addWidget(url_lbl)
 
         if lfs_warn:

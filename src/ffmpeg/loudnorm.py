@@ -35,8 +35,12 @@ from datetime import datetime
 from src.config import get_bin_dir
 from src.ffmpeg.runner import (
     KEEP_ALL_AUDIO,
+    LOUDNORM_CLAVES_OBLIGATORIAS,
+    LOUDNORM_OBJETIVO,
     _parse_time_to_seconds,
     _run_kwargs,
+    get_audio_streams,
+    measurement_is_usable,
     parse_audio_stream_index,
 )
 
@@ -69,7 +73,10 @@ def measure_loudness(ffmpeg_path, input_path, timeout_seconds=600,
     """Run pass-1 loudnorm measurement and return parsed JSON dict, or None.
 
     Returns a dict with keys: input_i, input_tp, input_lra, input_thresh,
-    target_offset (all strings with the measured LUFS / dB values).
+    target_offset (all strings with the measured LUFS / dB values). The
+    canonical list of those keys, the filter parameter each one is written
+    to and the range ffmpeg accepts for it live in
+    ``src.ffmpeg.runner.LOUDNORM_MEDIDAS`` — this docstring only names them.
     Returns None if:
         - The ffmpeg process errors out
         - No audio stream is present
@@ -106,7 +113,7 @@ def measure_loudness(ffmpeg_path, input_path, timeout_seconds=600,
     cmd.extend([
         "-map", f"0:a:{map_idx}?",
         "-vn",              # sin vídeo: no decodificar la pista más pesada
-        "-af", "loudnorm=I=-16:TP=-1.5:LRA=11:print_format=json",
+        "-af", "loudnorm=%s:print_format=json" % LOUDNORM_OBJETIVO,
         "-f", "null",
         "-",
     ])
@@ -195,7 +202,7 @@ def measure_loudness(ffmpeg_path, input_path, timeout_seconds=600,
         _append_log("FAIL", f"JSON decode error: {exc}")
         return None
 
-    required = ("input_i", "input_tp", "input_lra", "input_thresh")
+    required = LOUDNORM_CLAVES_OBLIGATORIAS
     if not all(k in data for k in required):
         _append_log("FAIL", f"missing keys: {sorted(set(required) - set(data.keys()))}")
         return None
@@ -206,4 +213,50 @@ def measure_loudness(ffmpeg_path, input_path, timeout_seconds=600,
         f"thresh={data['input_thresh']} offset={data.get('target_offset', '?')}",
     )
     return data
+
+
+def measure_loudness_all_tracks(ffmpeg_path, input_path, track_count=None, **kwargs):
+    """Mide cada pista por separado: una medición por pista, en orden.
+
+    Existe porque el boost de dos pasadas hornea los valores medidos en el
+    filtro, así que una sola medición no sirve para varias pistas: medir la
+    primera y aplicar ese filtro a todas deja a las demás con la ganancia
+    calculada para otra pista (medido en un mkv de dos pistas separadas 30
+    dB: la segunda salía en -44.85 LUFS en vez de -16).
+
+    Cada pista se mide con la MISMA función y las MISMAS opciones que una
+    pista suelta, de modo que un archivo con una sola pista no cambia de
+    comportamiento en nada.
+
+    La lista lleva un ``None`` por cada pista que no se puede medir (silencio
+    digital, valores fuera de rango). Ese ``None`` lo consume
+    ``build_boost_filters_per_track``, que le aplica a esa pista el loudnorm
+    de UNA pasada (``LOUDNORM_SIN_MEDIR``) mientras las demas conservan su
+    medicion de dos pasadas; la lista nunca se acorta, porque el indice es el
+    numero de pista. Solo se devuelve ``None`` entero si no se pudo medir
+    NINGUNA pista, que es cuando manda el camino de siempre.
+    """
+    if track_count is None:
+        try:
+            track_count = len(get_audio_streams(ffmpeg_path, input_path))
+        except Exception:
+            track_count = 0
+    if not isinstance(track_count, int) or track_count < 1:
+        return None
+    mediciones = []
+    for indice in range(track_count):
+        try:
+            medicion = measure_loudness(
+                ffmpeg_path, input_path, audio_stream_index=indice, **kwargs
+            )
+        except Exception:
+            medicion = None
+        # Una pista que no se puede medir de dos pasadas no tira a las demás:
+        # se marca con None y su filtro cae al single-pass, que sí la aguanta.
+        mediciones.append(medicion if measurement_is_usable(medicion) else None)
+    if not any(m is not None for m in mediciones):
+        # Nada medible en todo el archivo: no hay nada por pista que hacer y
+        # manda el camino de siempre (un -af con una pasada).
+        return None
+    return mediciones
 

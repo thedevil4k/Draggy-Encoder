@@ -12,19 +12,26 @@ nueva sea puramente declarativo: una entrada en ``REGISTRY`` + una función
 este módulo a través de ``list_all()``, ``reinstall()`` y ``uninstall()``
 exclusivamente.
 
-El borrado es robusto en Windows: si un archivo (DLL de torch/onnxruntime,
-binario FFmpeg en uso) está bloqueado, ``_rmtree_force`` registra la ruta
-en ``bin/.session/pending_cleanup.json`` y ``process_pending_cleanup()`` la
-completa en el siguiente arranque, antes de importar ningún runtime.
+Una fila es un dict, y sus campos estan escritos una sola vez, en
+``ROW_FIELDS``: esa tabla es la que recorre ``list_all`` para garantizar los
+suyos y la que usa el test del contrato para comprobar que una fila real trae
+lo que la fila de la UI lee. Un ``status_fn`` no tiene por que devolver los
+campos garantizados: si falta alguno, ``list_all`` lo rellena. Lo que no debe
+hacer es devolver claves que no signifiquen nada para la UI, y por eso los
+sensores de ``runtimes.manager`` no se copian enteros: son de otro esquema
+(``installed``, ``system``, ``gpu``).
+
+Lo que este modulo NO hace, porque es de otro dueno: medir el disco y
+borrarlo aunque Windows no deje (``src.fsops``), y decidir que se le dice
+al usuario en cada boton (``src.ui.dep_row``).
 """
 
 from __future__ import annotations
 
-import json
 import os
-import shutil
 from typing import Callable, Optional
 
+from src import fsops
 from src.config import (
     ensure_runtime_dirs,
     get_models_dir,
@@ -48,188 +55,8 @@ STATUS_ERROR = "error"
 
 
 # ---------------------------------------------------------------------------
-# Borrado robusto + cleanup pendiente (archivos DLL bloqueados en Windows)
+# Sensores de estado: una funcion por dependencia
 # ---------------------------------------------------------------------------
-
-PENDING_CLEANUP_FILENAME = "pending_cleanup.json"
-
-
-def _pending_cleanup_path():
-    from src.config import get_session_dir
-    return os.path.join(get_session_dir(), PENDING_CLEANUP_FILENAME)
-
-
-def _path_signature(path: str) -> int:
-    """Marca de creación de ``path`` (0 si no existe o no se puede leer).
-
-    En Windows ``st_ctime_ns`` no cambia al añadir archivos dentro, así que
-    sirve para distinguir "el directorio bloqueado que registramos" de "un
-    directorio NUEVO que se ha re-creado en la misma ruta".
-    """
-    try:
-        return int(os.stat(path).st_ctime_ns)
-    except OSError:
-        return 0
-
-
-def _register_pending_cleanup(path: str) -> None:
-    """Registra una ruta para borrarla en el próximo arranque (best-effort).
-
-    Windows bloquea DLLs cargadas (torch/onnxruntime ya importados). No
-    podemos borrarlos en caliente; al siguiente arranque, antes de importar
-    cualquier runtime, ``process_pending_cleanup()`` completa el borrado.
-
-    Se guarda además la marca de creación del directorio. Es imprescindible:
-    si el usuario desinstala (queda bloqueado), REINSTALA el mismo runtime y
-    luego reinicia, el borrado pendiente apuntaría a la ruta de la instalación
-    NUEVA y se la llevaría por delante. Comparando la marca se detecta que ese
-    directorio ya no es el que se quería borrar y se respeta.
-    """
-    try:
-        ensure_runtime_dirs()
-        p = _pending_cleanup_path()
-        data = {}
-        if os.path.exists(p):
-            try:
-                with open(p, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-            except Exception:
-                data = {}
-        if not isinstance(data, dict):
-            data = {}
-        entries = data.setdefault("paths", [])
-        entry = {"path": path, "sig": _path_signature(path)}
-        # Reemplaza una entrada previa de la misma ruta (re-registro).
-        entries[:] = [
-            e for e in entries
-            if (e.get("path") if isinstance(e, dict) else e) != path
-        ]
-        entries.append(entry)
-        with open(p, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2)
-    except Exception:
-        pass
-
-
-def _pending_entry_path(entry) -> str:
-    """Ruta de una entrada del fichero de limpiezas pendientes.
-
-    Acepta el formato antiguo (una ruta suelta) y el nuevo (``{path, sig}``).
-    """
-    if isinstance(entry, dict):
-        return str(entry.get("path") or "")
-    return str(entry or "")
-
-
-def _pending_entry_signature(entry) -> int:
-    """Marca de creación registrada (0 si el formato no la tiene)."""
-    if isinstance(entry, dict):
-        try:
-            return int(entry.get("sig") or 0)
-        except (TypeError, ValueError):
-            return 0
-    return 0
-
-
-def _remove_empty_dir_tree(path: str) -> bool:
-    """Borra ``path`` si está vacío (o solo contiene dirs vacíos).
-
-    Los DLL bloqueados impiden borrar SUS archivos, pero el resto del árbol sí
-    se puede limpiar; esto retira la carcasa vacía en vez de dejarla para
-    siempre. Devuelve True si el directorio desapareció.
-    """
-    if not os.path.exists(path):
-        return True
-    if os.path.isfile(path):
-        try:
-            os.remove(path)
-        except OSError:
-            return False
-        return not os.path.exists(path)
-    for dirpath, dirnames, filenames in os.walk(path, topdown=False):
-        for name in filenames:
-            try:
-                os.remove(os.path.join(dirpath, name))
-            except OSError:
-                pass
-        for name in dirnames:
-            try:
-                os.rmdir(os.path.join(dirpath, name))
-            except OSError:
-                pass
-    try:
-        os.rmdir(path)
-    except OSError:
-        return False
-    return True
-
-
-def process_pending_cleanup() -> None:
-    """Completa borrados pendientes del arranque anterior.
-
-    DEBE llamarse antes de importar ``torch``/``onnxruntime`` (en ``main.py``
-    justo después de inyectar los runtimes, antes de importarlos) para que los
-    DLLs no estén todavía bloqueados. Idempotente y tolerante a errores de E/S.
-
-    Una entrada se descarta (se considera hecha) si la ruta ya no existe o si
-    el directorio que hay ahora NO es el que se registró: eso significa que el
-    runtime se reinstaló y borrarlo destruiría una instalación válida.
-    """
-    p = _pending_cleanup_path()
-    if not os.path.exists(p):
-        return
-    try:
-        with open(p, "r", encoding="utf-8") as f:
-            data = json.load(f)
-    except Exception:
-        return
-    if not isinstance(data, dict):
-        data = {}
-    entries = list(data.get("paths") or [])
-    remaining = []
-    for entry in entries:
-        path = _pending_entry_path(entry)
-        if not path:
-            continue
-        if not os.path.exists(path):
-            continue  # ya no está: nada que hacer
-        expected = _pending_entry_signature(entry)
-        if expected and _path_signature(path) != expected:
-            continue  # re-creado: es una instalación nueva, se respeta
-        try:
-            shutil.rmtree(path, ignore_errors=True)
-        except Exception:
-            pass
-        if os.path.exists(path) and not _remove_empty_dir_tree(path):
-            remaining.append(entry)
-    try:
-        if remaining:
-            with open(p, "w", encoding="utf-8") as f:
-                json.dump({"paths": remaining}, f, indent=2)
-        else:
-            os.remove(p)
-    except Exception:
-        pass
-
-
-def _rmtree_force(path: str) -> bool:
-    """Borra recursivamente ``path``; si queda algo bloqueado, lo programa
-    para el próximo arranque. Devuelve True si el borrado quedó completo."""
-    if not os.path.isdir(path):
-        try:
-            if os.path.exists(path):
-                os.remove(path)
-        except Exception:
-            pass
-        return not os.path.exists(path)
-    try:
-        shutil.rmtree(path, ignore_errors=True)
-    except Exception:
-        pass
-    if os.path.exists(path):
-        _register_pending_cleanup(path)
-        return False
-    return True
 
 
 def _dir_has_files(path: str) -> bool:
@@ -271,7 +98,7 @@ def _runtime_status(engine_id, display_name, source_url, manager_status_fn):
     installed = bool(info.get("installed"))
     version = info.get("version") or "—"
     store = ai_runtimes_manager.get_runtime_modules_dir()
-    local_bytes = _safe_dir_size(store)
+    local_bytes = fsops.safe_dir_size(store)
     gpu = bool(info.get("gpu"))
     system = bool(info.get("system"))
 
@@ -307,7 +134,20 @@ def _runtime_status(engine_id, display_name, source_url, manager_status_fn):
         else:
             detail = "No está instalado. Pulsa 'Instalar' para descargarlo."
 
-    return {
+    # Qué claves del dict del manager pasan a la fila, y cuáles no.
+    #
+    # Aquí SÍ hace falta una lista explícita, y no es la misma forma que
+    # ``_ffmpeg_status``: la fuente de aquí (``runtimes.manager.*_status``)
+    # es un SENSOR, no una fila. Sus claves son de otro esquema —``installed``,
+    # ``system``, ``gpu``— y no campos que la UI sepa leer. Si se copiase el
+    # dict entero, la fila arrastraría esas tres, y mañana el manager
+    # añadiría ``cuda_smi`` y la fila también, sin que nadie lo pidiera.
+    #
+    # En FFmpeg la fuente (``get_install_info``) YA es una fila, así que
+    # allí copiarla entera es correcto y además es lo que evita que un campo
+    # nuevo se pierda por omisión. Aquí la lista es la que manda.
+    fila = {
+        # Campos de fila que esta capa decide o traduce del sensor.
         "id": engine_id,
         "display_name": display_name,
         "kind": KIND_RUNTIME,
@@ -321,10 +161,13 @@ def _runtime_status(engine_id, display_name, source_url, manager_status_fn):
         "is_updatable": True,
         "size_bytes": local_bytes,
         "detail": detail,
-        "local": installed,
         "deletable": installed and local_bytes > 0,
+        "local": installed,
+        # ``gpu`` del manager pasa renombrado a ``gpu_available`` porque es
+        # un campo de fila; el original se queda en el sensor.
         "gpu_available": gpu,
     }
+    return fila
 
 
 def _runtime_package_downloaded(store: str, engine_id: str) -> bool:
@@ -409,7 +252,7 @@ def _slot_status(display_name, category, install_dir, kind):
                     continue
                 if _dir_has_files(sub):
                     count += 1
-                    total += _safe_dir_size(sub)
+                    total += fsops.safe_dir_size(sub)
         except Exception:
             pass
 
@@ -427,6 +270,13 @@ def _slot_status(display_name, category, install_dir, kind):
             "No models installed here yet. Use the 'AI Engines' tab to add engines."
         )
 
+    # Aquí SÍ se construye el dict entero, y es a propósito: una ranura de
+    # modelos no consulta ningún manager que le devuelva una fila —su sensor
+    # cuenta carpetas en disco— así que no hay un dict de partida que
+    # preservar. La forma de ``_ffmpeg_status`` y ``_runtime_status`` es
+    # "empezar por lo que devuelve otro y sobreescribir lo mío"; esta no
+    # tiene "otro". Lo que comparte con ellas es no depender de una lista de
+    # campos ajenos: aquí la lista es propia y completa.
     return {
         "id": None,  # list_all() lo rellena con el id del REGISTRY
         "display_name": display_name,
@@ -461,20 +311,6 @@ def _local_ffmpeg_size_or_none():
     return None
 
 
-def _safe_dir_size(path):
-    try:
-        total = 0
-        for dirpath, _, filenames in os.walk(path):
-            for name in filenames:
-                try:
-                    total += os.path.getsize(os.path.join(dirpath, name))
-                except OSError:
-                    pass
-        return total
-    except Exception:
-        return 0
-
-
 # ---------------------------------------------------------------------------
 # Estado dinámico de FFmpeg
 # ---------------------------------------------------------------------------
@@ -482,11 +318,19 @@ def _safe_dir_size(path):
 def _ffmpeg_status():
     info = ffmpeg_manager.get_install_info()
     status = info["status"]
+    build_label = info.get("build_label") or "FFmpeg"
+    sin_descarga = info.get("nothing_to_install")
     if status == STATUS_INSTALLED:
         detail = (
-            "Alojado en la propia carpeta del programa. "
+            f"Alojado en la propia carpeta del programa ({build_label}). "
             "Usa 'Update' si hay una build más reciente en el upstream."
         )
+    elif status == STATUS_MISSING and sin_descarga:
+        # Aquí no hay nada bajable, así que NO se manda a pulsar un botón que
+        # no va a funcionar. Es la misma frase que ya usan el botón, el
+        # banner y la confirmación de reinstalar: un solo enunciado para este
+        # hecho, no cuatro redacciones distintas.
+        detail = f"FFmpeg no está instalado y aquí no se puede descargar: {sin_descarga}."
     elif status == STATUS_MISSING:
         detail = (
             "FFmpeg no está instalado todavía. Pulsa 'Install' para "
@@ -494,28 +338,31 @@ def _ffmpeg_status():
         )
     else:
         detail = "FFmpeg está instalado pero no responde a -version."
-    return {
-        "id": info["id"],
-        "display_name": info["display_name"],
-        "kind": info["kind"],
+
+    # Se parte del dict que devuelve ``get_install_info`` y se sobreescribe
+    # SÓLO lo que esta capa cambia de verdad. Antes se reconstruía el dict
+    # campo por campo, y por eso un campo nuevo añadido en el manager se
+    # perdía en silencio por no estar en la lista: así es como
+    # ``nothing_to_install`` llegaba a publicarse y no llegaba nunca a la fila.
+    #
+    # Aquí se copia ENTERO a propósito, y es la diferencia con
+    # ``_runtime_status``: la fuente ya es una fila —sus claves son campos
+    # que la UI sabe leer—, así que no hay nada interno que filtrar y una
+    # lista de campos prohibidos sería otra lista que se puede quedar vieja.
+    # El riesgo que sí tiene es al revés: que un campo de la fila se pierda,
+    # y por eso se copia entero.
+    fila = dict(info)
+    fila.update({
         "status": status,
-        "version": info.get("version") or "unknown",
-        "install_dir": info["install_dir"],
-        "source_url": info.get("source_url"),
+        "build_label": build_label,
         "is_updatable": True,
-        "size_bytes": _safe_dir_size(info["install_dir"]),
+        "size_bytes": fsops.safe_dir_size(info["install_dir"]),
         "detail": detail,
         "deletable": status == STATUS_INSTALLED,
-        # Datos de upstream (para Latest/Update available en la UI)
-        "latest_fingerprint": info.get("latest_fingerprint") or {},
-        "update_available": info.get("update_available"),
-        "last_check_iso": info.get("last_check_iso"),
-        "upstream_error": info.get("upstream_error"),
-    }
+    })
+    return fila
 
 
-# ---------------------------------------------------------------------------
-# Registro
 # ---------------------------------------------------------------------------
 # Registro
 # ---------------------------------------------------------------------------
@@ -527,7 +374,6 @@ REGISTRY = [
         "status_fn": _ffmpeg_status,
         "reinstall_fn": ffmpeg_manager.force_redownload,
         "uninstall_fn": ffmpeg_manager.uninstall,
-        "open_label": "Open bin/ffmpeg folder",
         "is_updatable": True,
         # Size/introspection hook: el chain controller lo usa para capturar
         # el tamano del binario ANTES y DESPUES de la reinstalacion, y asi
@@ -543,7 +389,6 @@ REGISTRY = [
         # Se desinstala SOLO PyTorch (y sus satélites onnx/onnxscript): el store
         # es compartido con ONNX Runtime, que debe seguir funcionando.
         "uninstall_fn": lambda parent=None: _uninstall_runtime("torch", parent),
-        "open_label": "Open bin/runtimes/ai_modules",
         "is_updatable": True,
     },
     {
@@ -553,7 +398,6 @@ REGISTRY = [
         "status_fn": _onnxruntime_status,
         "reinstall_fn": ai_runtimes_manager.install_onnxruntime,
         "uninstall_fn": lambda parent=None: _uninstall_runtime("onnxruntime", parent),
-        "open_label": "Open bin/runtimes/ai_modules",
         "is_updatable": True,
     },
     {
@@ -568,7 +412,6 @@ REGISTRY = [
         ),
         "reinstall_fn": None,
         "uninstall_fn": lambda parent=None: _uninstall_category_models("Upscale"),
-        "open_label": "Open bin/models/upscale",
     },
     {
         "id": "interp_models",
@@ -582,7 +425,6 @@ REGISTRY = [
         ),
         "reinstall_fn": None,
         "uninstall_fn": lambda parent=None: _uninstall_category_models("Interpolate"),
-        "open_label": "Open bin/models/interpolate",
     },
     {
         "id": "colorize_models",
@@ -596,7 +438,6 @@ REGISTRY = [
         ),
         "reinstall_fn": None,
         "uninstall_fn": lambda parent=None: _uninstall_category_models("Colorize"),
-        "open_label": "Open bin/models/colorize",
     },
     {
         "id": "face_restore_models",
@@ -610,9 +451,86 @@ REGISTRY = [
         ),
         "reinstall_fn": None,
         "uninstall_fn": lambda parent=None: _uninstall_category_models("FaceRestore"),
-        "open_label": "Open bin/models/facerestore",
     },
 ]
+
+
+# ---------------------------------------------------------------------------
+# El contrato de una fila
+# ---------------------------------------------------------------------------
+
+# Dueños posibles de un campo de fila. Los dos primeros son los unicos que
+# puede cumplir esta capa; el tercero es el resto del mundo.
+# Los nombres llevan el prefijo DUENO_ porque ``REGISTRY`` sin mas ya es la
+# lista de entradas del registro, y reutilizarlo aqui rompia ``list_all``.
+DUENO_LIST_ALL = "list_all"    # esta capa lo garantiza
+DUENO_REGISTRY = "registro"    # esta capa lo sobrescribe desde la entrada
+DUENO_FUERA = "otra capa"      # lo trae otro, y se anota para no perderlo de vista
+
+# Esta tabla es la UNICA lista de los campos de una fila. La recorre
+# ``list_all`` para garantizar los suyos, y la usa el test del contrato para
+# comprobar que una fila de verdad trae lo que la fila de la UI lee. Anadir un
+# campo a la UI obliga a anadirlo aqui, y si no, el test lo dice.
+#
+# Cada entrada es (campo, defecto, dueño):
+#
+#   defecto - lo que esta capa pone si el ``status_fn`` no lo traia. Puede ser
+#              una funcion de (entrada del REGISTRY, fila), porque la mayoria
+#              dependen de la entrada y no de una constante.
+#   dueño    - quien lo pone de verdad. ``DUENO_LIST_ALL`` se rellena con el
+#              defecto, ``DUENO_REGISTRY`` se sobrescribe siempre, y
+#              ``DUENO_FUERA`` significa que esta capa NO lo garantiza.
+#
+# Los ultimos los lee la fila de la UI y no los garantiza ``list_all``.
+# No son adorno: son el hueco real entre lo que la fila necesita y lo que esta
+# capa promete, y por eso viven aqui con su dueño escrito en vez de estar
+# repartidos entre el docstring, el manager y el dialogo.
+#
+# Y no pueden meterse en el bucle de garantias tal cual, por una razon concreta:
+# el dialogo decide montar el selector de build con ``"build_options" in info``,
+# asi que rellenar esa clave en toda fila lo montaria tambien en torch y en las
+# ranuras de modelos. Un campo que la UI consulta con ``in`` no puede pasar a
+# estar siempre presente sin cambiar lo que se ve.
+ROW_FIELDS = (
+    # (campo, defecto, dueño)
+    ("id", lambda e, i: e.get("id"), DUENO_REGISTRY),
+    ("display_name", lambda e, i: e.get("display_name", e.get("id", "")), DUENO_LIST_ALL),
+    ("kind", lambda e, i: e.get("kind", "unknown"), DUENO_LIST_ALL),
+    ("status", STATUS_COMING_SOON, DUENO_LIST_ALL),
+    ("version", "—", DUENO_LIST_ALL),
+    ("install_dir", None, DUENO_LIST_ALL),
+    ("source_url", None, DUENO_LIST_ALL),
+    ("is_updatable", lambda e, i: bool(e.get("is_updatable", False)), DUENO_LIST_ALL),
+    ("size_bytes", 0, DUENO_LIST_ALL),
+    ("detail", "", DUENO_LIST_ALL),
+    # Su defecto mira el status, asi que esta fila tiene que ir despues de
+    # ``status`` en la tabla. No es un detalle: reordenarlo cambia el valor.
+    ("deletable", lambda e, i: i.get("status") == STATUS_INSTALLED, DUENO_LIST_ALL),
+    # --- de aqui para abajo, los lee la fila y NO los garantiza esta capa ---
+    # La version que se LEE, distinta de ``version`` (el token tal cual). Solo
+    # FFmpeg tiene las dos: en una nightly de master el token es un
+    # `git describe` que no dice la linea, y la fila necesita las dos. Es de
+    # ``ffmpeg.manager``, como ``build_label``, y la fila la lee con ``.get``
+    # y cae a ``version`` en las filas que no la traen.
+    ("version_text", None, DUENO_FUERA),
+    ("build_label", None, DUENO_FUERA),
+    ("build_id", None, DUENO_FUERA),
+    ("preferred_build_id", None, DUENO_FUERA),
+    ("latest_fingerprint", None, DUENO_FUERA),
+    # Lo lee el banner de la ventana principal, no la fila, para decir
+    # "checked 10 min ago". Vive aqui porque es un campo de fila igual
+    # que los de arriba: lo publica el manager y solo llega a FFmpeg.
+    ("last_check_iso", None, DUENO_FUERA),
+    ("upstream_error", None, DUENO_FUERA),
+    ("update_available", None, DUENO_FUERA),
+    ("nothing_to_install", None, DUENO_FUERA),
+    ("build_options", None, DUENO_FUERA),
+)
+
+
+def _defecto(entry, info, defecto):
+    """Resuelve el defecto de un campo: constante, o funcion de la entrada."""
+    return defecto(entry, info) if callable(defecto) else defecto
 
 
 # ---------------------------------------------------------------------------
@@ -626,21 +544,15 @@ def list_all() -> list[dict]:
     for entry in REGISTRY:
         status_fn: Callable = entry["status_fn"]
         info = status_fn()
-        # El id canónico es el del REGISTRY (no permitimos que status_fn lo
-        # pise con None: rompería reinstall/uninstall por clave).
-        info["id"] = entry.get("id")
-        # Asegurar campos canónicos
-        info.setdefault("display_name", entry.get("display_name", entry.get("id", "")))
-        info.setdefault("kind", entry.get("kind", "unknown"))
-        info.setdefault("status", STATUS_COMING_SOON)
-        info.setdefault("version", "—")
-        info.setdefault("install_dir", None)
-        info.setdefault("source_url", None)
-        info.setdefault("is_updatable", bool(entry.get("is_updatable", False)))
-        info.setdefault("size_bytes", 0)
-        info.setdefault("detail", "")
-        info.setdefault("deletable", info.get("status") == STATUS_INSTALLED)
-        info["open_label"] = entry.get("open_label", "Open folder")
+        # Los campos garantizados, en el orden que dicta ROW_FIELDS.
+        for campo, defecto, dueno in ROW_FIELDS:
+            if dueno == DUENO_REGISTRY:
+                # El id canonico es el del REGISTRY (no permitimos que
+                # status_fn lo pise con None: romperia reinstall/uninstall por
+                # clave), asi que este se sobrescribe y no se rellena.
+                info[campo] = _defecto(entry, info, defecto)
+            elif dueno == DUENO_LIST_ALL:
+                info.setdefault(campo, _defecto(entry, info, defecto))
         out.append(info)
     return out
 
@@ -653,6 +565,10 @@ def reinstall(dep_id: str, progress_callback: Optional[Callable[[int], None]] = 
     instalador subyacente para que Instalar/Actualizar se pueda cancelar y
     nunca cuelgue indefinidamente. Todo ``reinstall_fn`` del REGISTRY debe
     aceptar estos dos parámetros opcionales.
+
+    No hay parámetro de "qué versión": la build que se reinstala la decide
+    cada instalador, y el de FFmpeg la lee de la preferencia (que es la
+    elegida en su fila del panel).
     """
     ensure_runtime_dirs()
     for entry in REGISTRY:
@@ -663,10 +579,8 @@ def reinstall(dep_id: str, progress_callback: Optional[Callable[[int], None]] = 
             raise RuntimeError(
                 f"{dep_id} no tiene instalador automático todavía (coming soon)."
             )
-        fn(
-            progress_callback=progress_callback, parent=parent,
-            abort_event=abort_event, timeout=timeout,
-        )
+        fn(progress_callback=progress_callback, parent=parent,
+           abort_event=abort_event, timeout=timeout)
         return True
     raise KeyError(f"Dependencia desconocida: {dep_id}")
 
@@ -677,7 +591,7 @@ def uninstall(dep_id: str, parent=None) -> bool:
     Lanza excepción si la dependencia no admite borrado o el borrado falla
     (la UI traduce el error). Para runtimes y FFmpeg con archivos bloqueados
     por Windows, el borrado se programa para el próximo arranque
-    (``process_pending_cleanup()``).
+    (``src.fsops.process_pending_cleanup()``).
     """
     ensure_runtime_dirs()
     for entry in REGISTRY:
@@ -703,7 +617,7 @@ def remove_local_path(path: str) -> bool:
     True si el borrado quedó completo; si algún archivo queda bloqueado, se
     programa para el próximo arranque.
     """
-    return _rmtree_force(path)
+    return fsops.rmtree_force(path)
 
 
 def _uninstall_category_models(category: str, parent=None) -> None:
@@ -723,7 +637,7 @@ def _uninstall_category_models(category: str, parent=None) -> None:
         for sub in os.listdir(cat_dir):
             target = os.path.join(cat_dir, sub)
             if os.path.isdir(target):
-                _rmtree_force(target)
+                fsops.rmtree_force(target)
     try:
         states = all_states()
     except Exception:

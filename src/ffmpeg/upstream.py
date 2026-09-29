@@ -31,10 +31,15 @@ from email.utils import parsedate_to_datetime
 import requests
 
 from src.config import (
-    FFMPEG_DOWNLOAD_URLS,
     UPSTREAM_CHECK_CACHE_HOURS,
     ensure_runtime_dirs,
     get_ffmpeg_dir,
+)
+from src.ffmpeg.builds import (
+    ensure_utc,
+    get_active_url,
+    parse_timestamp,
+    timestamp_age_hours,
 )
 
 
@@ -84,38 +89,26 @@ def clear_cache():
 # ---------------------------------------------------------------------------
 
 def _parse_http_date(value):
-    """Parse RFC 1123 / 850 / asctime date. Returns aware datetime or None."""
+    """Parse RFC 1123 / 850 / asctime date. Returns aware datetime or None.
+
+    El formato es de otra clase —una cabecera, no una marca ISO de la app—, asi
+    que el parseo no se comparte con ``builds.parse_timestamp``. Lo que si se
+    comparte es lo que pasa despues, y eso lo decide ``builds.ensure_utc``:
+    una cabecera sin zona significa UTC igual que una marca ISO sin zona.
+    """
     if not value:
         return None
     try:
         dt = parsedate_to_datetime(value)
-        if dt is None:
-            return None
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        return dt
+        return ensure_utc(dt)
     except Exception:
         return None
-
-
-def _cache_age_hours(cache):
-    cached_at = cache.get("checked_at")
-    if not cached_at:
-        return float("inf")
-    try:
-        dt = datetime.fromisoformat(cached_at)
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        return (datetime.now(timezone.utc) - dt).total_seconds() / 3600.0
-    except Exception:
-        return float("inf")
 
 
 def _iso(dt):
     if not isinstance(dt, datetime):
         return None
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
+    dt = ensure_utc(dt)
     return dt.isoformat()
 
 
@@ -168,13 +161,8 @@ def _platform_name(name=None):
     return name or _platform.system()
 
 
-def get_active_url(platform_name=None):
-    info = FFMPEG_DOWNLOAD_URLS.get(_platform_name(platform_name))
-    return info.get("url") if info else None
-
-
 def get_fingerprint(platform_name=None, force=False):
-    """Devuelve la huella upstream (dict) para la plataforma actual.
+    """Devuelve la huella upstream (dict) de la build elegida.
 
     Si el cache tiene menos de ``UPSTREAM_CHECK_CACHE_HOURS`` se devuelve
     directamente. Si no, se hace un HEAD fresco y se actualiza el cache.
@@ -191,7 +179,9 @@ def get_fingerprint(platform_name=None, force=False):
         return {}
 
     cache = read_cache()
-    age = _cache_age_hours(cache)
+    # La edad la calcula builds, que es su unico dueño: con ``inf`` cuando no
+    # hay ``checked_at`` utilizable, y la comparacion de abajo sale sola.
+    age = timestamp_age_hours(cache.get("checked_at"))
     if (
         not force
         and cache.get("url") == url
@@ -263,19 +253,17 @@ def is_update_available(local_manifest, fingerprint):
     if not (upstream_lm or upstream_cl or upstream_etag):
         return None
 
-    # Instalación manual (el usuario copió el binario a mano): no hay
-    # referencia de huella instalada ni modo de comparar — no declarar
-    # "update available" para siempre. El manifest manual se distingue
-    # de un manifest vacío {} (que sí sugiere update conservador).
+    # Manifest copiado a mano: nadie sabe de dónde salió ese binario, así que
+    # cualquier comparación sería inventada. No hay update que ofrecer.
     if (local_manifest or {}).get("source") == "manual-copy":
         return False
 
-    # Sin huella de instalación Y tenemos huella upstream → conservador: Sí,
-    # salvo que sepamos que el upstream estuvo caído (en ese caso no mentimos).
+    # Sin huella de instalación no hay evidencia de que el upstream haya
+    # cambiado: una instalación hecha sin red deja el manifest sin huella y
+    # ofrecer "Actualizar" sería ofrecer volver a bajar el mismo fichero. Por
+    # eso se dice "no lo sabemos" en vez de un True conservador.
     if stored_lm is None and stored_cl is None and stored_etag is None:
-        if fingerprint.get("last_error"):
-            return None  # network down + sin referencia → no sabemos
-        return True
+        return None
 
     # ETag / Content-Length arriba del todo: si la build se reconstruyó con
     # el mismo timestamp (poco habitual pero posible) estos dos son los
@@ -297,27 +285,15 @@ def is_update_available(local_manifest, fingerprint):
     # reciente. Si es más antiguo (rollback) sin cambios de tamaño/etag,
     # mantenemos el False.
     if stored_lm and upstream_lm:
-        try:
-            def _parse(iso):
-                if iso.endswith("Z"):
-                    iso = iso[:-1] + "+00:00"
-                return datetime.fromisoformat(iso)
-            delta = _parse(upstream_lm) - _parse(stored_lm)
-            if delta.total_seconds() > 0:
+        # La 'Z' y el UTC los decide builds: la 'Z' en parse_timestamp, el UTC
+        # en ensure_utc. Que no lo decidan dos sitios a la vez es lo que evita
+        # que una 'Z' signifique una cosa aqui y otra alla.
+        upstream_dt = parse_timestamp(upstream_lm)
+        stored_dt = parse_timestamp(stored_lm)
+        # Una marca que no se puede leer no es "mas nueva": aqui se cae al
+        # False de siempre, que es lo que hacia el except de antes.
+        if upstream_dt is not None and stored_dt is not None:
+            if upstream_dt > stored_dt:
                 return True
-        except Exception:
-            pass
 
     return False
-
-
-def freshness_label(cache):
-    """Texto humano para mostrar junto al valor 'Last check: …' del panel."""
-    age = _cache_age_hours(cache)
-    if age == float("inf"):
-        return "never"
-    if age < 1:
-        return f"{int(age * 60)} min ago"
-    if age < 24:
-        return f"{int(age)} h ago"
-    return f"{int(age / 24)} d ago"

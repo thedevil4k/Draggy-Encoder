@@ -24,6 +24,7 @@ from src.ffmpeg.manager import ensure_ffmpeg
 from src.hardware.detector import get_hardware_summary
 from src.ui.loading_dialog import LoadingDialog
 from src.ui.main_window import MainWindow
+from src.ui.selectable import install_text_selection
 
 
 def _set_windows_app_user_model_id():
@@ -206,6 +207,10 @@ class DraggyEncoderApp:
         self.app = QApplication(sys.argv)
         self.app.setApplicationName(APP_NAME)
         self.app.setStyle("Fusion")
+        # Una sola política para todo el programa: cualquier texto se puede
+        # seleccionar y copiar. Va aquí, con la QApplication, para que también
+        # la alcancen los cuadros de diálogo que se abren más adelante.
+        install_text_selection(self.app)
         # El logo del programa es el mismo icono que el botón Import de
         # la cadena: un único asset en toda la app.
         logo_path = get_asset_path("Import.png")

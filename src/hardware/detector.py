@@ -391,11 +391,42 @@ def get_system_summary():
     }
 
 
+# La respuesta a "¿qué hardware tiene este equipo?" tiene un dueño, y es este
+# módulo. Quien la necesite la lee de aquí en vez de preguntársela a la ventana
+# que la obtuvo: eso convertía "no lo sé" en "no hay GPU" en cuanto el
+# consumidor no resultaba ser esa ventana, y el selector de versiones pintaba
+# un neutro que parecía una elección del usuario.
+_KNOWN_HARDWARE = None
+
+
+def remember_hardware(summary):
+    """Publica una detección ya hecha y la devuelve.
+
+    La llama quien ya la tiene en la mano; ``get_hardware_summary()`` publica
+    la suya por su cuenta, así que en el uso normal no hace falta llamarla.
+    """
+    global _KNOWN_HARDWARE
+    _KNOWN_HARDWARE = summary
+    return summary
+
+
+def get_known_hardware():
+    """El hardware ya detectado en este proceso, o ``None`` si no se ha
+    detectado ninguno.
+
+    ``None`` quiere decir "no lo sabemos" y ``{"gpus": []}`` quiere decir "lo
+    sabemos y no hay GPU dedicada". No es lo mismo y no se colapsan: el
+    selector de versiones pinta el primero como "sin comprobar" y el segundo
+    como "da igual cuál elijas".
+    """
+    return _KNOWN_HARDWARE
+
+
 def get_hardware_summary():
     cpu = get_cpu_info()
     gpus = get_gpu_info()
     system = get_system_summary()
-    return {
+    return remember_hardware({
         "cpu": cpu,
         "gpus": gpus,
         "recommended_device": get_recommended_device(gpus),
@@ -406,7 +437,7 @@ def get_hardware_summary():
             "executable": system["python_executable"],
             "bits": system["python_bits"],
         },
-    }
+    })
 
 
 if __name__ == "__main__":

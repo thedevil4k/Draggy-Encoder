@@ -30,7 +30,8 @@ import tempfile
 import threading
 import time
 
-from src.config import ensure_runtime_dirs, get_bin_dir
+from src import fsops
+from src.config import get_bin_dir
 
 
 RUNTIME_MODULES_DIR = os.path.join(get_bin_dir(), "runtimes", "ai_modules")
@@ -2685,9 +2686,7 @@ def _schedule_aside_cleanup() -> None:
     if not os.path.isdir(aside):
         return
     try:
-        from src.dependencies import _rmtree_force
-
-        _rmtree_force(aside)
+        fsops.rmtree_force(aside)
     except Exception:
         _rmtree_quiet(aside)
 
@@ -2717,9 +2716,7 @@ def cleanup_install_leftovers() -> int:
     aside = _aside_dir()
     if os.path.isdir(aside) and _looks_like_store(aside):
         try:
-            from src.dependencies import _rmtree_force
-
-            _rmtree_force(aside)
+            fsops.rmtree_force(aside)
         except Exception:
             _rmtree_quiet(aside)
         if not os.path.isdir(aside):
@@ -3392,8 +3389,6 @@ def _uninstall_runtime_group(dep_id: str) -> tuple[bool, list[str]]:
     debe seguir funcionando. Lo que quede huérfano se limpia en la siguiente
     instalación, que reemplaza el paquete y sus metadatos a la vez.
     """
-    from src.dependencies import _rmtree_force
-
     prefixes = _runtime_group_prefixes(dep_id)
     if not prefixes:
         raise RuntimeError(f"Runtime desconocido: {dep_id}")
@@ -3410,7 +3405,7 @@ def _uninstall_runtime_group(dep_id: str) -> tuple[bool, list[str]]:
     leftovers: list[str] = []
     for entry in targets:
         path = os.path.join(RUNTIME_MODULES_DIR, entry)
-        complete = _rmtree_force(path)
+        complete = fsops.rmtree_force(path)
         if not complete or os.path.exists(path):
             leftovers.append(path)
 
@@ -3447,14 +3442,10 @@ def uninstall_local_runtimes(parent=None) -> None:
     :func:`uninstall_runtime` para respetar el otro runtime.
 
     En Windows, si algún DLL está cargado (runtime ya importado),
-    ``dependencies._rmtree_force`` lo programa para el próximo arranque.
+    ``fsops.rmtree_force`` lo programa para el próximo arranque.
     """
-    try:
-        from src.dependencies import _rmtree_force
-    except Exception:
-        return
     if os.path.isdir(RUNTIME_MODULES_DIR):
-        _rmtree_force(RUNTIME_MODULES_DIR)
+        fsops.rmtree_force(RUNTIME_MODULES_DIR)
     _invalidate_store_probe_cache()
 
 
@@ -3487,32 +3478,11 @@ def get_status() -> dict:
         "install_dir": RUNTIME_MODULES_DIR,
         "source_url": "https://pytorch.org/get-started/locally/",
         "is_updatable": True,
-        "size_bytes": _safe_dir_size(RUNTIME_MODULES_DIR),
+        "size_bytes": fsops.safe_dir_size(RUNTIME_MODULES_DIR),
         "detail": detail,
         "torch": torch,
         "onnx": onnx,
     }
-
-
-# ---------------------------------------------------------------------------
-# Private helpers
-# ---------------------------------------------------------------------------
-
-
-def _safe_dir_size(path: str) -> int:
-    if not os.path.isdir(path):
-        return 0
-    total = 0
-    try:
-        for dirpath, _, filenames in os.walk(path):
-            for name in filenames:
-                try:
-                    total += os.path.getsize(os.path.join(dirpath, name))
-                except OSError:
-                    pass
-    except Exception:
-        pass
-    return total
 
 
 # ---------------------------------------------------------------------------
@@ -3566,8 +3536,8 @@ def ensure_runtime_dlls_on_path() -> None:
                         extra.append(d)
 
     # Canal fiable: os.add_dll_directory (passed to LoadLibraryExW con
-    # LOAD_LIBRARY_SEARCH_USER_DIRS). Se llama de nuevo al重複idempotente
-    # (el handle interno vive hasta process exit; no duplica).
+    # LOAD_LIBRARY_SEARCH_USER_DIRS). Se llama de nuevo aunque se repita:
+    # es idempotente (el handle interno vive hasta process exit).
     for d in extra:
         try:
             os.add_dll_directory(d)

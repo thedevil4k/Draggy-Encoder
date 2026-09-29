@@ -30,6 +30,7 @@ from PySide6.QtWidgets import (
 
 from src.config import APP_NAME, get_asset_path
 import src.preferences as preferences
+from src.ffmpeg import builds
 from src.ffmpeg.runner import get_audio_streams, get_video_info, health_check_ffmpeg
 from src.ffmpeg.process_supervisor import ProcessSupervisor
 from src.processing.pipeline import (
@@ -44,12 +45,15 @@ from src.last_job import has_last_job as has_pending_last_job
 from src.last_job import load_last_job as load_pending_last_job
 from src.last_job import save_last_job as persist_last_job
 from src.ui.dependencies_dialog import DependenciesDialog
+from src.ui.dep_row import humanize_age
+from src.task_persist import phase_writer
 from src.ui.hardware_dialog import HardwareDialog
 from src.ui.preferences_dialog import PreferencesDialog
 from src.ui.preview_dialog import PreviewDialog
 from src.ui.audio_preview import AudioPreviewEngine
 from src.ui.settings_panel import SettingsPanel
 from src.ui.tasks_panel import TasksPanel
+from src.ui.tray_dashboard import TrayController, eta_text
 from src.ui.update_banner import UpdateBanner
 from src.ui.update_chain import _UpdateChainController, notify_log
 from src.runtimes.manager import (
@@ -158,6 +162,10 @@ class CompressionWorker(QThread):
     progress = Signal(int)
     status_message = Signal(str)
     phase_ev = Signal(dict)
+    # Cifras de throughput (fps, multiplicador). Van aparte de ``phase_ev``
+    # porque no son fases: no se guardan en el historial, no abren filas en el
+    # panel y no se pintan alli. Solo las mira el desplegable de la bandeja.
+    metrics_ev = Signal(dict)
 
     def __init__(self, ffmpeg_path, input_path, output_path, settings, mode="compress",
                  ai_engines=None, abort_event=None):
@@ -205,6 +213,7 @@ class CompressionWorker(QThread):
         try:
             status_cb = self._emit_status
             phase_cb = self._emit_phase
+            metrics_cb = self._emit_metrics
             preflight_errors = validate_render_preflight(
                 self.ffmpeg_path,
                 self.input_path,
@@ -274,6 +283,7 @@ class CompressionWorker(QThread):
                         on_processes=self._register_process,
                         phase_cb=phase_cb,
                         supervisor=self.supervisor,
+                        metrics_cb=metrics_cb,
                     )
                 else:
                     status_cb("AI preview: rendering the selected chain...")
@@ -290,6 +300,7 @@ class CompressionWorker(QThread):
                         on_processes=self._register_process,
                         phase_cb=phase_cb,
                         supervisor=self.supervisor,
+                        metrics_cb=metrics_cb,
                     )
                     self.success = bool(
                         self.preview_original and self.preview_compressed
@@ -307,6 +318,7 @@ class CompressionWorker(QThread):
                     on_process=self._register_process,
                     phase_cb=phase_cb,
                     supervisor=self.supervisor,
+                    metrics_cb=metrics_cb,
                 )
             elif self.mode == "preview":
                 self.preview_original, self.preview_compressed, self.preview_artifacts = generate_preview(
@@ -318,9 +330,9 @@ class CompressionWorker(QThread):
                     ai_engines=self.ai_engines,
                     abort_event=self.abort_event,
                     on_process=self._register_process,
-                    on_processes=self._register_process,
                     phase_cb=phase_cb,
                     supervisor=self.supervisor,
+                    metrics_cb=metrics_cb,
                 )
                 self.success = bool(
                     self.preview_original and self.preview_compressed
@@ -338,6 +350,12 @@ class CompressionWorker(QThread):
     def _emit_phase(self, ev):
         try:
             self.phase_ev.emit(dict(ev or {}))
+        except Exception:
+            pass
+
+    def _emit_metrics(self, ev):
+        try:
+            self.metrics_ev.emit(dict(ev or {}))
         except Exception:
             pass
 
@@ -735,13 +753,17 @@ class MainWindow(QMainWindow):
         self._setup_ui()
 
     def _setup_tray_icon(self):
-        """Inicializa un QSystemTrayIcon estable para notificaciones nativas.
+        """El icono de la bandeja: el desplegable y las dos salidas.
 
-        Solo lo usamos para showMessage() al terminar una auto-update al
-        cerrar el programa. Si el sistema no soporta tray (ej. Linux sin
-        shell adecuado), el icono queda inactivo; el programa sigue
-        funcionando porque _notify_completion tiene fallback a log.
+        Toda la logica vive en ``TrayController`` —el menu, el temporizador de
+        muestreo y el canal de metricas—, que se puede probar sin montar esta
+        ventana. Aqui solo se comprueba si hay bandeja, se construye el
+        controlador con sus dos callbacks, y se le entrega el menu.
+
+        Sin bandeja (``tray_icon is None``) el programa sigue igual, que es lo
+        que pasaba antes de que existiera el desplegable.
         """
+        self._tray = None
         if not QSystemTrayIcon.isSystemTrayAvailable():
             self.tray_icon = None
             return
@@ -752,12 +774,48 @@ class MainWindow(QMainWindow):
             icon = QGuiApplication.windowIcon()
         self.tray_icon = QSystemTrayIcon(icon, self)
         self.tray_icon.setToolTip("DRAGGY ENCODER")
-        # Menu contextual minimo: salir del programa.
-        menu = QMenu(self)
-        action_quit = menu.addAction("Quit DRAGGY ENCODER")
-        action_quit.triggered.connect(self.close)
-        self.tray_icon.setContextMenu(menu)
+        self._tray = TrayController(
+            self, on_open=self._on_tray_show, on_quit=self.close)
+        self.tray_icon.setContextMenu(self._tray.menu())
         self.tray_icon.show()
+
+    def _on_tray_show(self):
+        """Traer la ventana al frente sin stealar el foco a ciegas.
+
+        ``showNormal`` + ``raise_`` + ``activateWindow``: en Windows, si la
+        ventana estaba minimizada hay que restaurar antes de traerla, o la
+        llamada se queda en el aire sin error.
+        """
+        try:
+            if self.isMinimized():
+                self.showNormal()
+            else:
+                self.show()
+            self.raise_()
+            self.activateWindow()
+        except Exception:
+            pass
+
+    def _tray_sampling_start(self):
+        """Avisa de que hay un render en marcha. La bandeja se encarga."""
+        if self._tray is not None:
+            self._tray.start()
+            self._tray.set_task(getattr(self, "_current_task_name", ""))
+            if getattr(self, "_queue_active", False):
+                self._tray.set_queue(
+                    getattr(self, "_queue_done", 0),
+                    getattr(self, "_queue_total", 0),
+                )
+
+    def _tray_sampling_stop(self):
+        """Se acabó el render: se para el muestreo y se suelta NVML."""
+        if self._tray is not None:
+            self._tray.stop()
+
+    def _on_worker_metrics(self, ev):
+        """Cifras del worker. Vive en el hilo de la GUI."""
+        if self._tray is not None:
+            self._tray.update_metrics(ev)
 
     def _setup_ui(self):
         self.setWindowTitle(f"{APP_NAME} v1")
@@ -1530,7 +1588,15 @@ class MainWindow(QMainWindow):
             if install_engine_id:
                 # Disparar la instalación del motor seleccionado en el buscador.
                 dialog._on_engine_install(install_engine_id)
-            dialog.exec()
+            # Registrado mientras está abierto para que una redetección de
+            # hardware pueda repintarlo; se borra al cerrar, igual que
+            # ``_hardware_dialog``. Sin esta referencia el panel seguiría
+            # enseñando un veredicto viejo hasta que el usuario lo cerrara.
+            self._dependencies_dialog = dialog
+            try:
+                dialog.exec()
+            finally:
+                self._dependencies_dialog = None
         except Exception as exc:
             import traceback
             traceback.print_exc()
@@ -1625,6 +1691,22 @@ class MainWindow(QMainWindow):
            variantes-update.
         7. Resto: cierre normal sin propuesta.
         """
+        # Lo que el escritor de fases tenga pendiente se escribe antes de
+        # nada: aunque el cierre se acabe ignorando, el progreso ya esta en el
+        # archivo antes de que se vuelva a mirar.
+        #
+        # ``take_unwritten`` devuelve True si habia algo sin avisar, y se lo
+        # guarda para no repetir la noticia. Si lo hay, se avisa: el archivo
+        # se queda en su ultimo estado correcto y el usuario sabe que hay un
+        # render que no quedo guardado. Cerrar igualmente: quedarse aqui para
+        # siempre seria el "no responde" que esto vino a quitar.
+        try:
+            if phase_writer.take_unwritten():
+                logger.warning(
+                    "Cerrando con progreso sin escribir: el archivo de tareas "
+                    "se queda en su ultimo estado correcto.")
+        except Exception:
+            pass
         # La escucha de efectos abre un ffmpeg y un reproductor: se detienen
         # siempre, pase lo que pase con la cadena de auto-actualización, para
         # no dejar audio sonando ni un proceso huérfano tras cerrar.
@@ -2125,25 +2207,36 @@ class MainWindow(QMainWindow):
         last_mod_iso = (info.get("latest_fingerprint") or {}).get("last_modified_iso")
 
         if update_available is True:
-            title = "FFmpeg update available"
+            # En una plataforma sin mirrors no hay nada que ofrecer, aunque el
+            # upstream diga que hay versión nueva: anunciarla con el botón
+            # Update vivo sería prometer una descarga que va a fallar. La
+            # misma política que vacía el selector dice aquí que no hay nada.
+            #
+            # La plataforma se nombra explícitamente en vez de dejar que la
+            # política la busque: el selector la recibe en sus datos, y este
+            # banner va del equipo en el que corre, así que los tres leen de
+            # un solo sitio y no pueden acabar hablando de sistemas distintos.
+            plataforma = builds.current_platform()
+            sin_descarga = builds.nothing_to_offer_reason(plataforma)
+            if sin_descarga:
+                # El motivo viene en minúscula para poder ir en medio de una
+                # frase; aquí empieza párrafo, así que sólo se sube la primera
+                # letra (``.capitalize()`` hundiría "FFmpeg" y "Darwin").
+                self.update_banner.show_offline(
+                    "FFmpeg not available for this system",
+                    sin_descarga[:1].upper() + sin_descarga[1:] + ".",
+                )
+                return
+            title = f"FFmpeg update available: {builds.chosen_build_label()}"
             detail_bits = []
             if last_mod_iso:
                 detail_bits.append(f"upstream build {last_mod_iso.split('T', 1)[0]}")
-            if last_checked:
-                try:
-                    from datetime import datetime, timezone
-                    dt = datetime.fromisoformat(last_checked)
-                    if dt.tzinfo is None:
-                        dt = dt.replace(tzinfo=timezone.utc)
-                    hours = (datetime.now(timezone.utc) - dt).total_seconds() / 3600.0
-                    if hours < 1:
-                        detail_bits.append(f"checked {int(hours * 60)} min ago")
-                    elif hours < 24:
-                        detail_bits.append(f"checked {hours:.1f} h ago")
-                    else:
-                        detail_bits.append(f"checked {hours / 24:.1f} d ago")
-                except Exception:
-                    pass
+            # La edad la formatea dep_row, que es su unico dueño: la fila del
+            # panel y este banner dicen lo mismo para el mismo instante. Aqui
+            # solo se decide si la frase se añade; sin fecha, no se añade.
+            age = humanize_age(last_checked)
+            if age:
+                detail_bits.append(f"checked {age}")
             if info.get("upstream_error"):
                 self.update_banner.show_offline(
                     "FFmpeg status unavailable",
@@ -2168,6 +2261,16 @@ class MainWindow(QMainWindow):
                 "Ya hay una actualizacion de FFmpeg en curso. Espera a que termine.",
             )
             return
+        # El banner ya avisa de esto, pero el botón se puede pulsar igual
+        # (queda vivo de un estado anterior). Preguntar "¿Descargar X?" aquí
+        # sería prometer la misma descarga imposible que el banner ya niega.
+        sin_descarga = builds.nothing_to_offer_reason(builds.current_platform())
+        if sin_descarga:
+            QMessageBox.information(
+                self, "FFmpeg not available for this system",
+                f"No se puede descargar FFmpeg en este sistema: {sin_descarga}.",
+            )
+            return
         try:
             from src.ffmpeg.manager import get_install_info
             info = get_install_info()
@@ -2175,15 +2278,18 @@ class MainWindow(QMainWindow):
             cl = (info.get("latest_fingerprint") or {}).get("content_length")
             if cl:
                 size_mb = f"{int(cl) / (1024 * 1024):.1f} MB"
+            build_label = builds.chosen_build_label()
         except Exception:
             size_mb = "?"
+            build_label = "FFmpeg"
 
         confirm = QMessageBox.question(
             self,
             "Update FFmpeg now",
-            f"Descargar la build mas reciente de FFmpeg ({size_mb}) ahora?\n"
-            "El binario actual sera reemplazado. Cualquier compresion en curso "
-            "se abortara.",
+            f"Descargar {build_label} ({size_mb}) ahora?\n"
+            "Se comprueba que arranca antes de tocar nada: si la descarga, la "
+            "extraccion o la comprobacion fallan, el FFmpeg que tienes ahora "
+            "sigue instalado. Cualquier compresion en curso se abortara.",
         )
         if confirm != QMessageBox.StandardButton.Yes:
             return
@@ -2454,20 +2560,7 @@ class MainWindow(QMainWindow):
             return
         self.tasks_panel.update_phase_event(task_id, ev)
         try:
-            import src.task_history as task_history
-            phase_status = {
-                "start": "pending",
-                "progress": "running",
-                "end": "done",
-                "failed": "failed",
-            }.get(ev.get("ev"), "pending")
-            task_history.update_phase(
-                task_id,
-                ev.get("id", ""),
-                label=ev.get("label", ""),
-                status=phase_status,
-                pct=int(ev.get("pct", 0) or 0),
-            )
+            phase_writer.note_phase_event(task_id, ev)
         except Exception:
             pass
 
@@ -2476,8 +2569,9 @@ class MainWindow(QMainWindow):
         if task_id:
             self.tasks_panel.mark_finished(task_id, status)
             try:
-                import src.task_history as task_history
-                task_history.finish_task(task_id, status)
+                # El orden —fases antes que cierre— y el aviso viven en el
+                # escritor; el panel no lee el veredicto.
+                phase_writer.finish_task(task_id, status)
             except Exception:
                 pass
         self._preview_task_id = None
@@ -2565,6 +2659,10 @@ class MainWindow(QMainWindow):
         task_name = os.path.basename(src)
         if mode == "preview":
             task_name += " (preview)"
+        # Como atributo y no como variable local: es lo que enseña el nombre
+        # del desplegable de la bandeja, que no tiene otra forma de saber
+        # sobre qué render va la barra.
+        self._current_task_name = task_name
         self.tasks_panel.get_or_create(self._current_task_id, task_name)
         self.tasks_panel._cards[self._current_task_id].set_running()
         try:
@@ -2602,27 +2700,30 @@ class MainWindow(QMainWindow):
         # Direct slot + QueuedConnection: el callback SIEMPRE corre en el
         # hilo de la GUI. Lambda en hilo secundario fallaria silenciosamente.
         self.worker.finished.connect(self._on_worker_finished, Qt.ConnectionType.QueuedConnection)
+        self.worker.metrics_ev.connect(self._on_worker_metrics)
+        self._tray_sampling_start()
         self.worker.start()
         # Worker ya asignado: re-sincronizar botones (habilita Abort).
         self._update_action_buttons()
 
     def _on_worker_progress(self, value):
-        """Actualiza la barra + ETA estimado a partir del throughput medido."""
+        """Actualiza la barra + ETA estimado a partir del throughput medido.
+
+        El ETA lo calcula ``tray_dashboard.eta_text`` y no esta codigo: la
+        barra y el desplegable de la bandeja enseñan el mismo numero, y si el
+        formato viviese en los dos sitios acabarían discrepando sobre el
+        mismo render.
+        """
         self.progress.setValue(value)
+        eta = None
         try:
             elapsed = time.time() - getattr(self, "_worker_started", time.time())
-            if value > 1 and elapsed > 2:
-                remaining = elapsed * (100 - value) / value
-                mm, ss = divmod(int(remaining), 60)
-                hh, mm = divmod(mm, 60)
-                if hh:
-                    self.progress.setFormat(f"%p%  ·  ETA ~{hh}h {mm:02d}m {ss:02d}s")
-                else:
-                    self.progress.setFormat(f"%p%  ·  ETA ~{mm:02d}:{ss:02d}")
-            else:
-                self.progress.setFormat("%p%")
+            eta = eta_text(elapsed, value)
+            self.progress.setFormat(f"%p%  ·  {eta}" if eta else "%p%")
         except Exception:
             pass
+        if self._tray is not None:
+            self._tray.update_progress(value, eta)
 
     def _on_status_message(self, message):
         """Estado del worker: label + log del panel lateral."""
@@ -2635,42 +2736,38 @@ class MainWindow(QMainWindow):
         if not task_id:
             return
         self.tasks_panel.update_phase_event(task_id, ev)
-        if getattr(self, "_queue_active", False):
-            try:
-                import src.task_queue as task_queue
-                phase_id = str(ev.get("id", ""))
-                phase_ev = str(ev.get("ev", ""))
-                if phase_ev == "failed":
-                    task_queue.set_status(task_id, "failed", error=ev.get("msg", ""))
-                elif phase_id == "mux" and phase_ev in ("start", "progress"):
-                    task_queue.set_status(task_id, "muxing")
-            except Exception:
-                pass
         try:
-            import src.task_history as task_history
-            phase_status = {
-                "start": "pending",
-                "progress": "running",
-                "end": "done",
-                "failed": "failed",
-            }.get(ev.get("ev"), "pending")
-            task_history.update_phase(
-                task_id,
-                ev.get("id", ""),
-                label=ev.get("label", ""),
-                status=phase_status,
-                pct=int(ev.get("pct", 0) or 0),
-            )
+            # El historial y la cola los escribe un hilo aparte. Aqui esto es
+            # solo una anotacion en memoria: antes se escribia en este mismo
+            # hilo, y cada escritura releia y reescribia el archivo entero con
+            # fsync, una vez por fase y por fotograma, con la GUI esperando al
+            # disco justo cuando el disco esta mas lleno. Lo que se ve —barra,
+            # estado, tarjetas— lo sigue pintando esta misma senal, igual y en el
+            # mismo orden, porque eso no se ha tocado.
+            #
+            # Aqui no queda ninguna condicion: que un evento cierre la fase, y
+            # que un cierre se escriba entero y sin fundirse, lo decide el
+            # modulo. La ventana solo dice si hay una cola en marcha.
+            phase_writer.note_render_event(
+                task_id, ev, getattr(self, "_queue_active", False))
         except Exception:
             pass
 
     def _mark_task_finished(self, status):
         task_id = getattr(self, "_current_task_id", None)
+        # El muestreo de la bandeja para aqui y no despues de escribir el
+        # cierre: un temporizador vivo sobre un widget que ya no pinta es un
+        # temporador que sobrevive a la tarea.
+        self._tray_sampling_stop()
         if task_id:
             self.tasks_panel.mark_finished(task_id, status)
             try:
-                import src.task_history as task_history
-                task_history.finish_task(task_id, status)
+                # Las fases pendientes salen antes que el cierre: si el archivo
+                # dice "success" tiene que decir tambien hasta donde llego. El
+                # orden y el aviso viven en el escritor; aqui no se mira el
+                # veredicto, porque el panel no es quien decide si algo se
+                # guardo.
+                phase_writer.finish_task(task_id, status)
             except Exception:
                 pass
         self._current_task_id = None
@@ -3281,6 +3378,25 @@ class MainWindow(QMainWindow):
         except Exception:
             logger.debug("could not refresh the hardware dialog", exc_info=True)
 
+    def _refresh_dependencies_dialog(self):
+        """Repinta el panel de dependencias si está abierto.
+
+        El selector de builds manda al usuario a 'Re-detect Hardware &
+        Codecs' cuando no pudo leer el hardware, así que cuando esa
+        redetección termina y el panel sigue en pantalla tiene que ver el
+        veredicto nuevo sin cerrarlo. Si no hay panel abierto, no hay nada
+        que hacer y aquí no pasa nada.
+        """
+        dialog = getattr(self, "_dependencies_dialog", None)
+        if dialog is None:
+            return
+        try:
+            dialog.repopulate()
+        except Exception:
+            logger.debug(
+                "could not refresh the dependencies dialog", exc_info=True
+            )
+
     def _on_redetect_done(self, hardware_info, compatible_codecs):
         self._set_redetect_busy(False)
         self.btn_compress.setEnabled(bool(self.input_path))
@@ -3302,6 +3418,7 @@ class MainWindow(QMainWindow):
         recommended = hardware_info.get("recommended_device", "CPU")
         self.settings_panel.set_device(recommended)
         self._refresh_hardware_dialog(hardware_info, compatible_codecs)
+        self._refresh_dependencies_dialog()
         self.status_label.setText("Re-detection finished.")
 
     def _on_redetect_error(self, msg):

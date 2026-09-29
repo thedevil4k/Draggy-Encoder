@@ -20,8 +20,8 @@ DRAGGY ENCODER combines FFmpeg-based encoding with ONNX/PyTorch AI models for vi
 ## Quick Start
 
 ```bash
-git clone https://github.com/YOUR_USER/DRAGGY_ENCODER.git
-cd DRAGGY_ENCODER
+git clone https://github.com/thedevil4k/Draggy-Encoder.git
+cd Draggy-Encoder
 
 python -m venv venv
 venv/Scripts/activate   # Windows
@@ -32,6 +32,45 @@ python main.py
 
 On first launch the app auto-detects your hardware, downloads FFmpeg + ONNX Runtime + PyTorch if needed, and tests all compatible GPU/CPU codecs — no configuration required.
 
+### Choosing the FFmpeg version
+
+The FFmpeg row of **Manage Dependencies** has a version selector. By default
+nothing changes: the program keeps installing the same rolling build it always
+did. But you can pick another published build — useful when a newer FFmpeg is
+compiled against a newer NVIDIA Video Codec SDK and asks for a driver your GPU
+no longer gets.
+
+- **Windows** — master, 9.0 and 8.1 are rebuilt daily by BtbN and all three
+  need driver 570+; 7.1, 6.1 and 5.1.6 are BtbN's frozen October 2024 snapshot
+  (551.76 / 522.25 / 471.41) and are the ones that still work on an older
+  laptop GPU.
+- **Linux** — the same rolling builds, plus the frozen 6.0 / 5.1 / 4.4 static
+  builds (down to driver 455).
+
+Each option is colour-coded against the hardware detected on your machine. The
+codecs attributed to an NVIDIA GPU are not guessed from the architecture: they
+are transcribed from NVIDIA's published Video Encode and Decode Support Matrix,
+so a model that NVIDIA lists with zero NVENC engines (some MX, the GT 1030, the
+Quadro P500/P520) is never painted green.
+
+- **Green** — the GPU is a known NVENC model *and* your driver is at or above
+  the minimum that FFmpeg branch requires (the same number the binary itself
+  prints when it cannot open NVENC).
+- **Amber** — it cannot be checked: unknown GPU model, driver version not
+  readable, a GPU NVIDIA publishes with no NVENC engines (encoding goes through
+  the CPU, so the build does not decide anything), or an AMD/Intel encoder whose
+  availability does not depend on the FFmpeg version. Install it and
+  *Re-detect Hardware & Codecs* to measure the real thing.
+- **Red** — your driver is below that build's minimum; the note also lists the
+  builds that do work with your driver, and says so plainly when no published
+  build covers it.
+- **Grey** — the machine has no dedicated GPU, so every build encodes on the CPU
+  alike and the version is irrelevant here.
+
+The note under the selector also says *why* a build needs the driver it needs,
+so a rebuilt branch whose minimum is the same as master's does not look like a
+solution to an old driver when it is not.
+
 ## Project Structure
 
 ```
@@ -39,7 +78,7 @@ DRAGGY_ENCODER/
 ├── main.py                  # Entry point
 ├── requirements.txt          # Python dependencies
 ├── LICENSE                   # MIT
-├── assets/                   # UI icons (7 PNGs)
+├── assets/                   # UI icons (8 PNGs)
 ├── bin/                      # Downloaded binaries (auto-generated, gitignored)
 │   ├── .session/             # Preferences & engine state
 │   ├── ffmpeg/               # FFmpeg (auto-downloaded on first run)
@@ -50,12 +89,75 @@ DRAGGY_ENCODER/
 └── src/
     ├── ai/                   # AI engine catalog, inference, architectures, HF search
     ├── ffmpeg/               # FFmpeg manager, downloader, runner, codec testing
+    │   ├── builds.py         # catálogo de builds: cuáles hay, de dónde, cuál eligió el usuario
+    │   ├── build_fit.py      # veredicto: ¿le sirve esa build a este equipo?
     ├── hardware/             # CPU/GPU detection + codec compatibility maps
+    ├── dependencies.py       # registro de dependencias: sensores -> filas, REGISTRY, API
+    ├── fsops.py              # el disco: medir un árbol y borrarlo aunque Windows no deje
     ├── processing/           # Video pipeline (AI frame-by-frame + standard encode)
     ├── runtimes/             # PyTorch/ONNX Runtime local install manager
-    ├── ui/                   # PySide6 GUI components (~16 widgets)
+    ├── ui/                   # PySide6 GUI components (~30 widgets)
+    │   ├── dep_row.py        # la fila de una dependencia: qué se pinta y qué se puede hacer
+    │   ├── ffmpeg_row.py     # monta el selector de versión dentro de la fila de FFmpeg
+    │   ├── ffmpeg_build_picker.py  # el desplegable de builds, con su veredicto de GPU
     └── utils/                # Time/format helpers
 ```
+
+### El panel de dependencias: quién manda en qué
+
+Cuatro capas, y la dirección de la flecha es la regla para no volver a
+enredarlas:
+
+```
+src/ui/dependencies_dialog.py   el panel, los hilos, la pestaña de motores
+        │ importa
+        ▼
+src/ui/dep_row.py               qué dice la fila y qué botón está vivo
+        │ importa
+        ▼
+src/dependencies.py             sensores -> filas, REGISTRY, y qué campos
+                                son canónicos en una fila
+        │ importa
+        ▼
+src/fsops.py                    el disco: medir y borrar aunque no se pueda
+        ▲
+        │ importan
+src/ffmpeg/manager.py  ·  src/runtimes/manager.py
+```
+
+Dos reglas que costaron un disgusto y conviene no volver a romper:
+
+- **Un sensor no se copia entero a una fila.** `runtimes.manager` devuelve
+  claves de sensor (`installed`, `system`, `gpu`), no campos de fila; por eso
+  `_runtime_status` nombra sus 13 campos uno a uno. En cambio
+  `ffmpeg.manager.get_install_info()` ya *es* una fila, y por eso esa se
+  copia entera. Está escrito en el sitio, en los dos.
+- **La política de FFmpeg tiene un dueño:** `builds.nothing_to_offer_reason`.
+  El manager la publica en la fila como `nothing_to_install` para el botón y
+  el tooltip; el diálogo la vuelve a preguntar en el clic, a propósito,
+  porque una confirmación tiene que hablar del mundo en el momento en que el
+  usuario confirma y no de una foto de hace un segundo.
+- **Lo que dice una fila lo deciden seis funciones puras, todas en
+  `src/ui/dep_row.py`**, y por eso se prueban sin montar un widget:
+  - `badge_text` — la palabra de la insignia.
+  - `primary_label` — el texto del botón principal.
+  - `primary_enabled` — si ese botón está vivo, y por qué no.
+  - `ai_runtime_support_info` — si el runtime de IA tiene ruedas para este Python.
+  - `humanize_age` — el «hace cuánto» del último check.
+  - `format_latest_line` — la línea `Latest: … · last check: …`.
+
+  `humanize_age` la usa también el banner de la ventana principal, así que los
+  dos dicen lo mismo para el mismo instante. Y leer la marca de tiempo no lo
+  decide ninguna de las dos: sale de `src/ffmpeg/builds.py`, que es el módulo
+  que ya importan las tres capas que la necesitan. Ahí hay dos reglas con un
+  dueño cada una —`parse_timestamp` es el único parseo de ISO y el único que
+  sabe qué es una `Z` final; `ensure_utc` es el único que decide que una fecha
+  sin zona se lee como UTC, y `upstream` lo llama en sus dos puntos de entrada
+  en vez de repetirla—. Y lo que **no** se comparte, para que no se cuente como
+  si sí: el parseo de las cabeceras RFC 1123 del upstream, que es otro formato
+  y lo lee `upstream` con `parsedate_to_datetime`. Comparten qué significa
+  "sin zona", no la lectura.
+
 
 ## Requirements
 

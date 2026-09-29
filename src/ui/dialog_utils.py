@@ -1,4 +1,4 @@
-"""Utilidades comunes para diálogos (scroll y ajuste a la pantalla).
+"""Utilidades comunes para diálogos (scroll, ajuste a la pantalla, abrir carpeta).
 
 Salen de dos fallos reales:
 
@@ -7,13 +7,25 @@ Salen de dos fallos reales:
   * Al meter contenido en un ``QScrollArea``, su *viewport* se pinta con el
     color base de la paleta (blanco) y rompe el tema oscuro de la app.
 
-Ambas cosas se resuelven igual en cualquier diálogo, así que viven aquí.
+Ambas cosas se resuelven igual en cualquier diálogo, así que viven aquí. Y lo
+mismo con abrir una carpeta: el dispatcher por sistema operativo y el aviso de
+fallo son idénticos en los tres sitios que lo hacen, así que también es uno.
 """
 
 from __future__ import annotations
 
+import os
+import platform
+import subprocess
+
 from PySide6.QtCore import Qt
-from PySide6.QtWidgets import QApplication, QFrame, QScrollArea, QWidget
+from PySide6.QtWidgets import (
+    QApplication,
+    QFrame,
+    QMessageBox,
+    QScrollArea,
+    QWidget,
+)
 
 
 def wrap_scrollable(page: QWidget, margins=(0, 0, 0, 0)) -> QScrollArea:
@@ -61,3 +73,32 @@ def fit_to_screen(dialog, preferred_width: int = 940, preferred_height: int = 84
         )
     except Exception:
         pass
+
+
+def open_folder(path, parent=None, titulo: str = "Open folder",
+                frase: str = "No se pudo abrir la carpeta") -> None:
+    """Abre ``path`` en el explorador del sistema, creándolo si hace falta.
+
+    Es la misma pregunta en los tres sitios que la hacen —la carpeta de la
+    dependencia, la de logs y la del motor—, y por eso el dispatcher y el
+    aviso de fallo viven aquí una sola vez. Lo único que cada sitio pone es
+    cómo se llama la carpeta: de ahí ``titulo`` y ``frase``, que solo se usan
+    si la apertura falla. Nunca lanza: un fallo se enseña y se sigue.
+
+    No comprueba que ``path`` venga vacío. Quien tenga un botón que se puede
+    pulsar sin carpeta (la fila, con ``install_dir`` a ``None``) decide eso
+    antes de llamar.
+    """
+    try:
+        os.makedirs(path, exist_ok=True)
+    except Exception:
+        pass
+    try:
+        if platform.system() == "Windows":
+            os.startfile(path)  # noqa: S606
+        elif platform.system() == "Darwin":
+            subprocess.Popen(["open", path])
+        else:
+            subprocess.Popen(["xdg-open", path])
+    except Exception as exc:
+        QMessageBox.warning(parent, titulo, f"{frase}:\n{exc}")

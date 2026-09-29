@@ -652,9 +652,6 @@ class QueueRow(QFrame):
         self._details = QLabel("")
         self._details.setWordWrap(True)
         self._details.setTextFormat(Qt.TextFormat.RichText)
-        self._details.setTextInteractionFlags(
-            Qt.TextInteractionFlag.TextSelectableByMouse
-        )
         self._details.setStyleSheet(
             "QLabel { background-color: #0f1424; color: #c8c8d4; "
             "padding: 8px; border: 1px solid #243049; border-radius: 4px; "

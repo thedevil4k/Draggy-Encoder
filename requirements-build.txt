@@ -11,3 +11,7 @@ huggingface_hub>=0.20.0
 numpy>=1.24.0
 pillow>=10.0.0
 pyinstaller>=6.3.0
+# Tambien en el entorno de build: la app lo importa en tiempo de ejecucion
+# (src/hardware/metrics.py), asi que PyInstaller tiene que encontrarlo. Se
+# detecta solo por el analisis de imports; el .spec solo fuerza stdlib.
+nvidia-ml-py>=12.535.0
