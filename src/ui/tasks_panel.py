@@ -19,6 +19,8 @@ from __future__ import annotations
 import os
 from datetime import datetime
 
+from src.task_queue import TERMINAL_STATUS
+
 from PySide6.QtCore import QSize, Qt, Signal
 from PySide6.QtGui import QColor, QPainter, QTextCursor
 from PySide6.QtWidgets import (
@@ -33,6 +35,19 @@ from PySide6.QtWidgets import (
     QTabWidget,
     QVBoxLayout,
     QWidget,
+)
+
+# Un solo estilo para los dos botones de quitar (fila de la cola y ficha de
+# la pestaña Tasks): son el mismo gesto con el mismo significado, y tenerlos
+# copiados hacía que arreglar la visibilidad del uno dejara al otro atrás.
+_REMOVE_BTN_QSS = (
+    # El gris de reposo era tan apagado que el boton no se leia ni sobre el
+    # fondo de la fila: por eso lleva fondo y borde propios y solo se
+    # "enciende" al pasar el raton por encima.
+    "QPushButton { background: #252f52; color: #c2cad8; "
+    "border: 1px solid #46597f; border-radius: 4px; font-size: 14px; }"
+    "QPushButton:hover { color: #ffffff; background: #3a1d24; "
+    "border: 1px solid #e74c3c; }"
 )
 
 # Estado de fase -> (color del pill, texto corto)
@@ -127,6 +142,8 @@ class PhaseRow(QWidget):
 class TaskCard(QFrame):
     """Una tarea (render en curso o del histórico) con sus fases."""
 
+    remove_requested = Signal(str)
+
     def __init__(self, task_id, name, parent=None):
         super().__init__(parent)
         self.task_id = task_id
@@ -147,7 +164,22 @@ class TaskCard(QFrame):
         self.title = QLabel(name or task_id)
         self.title.setStyleSheet("color: #e8e8f0; font-weight: bold; font-size: 12px;")
         self.title.setWordWrap(True)
-        outer.addWidget(self.title)
+        # Cabecera: titulo (ocupa el ancho) + el boton de ESTA ficha.
+        header = QHBoxLayout()
+        header.setSpacing(6)
+        header.addWidget(self.title, 1)
+        self.btn_remove = QPushButton("\u2715")  # aspa
+        self.btn_remove.setFixedSize(30, 24)
+        self.btn_remove.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_remove.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.btn_remove.setAccessibleName("Remove this task")
+        self.btn_remove.setStyleSheet(_REMOVE_BTN_QSS)
+        self.btn_remove.setToolTip("Remove this task from the list")
+        self.btn_remove.clicked.connect(
+            lambda _checked=False: self.remove_requested.emit(self.task_id)
+        )
+        header.addWidget(self.btn_remove)
+        outer.addLayout(header)
 
         self._status_label = QLabel("PENDING")
         self._status_label.setStyleSheet(
@@ -210,6 +242,15 @@ class TaskCard(QFrame):
         text, color = texts.get(status, (status.upper(), "#a0a0b0"))
         self._status_label.setText(text.upper())
         self._status_label.setStyleSheet(f"color: {color}; font-size: 10px; font-weight: bold;")
+        # El boton dice la verdad: en marcha PARA el render (tira el trabajo
+        # hecho, por eso MainWindow pregunta antes); terminado solo saca la
+        # ficha del historico.
+        btn = getattr(self, "btn_remove", None)
+        if btn is not None:
+            btn.setToolTip(
+                "Stop this render" if status == "running"
+                else "Remove this task from the list"
+            )
 
     def _maybe_auto_done(self):
         if not self._phases:
@@ -247,6 +288,7 @@ class TasksPanel(QWidget):
     """
 
     cancel_requested = Signal(str)
+    cancel_task_requested = Signal(str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -390,6 +432,26 @@ class TasksPanel(QWidget):
         btn_row.addWidget(self.btn_clear_queue)
         queue_lay.addLayout(btn_row)
 
+        # Los botones de limpieza van en su PROPIA fila. Tres botones con
+        # etiqueta necesitan ~470 px y el panel lateral vive en 320
+        # (``splitter.setSizes([980, 320])``): compartir la fila empujaba el
+        # ancho minimo del panel de 310 a 503 px y le robaba ese sitio a la
+        # columna principal, que es lo que mas falta hace en pantallas
+        # normales.
+        clean_row = QHBoxLayout()
+        clean_row.setSpacing(6)
+        self.btn_remove_finished = QPushButton("Remove finished")
+        self.btn_remove_finished.setStyleSheet(
+            "background-color: #1f2c4c; color: #a0a0b0; border: 1px solid #2c3e50; "
+            "border-radius: 6px; padding: 4px 10px; font-size: 11px;"
+        )
+        self.btn_remove_finished.setToolTip(
+            "Remove finished jobs (done / failed / aborted) from the list"
+        )
+        self.btn_remove_finished.setEnabled(False)
+        clean_row.addWidget(self.btn_remove_finished, 1)
+        queue_lay.addLayout(clean_row)
+
         self.tabs.addTab(self._queue_host, "Queue")
         root.addWidget(self.tabs, 1)
 
@@ -439,6 +501,9 @@ class TasksPanel(QWidget):
                 card.title.setText(name)
             return card
         card = TaskCard(task_id, name or task_id)
+        card.remove_requested.connect(
+            lambda tid=task_id: self.cancel_task_requested.emit(tid)
+        )
         self._cards[task_id] = card
         # Newest first: insert at the top of the list (index 0).
         self._list_layout.insertWidget(0, card)
@@ -482,7 +547,6 @@ class TasksPanel(QWidget):
         """Reconstruye la pestaña Queue desde ``src.task_queue.list_items()``."""
         for queue_id in list(self._queue_rows):
             self._remove_queue_row(queue_id)
-        has_any = False
         count = 0
         for item in (items or []):
             queue_id = item.get("queue_id", "")
@@ -490,16 +554,12 @@ class TasksPanel(QWidget):
                 continue
             self._queue_row(queue_id, item.get("name", queue_id), item=item)
             self.set_queue_status(queue_id, item.get("status", "queued"))
-            has_any = True
             count += 1
-        self._queue_empty.setVisible(not has_any)
-        # El botón Start queue debe habilitarse con jobs en cola (y la UI de
-        # progreso reflejar el conteo). Antes solo se habilitaba al TERMINAR
-        # una cola, así que la primera vez no se podía arrancar nada.
-        self._queue_progress_label.setText(
-            f"{count} job(s) queued" if has_any else "No queued jobs"
-        )
+        # El total lo necesita la barra de la pasada; el contador de la
+        # etiqueta, el aviso de vacio y los botones los pone el unico sitio
+        # que sabe derivarlos de las filas.
         self.set_queue_running(self._queue_running, total=count)
+        self._sync_queue_state()
 
     def _queue_row(self, queue_id: str, name: str, item: dict = None) -> QueueRow:
         row = self._queue_rows.get(queue_id)
@@ -510,9 +570,8 @@ class TasksPanel(QWidget):
                 row.set_details(item)
             return row
         row = QueueRow(queue_id, name)
-        row.btn_remove.clicked.connect(
-            lambda _checked=False, qid=queue_id: self.cancel_requested.emit(qid)
-        )
+        # signal-a-signal: el aspa y el Delete de la fila avisan igual.
+        row.remove_requested.connect(self.cancel_requested.emit)
         if item is not None:
             row.set_details(item)
         # Auto-expand del primer item en marcha para que se vea sin click.
@@ -520,7 +579,6 @@ class TasksPanel(QWidget):
             row.set_expanded(True)
         self._queue_rows[queue_id] = row
         self._queue_layout.insertWidget(self._queue_layout.count() - 1, row)
-        self._queue_empty.hide()
         return row
 
     def set_queue_status(self, queue_id: str, status: str):
@@ -531,6 +589,7 @@ class TasksPanel(QWidget):
             # comprimiendo ahora mismo.
             if status == "running":
                 row.set_expanded(True)
+        self._sync_queue_state()
 
     def _remove_queue_row(self, queue_id: str):
         row = self._queue_rows.pop(queue_id, None)
@@ -577,33 +636,83 @@ class TasksPanel(QWidget):
         return result
 
     def _forget_queue_row(self, queue_id: str):
-        """Quita la fila de la lista y recontesta el estado de la cola."""
+        """Quita la fila de la lista y deja el estado derivado al dia."""
         self._remove_queue_row(queue_id)
-        if not self._queue_rows:
-            self._queue_empty.show()
-            self._queue_progress_label.setText("No queued jobs")
-        else:
-            pending = sum(
+        self._sync_queue_state()
+
+    def _sync_queue_state(self):
+        """Todo lo que se deduce de las FILAS, escrito aqui y en ningun otro sitio.
+
+        Contador de la etiqueta, aviso de cola vacia y los dos botones. Con
+        seis sitios recontando lo mismo, cualquier estado nuevo obligaba a
+        acordarse de todos y era facil que uno se quedara viejo.
+
+        La etiqueta del progreso de una pasada ("Queue: 2/5 done") NO sale de
+        aqui: esa depende de cuantos jobs lleva la pasada, no de las filas, y
+        la escriben ``set_queue_running`` / ``set_queue_progress``. Por eso el
+        texto de la cola quieta solo se retoca cuando no hay pasada en curso.
+        """
+        self._queue_empty.setVisible(not self._queue_rows)
+        if not self._queue_running:
+            queued = sum(
                 1 for row in self._queue_rows.values()
-                if row.pill.text() == _QUEUE_STATUS_META["queued"][0]
+                if row.status_name == "queued"
             )
-            self._queue_progress_label.setText(f"{pending} job(s) queued")
-        self.set_queue_running(self._queue_running)
+            self._queue_progress_label.setText(
+                f"{queued} job(s) queued" if self._queue_rows else "No queued jobs"
+            )
+        self._sync_queue_buttons()
+
+    def _sync_queue_buttons(self):
+        """Los dos botones: dependen de las filas y de si hay pasada en marcha.
+
+        Vive aparte porque ``set_queue_running`` tambien tiene que refrescarlos
+        (arrancar una pasada desactiva "Start queue") sin tocar la etiqueta,
+        que en ese momento ya no le pertenece.
+        """
+        self.btn_start_queue.setEnabled(
+            not self._queue_running and bool(self._queue_rows)
+        )
+        self.btn_remove_finished.setEnabled(
+            any(
+                row.status_name in TERMINAL_STATUS
+                for row in self._queue_rows.values()
+            )
+        )
+
+    def remove_finished_rows(self) -> int:
+        """Quita de golpe las filas ya terminadas (done/failed/aborted).
+
+        Es la limpieza de la cola que se llena de "DONE" al terminar una
+        tanda. NO toca los jobs en espera ni el que este en marcha: para eso
+        esta el boton de su fila, que ademas sabe parar el proceso. Aqui solo
+        se quita de la UI y del archivo lo que ya no renderiza nadie.
+        Devuelve cuantas filas se quitaron.
+        """
+        finished = [
+            qid for qid, row in self._queue_rows.items()
+            if row.status_name in TERMINAL_STATUS
+        ]
+        if not finished:
+            return 0
+        try:
+            import src.task_queue as task_queue
+            task_queue.purge_finished()
+        except Exception:
+            pass
+        for queue_id in finished:
+            self._forget_queue_row(queue_id)
+        return len(finished)
 
     def clear_queue_rows(self):
         """Limpia SOLO la pestaña UI; no toca el archivo persistente."""
         for queue_id in list(self._queue_rows):
             self._remove_queue_row(queue_id)
-        self._queue_empty.show()
-        self._queue_progress_label.setText("No queued jobs")
-        self.set_queue_running(self._queue_running)
+        self._sync_queue_state()
 
     def set_queue_running(self, running: bool, total: int = 0):
-        """Habilita/deshabilita Start queue según si la cola está en marcha."""
+        """La pasada en marcha: su barra y su contador, no los de las filas."""
         self._queue_running = running
-        self.btn_start_queue.setEnabled(
-            not running and bool(self._queue_rows)
-        )
         if running:
             self._queue_progress_bar.setRange(0, max(int(total), 1))
             self._queue_progress_bar.setValue(0)
@@ -611,6 +720,7 @@ class TasksPanel(QWidget):
             self._queue_progress_label.setText(f"Queue running: 0/{total} done")
         else:
             self._queue_progress_bar.hide()
+        self._sync_queue_buttons()
 
     def set_queue_progress(self, done: int, total: int):
         """Actualiza la barra global de la cola: jobs completados / total."""
@@ -640,11 +750,6 @@ _QUEUE_STATUS_META = {
     "failed":      ("FAILED", "#e74c3c"),
     "aborted":     ("ABORTED", "#e67e22"),
 }
-# Estados sin render detrás: su ``✕`` ya no cancela nada, sólo saca la
-# fila terminada de la lista.
-_QUEUE_TERMINAL_STATUS = {"done", "failed", "aborted"}
-
-
 class QueueRow(QFrame):
     """Fila de la pestaña Queue: nombre + estado + quitar item.
 
@@ -657,16 +762,23 @@ class QueueRow(QFrame):
     marcha, saca de la cola el que está en espera y descarta de la lista
     el que ya terminó (done/failed/aborted), que ya no tiene nada que
     cancelar pero sí ocupa sitio.
+
+    El boton y el atajo de teclado salen por la MISMA signal
+    ``remove_requested``: el atajo no es un camino paralelo que pueda
+    divergir del boton.
     """
+
+    remove_requested = Signal(str)
 
     def __init__(self, queue_id, name, parent=None):
         super().__init__(parent)
         self.queue_id = queue_id
         self.setObjectName("QueueRow")
-        self.setStyleSheet(
-            "#QueueRow { background-color: #141a30; border: 1px solid #243049; "
-            "border-radius: 6px; }"
-        )
+        self._status = ""
+        self._paint_row()
+        # StrongFocus: un clic en la fila (las etiquetas no tienen foco) la
+        # deja enfocada y a partir de ahi Delete quita ESE job.
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         outer = QVBoxLayout(self)
         outer.setContentsMargins(6, 4, 6, 6)
         outer.setSpacing(4)
@@ -700,15 +812,15 @@ class QueueRow(QFrame):
         # Cancelar SOLO este item. En espera quita la fila; en marcha para
         # el render (lo hace MainWindow, que es quien tiene al worker).
         self.btn_remove = QPushButton("\u2715")  # ✕
-        self.btn_remove.setFixedWidth(26)
+        self.btn_remove.setFixedSize(30, 24)
         self.btn_remove.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_remove.setStyleSheet(
-            "QPushButton { background: transparent; color: #8a93ab; "
-            "border: none; font-size: 14px; }"
-            "QPushButton:hover { color: #e74c3c; background: #2a1a22; "
-            "border-radius: 4px; }"
-        )
+        self.btn_remove.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.btn_remove.setAccessibleName("Cancel this job")
+        self.btn_remove.setStyleSheet(_REMOVE_BTN_QSS)
         self.btn_remove.setToolTip("Cancel this job")
+        self.btn_remove.clicked.connect(
+            lambda _checked=False: self.remove_requested.emit(self.queue_id)
+        )
         header.addSpacing(4)
         header.addWidget(self.btn_remove)
 
@@ -725,6 +837,35 @@ class QueueRow(QFrame):
         )
         self._details.hide()
         outer.addWidget(self._details)
+
+    @property
+    def status_name(self) -> str:
+        """Estado real de la fila (el texto del pill se puede repintar)."""
+        return self._status or "queued"
+
+    def _paint_row(self):
+        """Borde de la fila: cian cuando tiene el foco (teclado Delete)."""
+        border = "#00d2d3" if self.hasFocus() else "#243049"
+        self.setStyleSheet(
+            f"#QueueRow {{ background-color: #141a30; border: 1px solid {border}; "
+            "border-radius: 6px; }"
+        )
+
+    def focusInEvent(self, event):  # noqa: N802 - Qt callback name
+        self._paint_row()
+        super().focusInEvent(event)
+
+    def focusOutEvent(self, event):  # noqa: N802 - Qt callback name
+        self._paint_row()
+        super().focusOutEvent(event)
+
+    def keyPressEvent(self, event):  # noqa: N802 - Qt callback name
+        """Delete/Backspace es el mismo boton que el aspa, sin raton."""
+        if event.key() in (Qt.Key.Key_Delete, Qt.Key.Key_Backspace):
+            self.remove_requested.emit(self.queue_id)
+            event.accept()
+            return
+        super().keyPressEvent(event)
 
     def _set_expanded(self, expanded: bool):
         self.toggle_btn.setText("\u25be" if expanded else "\u25b8")  # ▾ / ▸
@@ -744,6 +885,7 @@ class QueueRow(QFrame):
         self._details.setText(_format_queue_item_details(item))
 
     def _paint(self, status: str):
+        self._status = str(status)
         text, color = _QUEUE_STATUS_META.get(
             status, ("QUEUED", "#9f8fa6")
         )
@@ -758,7 +900,7 @@ class QueueRow(QFrame):
         # El botón acompaña al estado: siempre disponible (un item ya
         # terminado también se puede quitar de la lista), pero con el
         # texto que dice qué va a hacer DE VERDAD.
-        if status in _QUEUE_TERMINAL_STATUS:
+        if status in TERMINAL_STATUS:
             self.btn_remove.setToolTip("Remove this finished job from the list")
         elif str(status) == "queued":
             self.btn_remove.setToolTip("Cancel this job and remove it from the queue")

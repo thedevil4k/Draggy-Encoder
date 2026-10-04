@@ -5389,6 +5389,319 @@ def test_clear_queue_stops_the_running_render_first(qapp, tmp_path, monkeypatch)
 
 
 # ---------------------------------------------------------------------------
+# 11b. Cancelar tareas: el boton visible, la limpieza de terminadas y el
+#     boton de la ficha de la pestana Tasks.
+# ---------------------------------------------------------------------------
+def test_queue_row_cancel_button_is_visible_and_delete_is_the_same_button(
+    qapp, tmp_path, monkeypatch
+):
+    """El boton de la fila se VE, y Delete es literalmente el mismo boton."""
+    from PySide6.QtCore import QEvent, Qt
+    from PySide6.QtGui import QKeyEvent
+    import src.task_queue as tq
+    from src.ui.tasks_panel import TasksPanel
+
+    monkeypatch.setattr(tq, "_path", lambda: str(tmp_path / "queue.json"))
+    qid = tq.enqueue(name="movie.mp4", input_path="/in/movie.mp4",
+                     output_path="/out/movie.mp4", settings={})
+
+    panel = TasksPanel()
+    asked = []
+    panel.cancel_requested.connect(asked.append)
+    panel.rebuild_queue(tq.list_items())
+
+    row = panel._queue_rows[qid]
+    btn = row.btn_remove
+    # Visible de verdad: antes era un aspa de 26 px sin fondo ni borde sobre
+    # el fondo de la fila, y en la app no se leia.
+    assert btn.width() >= 28
+    assert btn.height() >= 22
+    assert "background" in btn.styleSheet()
+    assert btn.accessibleName() == "Cancel this job"
+    # El foco va a la fila (no al boton) para que Delete sirva en cualquier
+    # parte de ella.
+    assert row.focusPolicy() == Qt.FocusPolicy.StrongFocus
+    assert btn.focusPolicy() == Qt.FocusPolicy.NoFocus
+
+    row.setFocus()
+    row.keyPressEvent(QKeyEvent(QEvent.Type.KeyPress, Qt.Key.Key_Delete,
+                                Qt.KeyboardModifier.NoModifier))
+
+    assert asked == [qid]                      # el atajo pide lo mismo
+    assert qid in panel._queue_rows            # y no borra nada por su cuenta
+    assert tq.get_item(qid)["status"] == "queued"
+
+    btn.click()
+    assert asked == [qid, qid]                 # los dos gestos, una sola via
+
+
+def test_purge_finished_only_drops_terminal(tmp_path, monkeypatch):
+    """``purge_finished`` limpia lo terminado y NADA mas."""
+    import src.task_queue as tq
+
+    monkeypatch.setattr(tq, "_path", lambda: str(tmp_path / "queue.json"))
+    done = tq.enqueue(name="a.mp4", input_path="/in/a.mp4",
+                      output_path="/out/a.mp4", settings={})
+    failed = tq.enqueue(name="b.mp4", input_path="/in/b.mp4",
+                        output_path="/out/b.mp4", settings={})
+    waiting = tq.enqueue(name="c.mp4", input_path="/in/c.mp4",
+                         output_path="/out/c.mp4", settings={})
+    running = tq.enqueue(name="d.mp4", input_path="/in/d.mp4",
+                         output_path="/out/d.mp4", settings={})
+    assert tq.set_status(done, "running") is True
+    assert tq.set_status(done, "done") is True
+    assert tq.set_status(failed, "running") is True
+    assert tq.set_status(failed, "failed") is True
+    assert tq.set_status(running, "running") is True
+
+    assert tq.purge_finished() == 2
+    assert [i["queue_id"] for i in tq.list_items()] == [waiting, running]
+    # Idempotente: la segunda pasada no encuentra nada que quitar.
+    assert tq.purge_finished() == 0
+    assert len(tq.list_items()) == 2
+
+
+def test_remove_finished_keeps_pending_and_running(qapp, tmp_path, monkeypatch):
+    """"Remove finished" despeja la tanda sin tocar lo que sigue vivo."""
+    import src.task_queue as tq
+    from src.ui.main_window import MainWindow
+    from src.ui.tasks_panel import TasksPanel
+
+    monkeypatch.setattr(tq, "_path", lambda: str(tmp_path / "queue.json"))
+    first = tq.enqueue(name="a.mp4", input_path="/in/a.mp4",
+                       output_path="/out/a.mp4", settings={})
+    second = tq.enqueue(name="b.mp4", input_path="/in/b.mp4",
+                        output_path="/out/b.mp4", settings={})
+    waiting = tq.enqueue(name="c.mp4", input_path="/in/c.mp4",
+                         output_path="/out/c.mp4", settings={})
+    running = tq.enqueue(name="d.mp4", input_path="/in/d.mp4",
+                         output_path="/out/d.mp4", settings={})
+    assert tq.set_status(first, "running") is True
+    assert tq.set_status(first, "done") is True
+    assert tq.set_status(second, "running") is True
+    assert tq.set_status(second, "done") is True
+    assert tq.set_status(running, "running") is True
+
+    panel = TasksPanel()
+    panel.rebuild_queue(tq.list_items())
+    assert panel.btn_remove_finished.isEnabled() is True   # hay DONE que quitar
+
+    mw = MainWindow.__new__(MainWindow)
+    mw.tasks_panel = panel
+    mw._queue_active = False
+    mw._queue_done = 0
+    mw._queue_total = 0
+    mw.worker = None
+    mw._tray = None
+    messages = []
+    mw._on_status_message = messages.append
+
+    mw._on_remove_finished()
+
+    assert set(panel._queue_rows) == {waiting, running}
+    assert [i["queue_id"] for i in tq.list_items()] == [waiting, running]
+    assert panel._queue_progress_label.text() == "1 job(s) queued"
+    assert any("2 finished" in m for m in messages)
+
+    # Sin terminados que quitar, el boton se apaga (no queda nada que hacer).
+    assert panel.btn_remove_finished.isEnabled() is False
+    mw._on_remove_finished()
+    assert len(tq.list_items()) == 2
+
+
+def test_task_card_remove_button_stops_running_render_after_confirm(
+    qapp, tmp_path, monkeypatch
+):
+    """El boton de una ficha EN MARCHA para el render, previa confirmacion."""
+    from PySide6.QtWidgets import QMessageBox
+    import src.task_queue as tq
+    from src.ui.main_window import MainWindow
+    from src.ui.tasks_panel import TasksPanel
+
+    monkeypatch.setattr(tq, "_path", lambda: str(tmp_path / "queue.json"))
+    qid = tq.enqueue(name="long.mp4", input_path="/in/long.mp4",
+                     output_path="/out/long.mp4", settings={})
+    assert tq.set_status(qid, "running") is True
+
+    panel = TasksPanel()
+    panel.rebuild_queue(tq.list_items())
+    panel.get_or_create(qid, "long.mp4").set_running()
+    assert panel._cards[qid].btn_remove.toolTip() == "Stop this render"
+
+    class _Worker:
+        task_id = qid
+
+        def isRunning(self):
+            return True
+
+    mw = MainWindow.__new__(MainWindow)
+    mw.tasks_panel = panel
+    mw._queue_active = False
+    mw.worker = _Worker()
+    # __new__ no pasa por _setup_ui: la conexion la hace la app al arrancar.
+    panel.cancel_task_requested.connect(mw._on_cancel_task)
+    stopped = []
+    mw._abort_running_worker = lambda cleanup_partial_output: (
+        stopped.append(cleanup_partial_output) or True
+    )
+    mw._cleanup_after_abort = lambda: stopped.append("cleanup")
+    messages = []
+    mw._on_status_message = messages.append
+
+    asked = []
+    monkeypatch.setattr(
+        QMessageBox, "question",
+        staticmethod(lambda *a, **k: asked.append(a) or QMessageBox.No),
+    )
+    panel._cards[qid].btn_remove.click()
+    assert len(asked) == 1                    # pregunta antes de parar
+    assert stopped == []
+    assert qid in panel._cards                 # la ficha sigue viva
+
+    monkeypatch.setattr(
+        QMessageBox, "question", staticmethod(lambda *a, **k: QMessageBox.Yes)
+    )
+    panel._cards[qid].btn_remove.click()
+    assert stopped == [True, "cleanup"]        # paro el worker de verdad
+    assert any("cancelled" in m for m in messages)
+    # Delega en el camino de la fila: el item queda marcado aborted.
+    assert tq.get_item(qid)["status"] == "aborted"
+    assert qid in panel._cards
+
+
+def test_task_card_remove_button_drops_finished_history_entry(
+    qapp, tmp_path, monkeypatch
+):
+    """Terminada la ficha, su boton quita la entrada del historico."""
+    from PySide6.QtWidgets import QMessageBox
+    import src.task_history as th
+    from src.ui.main_window import MainWindow
+    from src.ui.tasks_panel import TasksPanel
+
+    monkeypatch.setattr(th, "_path", lambda: str(tmp_path / "history.json"))
+    th.start_task("t1", "movie.mp4", "/in/movie.mp4")
+    th.finish_task("t1", "completed")
+    th.start_task("t2", "other.mp4", "/in/other.mp4")
+    th.finish_task("t2", "completed")
+
+    panel = TasksPanel()
+    panel.rebuild(list(th.list_tasks()))
+    panel.get_or_create("t1", "movie.mp4").finish("success")
+    assert panel._cards["t1"].btn_remove.toolTip() == (
+        "Remove this task from the list"
+    )
+
+    class _Worker:
+        task_id = "otro"
+
+        def isRunning(self):
+            return False
+
+    mw = MainWindow.__new__(MainWindow)
+    mw.tasks_panel = panel
+    mw.worker = _Worker()
+    panel.cancel_task_requested.connect(mw._on_cancel_task)
+    messages = []
+    mw._on_status_message = messages.append
+
+    asked = []
+    monkeypatch.setattr(
+        QMessageBox, "question",
+        staticmethod(lambda *a, **k: asked.append(a) or QMessageBox.Yes),
+    )
+    panel._cards["t1"].btn_remove.click()
+
+    # Quitar una ficha ya terminada no tira trabajo: no se pregunta.
+    assert asked == []
+    assert "t1" not in panel._cards
+    assert th.get_task("t1") is None
+    assert th.get_task("t2") is not None        # el otro historico sigue
+    assert any("removed from history" in m for m in messages)
+
+
+def test_tasks_panel_min_width_still_fits_the_sidebar(qapp):
+    """El panel lateral tiene que caber en los 320 px que le pide el splitter.
+
+    Meter un tercer boton etiquetado en la fila de Start/Clear，推动o el
+    ancho minimo del panel a 503 px, y el splitter ya no podia darle los
+    320 de ``setSizes([980, 320])``: la columna principal se quedaba sin
+    sitio (que es justo lo que mas falta hace). Este test es el techo.
+    """
+    from src.ui.tasks_panel import TasksPanel
+
+    panel = TasksPanel()
+    assert panel.minimumSizeHint().width() <= 320, (
+        "el panel lateral necesita %d px y el splitter solo le da 320"
+        % panel.minimumSizeHint().width()
+    )
+
+
+def test_task_card_cancel_marks_a_non_queue_render_aborted(qapp, tmp_path,
+                                                          monkeypatch):
+    """Cancelar un render que NO es de la cola marca la ficha al instante.
+
+    Antes de esto la ficha se quedaba diciendo RUNNING hasta que el worker
+    emitia ``finished``; y no vale la pena esperar a ese momento para decir
+    lo que ya se sabe.
+    """
+    from PySide6.QtWidgets import QMessageBox
+    import src.task_history as th
+    from src.ui.main_window import MainWindow
+    from src.ui.tasks_panel import TasksPanel
+
+    monkeypatch.setattr(th, "_path", lambda: str(tmp_path / "history.json"))
+    th.start_task("solo", "preview.mp4", "/in/preview.mp4")
+
+    panel = TasksPanel()
+    panel.get_or_create("solo", "preview.mp4").set_running()
+
+    class _Worker:
+        task_id = "solo"
+
+        def isRunning(self):
+            return True
+
+    mw = MainWindow.__new__(MainWindow)
+    mw.tasks_panel = panel
+    mw._queue_active = False
+    mw.worker = _Worker()
+    panel.cancel_task_requested.connect(mw._on_cancel_task)
+    stopped = []
+    mw._abort_running_worker = lambda cleanup_partial_output: (
+        stopped.append(cleanup_partial_output) or True
+    )
+    mw._cleanup_after_abort = lambda: None
+    mw._on_status_message = lambda message: None
+    monkeypatch.setattr(
+        QMessageBox, "question", staticmethod(lambda *a, **k: QMessageBox.Yes)
+    )
+
+    panel._cards["solo"].btn_remove.click()
+
+    assert stopped == [True]
+    assert panel._cards["solo"]._status_label.text() == "ABORTED"
+    # El cierre del historial sigue siendo de _on_worker_finished: aqui solo
+    # se marca la ficha, para no dejar al writer de fases sin tarea a medias.
+    assert th.get_task("solo") is not None
+    assert "solo" in panel._cards
+
+
+def test_task_history_remove_task(tmp_path, monkeypatch):
+    """``remove_task`` borra una entrada y solo esa."""
+    import src.task_history as th
+
+    monkeypatch.setattr(th, "_path", lambda: str(tmp_path / "history.json"))
+    th.start_task("t1", "a.mp4", "/in/a.mp4")
+    th.start_task("t2", "b.mp4", "/in/b.mp4")
+
+    assert th.remove_task("no-existe") is False
+    assert th.remove_task("") is False
+    assert th.remove_task("t1") is True
+    assert th.get_task("t1") is None
+    assert [t["task_id"] for t in th.list_tasks()] == ["t2"]
+
+
+# ---------------------------------------------------------------------------
 # 12. Model scale: filename parsing + target scale honored by engines
 # ---------------------------------------------------------------------------
 

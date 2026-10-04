@@ -189,6 +189,24 @@ def get_task(task_id: str) -> Optional[dict]:
     return None
 
 
+def remove_task(task_id: str) -> bool:
+    """Borra UNA entrada del historial (el boton de la ficha de Tasks).
+
+    No toca el archivo de video ni el render: solo el registro de UI. Si el
+    id no existe (o la escritura falla) devuelve False, para que quien llama
+    pueda avisar en vez de prometer algo que no ocurrio.
+    """
+    if not task_id:
+        return False
+    with _LOCK:
+        tasks = _load_raw()
+        idx = _get_index(tasks, task_id)
+        if idx < 0:
+            return False
+        tasks.pop(idx)
+        return _save_raw(tasks)
+
+
 def clear() -> bool:
     try:
         path = _path()

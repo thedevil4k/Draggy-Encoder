@@ -1109,6 +1109,10 @@ class MainWindow(QMainWindow):
         self.tasks_panel.btn_start_queue.clicked.connect(self._start_queue)
         self.tasks_panel.btn_clear_queue.clicked.connect(self._on_clear_queue)
         self.tasks_panel.cancel_requested.connect(self._on_cancel_queue_item)
+        self.tasks_panel.btn_remove_finished.clicked.connect(
+            self._on_remove_finished
+        )
+        self.tasks_panel.cancel_task_requested.connect(self._on_cancel_task)
 
         self.splitter = QSplitter(Qt.Orientation.Horizontal)
         self.splitter.setChildrenCollapsible(True)
@@ -3015,6 +3019,90 @@ class MainWindow(QMainWindow):
         self.tasks_panel.set_queue_progress(done, self._queue_total)
         if self._tray is not None:
             self._tray.set_queue(done, self._queue_total)
+
+    def _on_remove_finished(self):
+        """"Remove finished": fuera las filas done/failed/aborted de un golpe.
+
+        Es la limpieza de la cola llena de "DONE" que deja una tanda. No toca
+        lo pendiente ni el render en marcha (para eso esta el boton de su
+        fila), asi que no necesita confirmacion: no se pierde trabajo, solo
+        se olvida lo que ya termino.
+        """
+        removed = self.tasks_panel.remove_finished_rows()
+        if not removed:
+            self._on_status_message("No finished jobs to remove.")
+            return
+        self.tasks_panel.append_log(f"Removed {removed} finished queue item(s).")
+        self._on_status_message(f"Removed {removed} finished job(s).")
+        # La barra y la bandeja no pueden seguir prometiendo trabajo que ya
+        # no esta en la cola.
+        self._retarget_queue_total()
+
+    def _on_cancel_task(self, task_id: str):
+        """Boton de una ficha de la pestaña Tasks.
+
+        En marcha significa PARAR ese render, que tira el trabajo hecho, asi
+        que se pregunta igual que en la fila de la cola y la ficha se queda
+        en ABORTED (el veredicto de lo que paso). Terminada solo significa
+        quitar esa entrada del historico.
+        """
+        card = self.tasks_panel._cards.get(task_id)
+        name = (card.name if card is not None else task_id) or task_id
+        worker = getattr(self, "worker", None)
+        running = (
+            worker is not None
+            and worker.isRunning()
+            and str(getattr(worker, "task_id", "") or "") == str(task_id)
+        )
+
+        if running:
+            ret = QMessageBox.question(
+                self,
+                "Stop render",
+                f"Stop the render in progress?\n\n{name}",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            if ret != QMessageBox.Yes:
+                return
+            # Si ademas es un item de la cola, el camino canonico es el de su
+            # fila (marca aborted, para el proceso y deja el veredicto). Se
+            # delega en el para no duplicar esa logica.
+            try:
+                import src.task_queue as task_queue
+                is_queue_item = task_queue.get_item(task_id) is not None
+            except Exception:
+                is_queue_item = False
+            if is_queue_item:
+                self._on_cancel_queue_item(task_id)
+                return
+            if self._abort_running_worker(cleanup_partial_output=True):
+                self._cleanup_after_abort()
+                # La ficha se queda con el veredicto YA puesto: sin esto
+                # seguia diciendo RUNNING hasta que el hilo terminara (que es
+                # cuando ``_on_worker_finished`` vuelve a marcarla). Solo se
+                # marca la FICHA; el cierre del historial y el avance de la
+                # cola siguen siendo de ``_on_worker_finished``, que es quien
+                # sabe cuando el worker muere de verdad -- marcar aqui el
+                # historico y limpiar ``_current_task_id`` dejaria al writer de
+                # fases sin tarea a mitad de render.
+                self.tasks_panel.mark_finished(task_id, "aborted")
+                self._on_status_message(f"Render cancelled: {name}")
+                return
+            self.tasks_panel.mark_finished(task_id, "aborted")
+            self.tasks_panel.append_log(
+                f"Render cancelled: {name} (nothing was running)"
+            )
+            return
+
+        # Terminada (o solo historico): fuera la ficha y su registro.
+        try:
+            import src.task_history as task_history
+            task_history.remove_task(task_id)
+        except Exception:
+            pass
+        self.tasks_panel.remove_task(task_id)
+        self._on_status_message(f"Task removed from history: {name}")
 
     def _on_clear_queue(self):
         ret = QMessageBox.question(

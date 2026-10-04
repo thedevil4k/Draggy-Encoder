@@ -48,7 +48,11 @@ _VALID_STATUS = {
     "queued", "validating", "preparing", "running", "muxing",
     "publishing", "done", "failed", "aborted", "recoverable",
 }
-_TERMINAL_STATUS = {"done", "failed", "aborted"}
+# Estados en los que el item ya no renderiza nada. Es publico porque es la
+# definicion unica de "terminado": la UI lo usa para decidir que filas puede
+# quitar de la lista, y duplicar el set aqui garantia que los dos se
+# desincronizasen el dia que se añadiera un estado.
+TERMINAL_STATUS = frozenset({"done", "failed", "aborted"})
 _ALLOWED_TRANSITIONS = {
     "queued": {"queued", "validating", "preparing", "running", "failed", "aborted"},
     "validating": {"validating", "preparing", "running", "failed", "aborted"},
@@ -186,7 +190,7 @@ def set_status(queue_id: str, status: str, error: str = "") -> bool:
             "at": _now(),
             "error": str(error or ""),
         })
-        if status in _TERMINAL_STATUS:
+        if status in TERMINAL_STATUS:
             items[idx]["finished_at"] = _now()
         return _save_raw(items)
 
@@ -270,7 +274,7 @@ def cancel(queue_id: str) -> str:
                 "error": "Cancelled by user.",
             })
             return "aborted" if _save_raw(items) else "error"
-        if current in _TERMINAL_STATUS:
+        if current in TERMINAL_STATUS:
             return "finished"
         items.pop(idx)
         return "cancelled" if _save_raw(items) else "error"
@@ -284,6 +288,27 @@ def remove(queue_id: str) -> bool:
             return False
         items.pop(idx)
         return _save_raw(items)
+
+
+def purge_finished() -> int:
+    """Borra TODOS los items ya terminados (done/failed/aborted) de golpe.
+
+    Devuelve cuantos se fueron (0 si no habia ninguno o si no se pudo
+    guardar). Los items "queued" y los que tienen un render en marcha
+    (``_ACTIVE_STATUS``) se quedan intactos: quitarles la fila por la
+    espalda dejaria al worker escribiendo un archivo que la app ya no
+    cuenta, que es justo lo que ``cancel`` evita item a item.
+    """
+    with _LOCK:
+        items = _load_raw()
+        kept = [
+            it for it in items
+            if str(it.get("status") or "queued") not in TERMINAL_STATUS
+        ]
+        removed = len(items) - len(kept)
+        if removed <= 0:
+            return 0
+        return removed if _save_raw(kept) else 0
 
 
 def clear() -> bool:
