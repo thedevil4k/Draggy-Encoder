@@ -185,12 +185,18 @@ class LiveMetrics:
 
 
 def format_percent(value):
-    """``61.4 -> "61 %"``, ``None -> "—"``. Para que el cero falso no exista."""
+    """``61.4 -> "61 %"``, ``None -> "—"``. Para que el cero falso no exista.
+
+    El ``OverflowError`` está en la lista por el ``inf``: ``int(round(inf))``
+    lanza, y un ``NaN`` o un ``inf`` que se cuela en la lectura de la GPU es
+    basura, no un porcentaje. Aquí se enseña como "no lo sé", que es lo que
+    significa.
+    """
     if value is None:
         return "—"
     try:
         return "%d %%" % int(round(float(value)))
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return "—"
 
 

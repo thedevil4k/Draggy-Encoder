@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import queue as queue_module
 import random
@@ -12,6 +13,7 @@ import tempfile
 import threading
 import time
 from datetime import datetime
+from typing import NamedTuple
 
 import numpy as np
 
@@ -65,12 +67,19 @@ def _emit_phase(phase_cb, ev, phase_id, label="", pct=0, msg=""):
 def _emit_metrics(metrics_cb, **fields):
     """Publica cifras de throughput en un dict plano. Nunca lanza.
 
-    El canal de métricas es **plano** a propósito, y por eso se parece al que
-    ya usa ``run_ffmpeg``: quien lo consume (el desplegable de la bandeja) lo
-    mezcla tal cual llega, sin tener que saber de qué render salió cada
-    número. Envolverlo en ``{"metric": ..., "value": ...}`` —que es lo que
-    necesita una fase, porque tiene nombre e historia— aquí solo añadía una
-    forma más que el consumidor tenía que adivinar.
+    El canal de métricas es **plano** a propósito —ni envoltorio, ni
+    metadatos, ni cadenas que haya que parsear—, y por eso se parece al que
+    ya usa ``run_ffmpeg``. Envolverlo en ``{"metric": ..., "value": ...}``,
+    que es lo que necesita una fase porque tiene nombre e historia, aquí solo
+    añadía una forma más que el consumidor tenía que adivinar.
+
+    Lo que sí es obligatorio es el **prefijo** de cada clave: este canal lo
+    escribe el render de IA y el de ffmpeg escribe en el mismo estado. Con dos
+    fuentes escribiendo en la misma clave ``fps``, la que hablaba último
+    borraba a la otra y no había forma de saber de quién era el número que se
+    veía en el desplegable. Aquí todo sale con ``ai_`` (``ai_fps``,
+    ``ai_frame``, ``ai_total_frames``) y allí con ``enc_``, de modo que ambas
+    cifras conviven y se enseñan por separado.
     """
     if not metrics_cb:
         return
@@ -78,6 +87,41 @@ def _emit_metrics(metrics_cb, **fields):
         metrics_cb(dict(fields))
     except Exception as exc:
         logger.debug("metrics_cb error: %s", exc)
+
+
+#: Frames por bloque de métricas del render de IA. Es a la vez la granularidad
+#: de publicación y la **ventana** del fps: lo que se enseña es el ritmo de los
+#: últimos 30 frames. Treinta frames es lo que ya se usaba para publicar, así
+#: que la frecuencia de actualización no cambia; lo que cambia es qué se mide.
+VENTANA_METRICAS_IA = 30
+
+
+def _fps_ventana(dt, frames, frame_num, elapsed_global):
+    """El ritmo de los últimos ``frames`` frames, no la media histórica.
+
+    El argumento es el tiempo del **último bloque** (``dt``), no el total. Con la
+    media global, el arranque del render se quedaba promediado para siempre: la
+    carga del modelo, la compilación de kernels de cuDNN y la VRAM fría
+    inflaban el denominador y hundían la cifra el resto del render, en
+    proporción inversa a lo corto que era el clip. Con la ventana, el arranque
+    sale del numerador en cuanto hay un segundo bloque, y lo que se enseña es lo
+    que la tarjeta está haciendo ahora.
+
+    Si ``dt`` no sirve (el reloj no avanzó, o dos emisiones en el mismo
+    instante) se cae a la media global para no publicar un cero, y si tampoco
+    esa sirve, a cero.
+    """
+    try:
+        if dt and float(dt) > 0:
+            return float(frames) / float(dt)
+    except (TypeError, ValueError, ZeroDivisionError):
+        pass
+    try:
+        if elapsed_global and float(elapsed_global) > 0:
+            return float(frame_num) / float(elapsed_global)
+    except (TypeError, ValueError, ZeroDivisionError):
+        pass
+    return 0.0
 
 
 def _get_duration_seconds(ffmpeg_path, video_path):
@@ -391,6 +435,9 @@ def compress_video(ffmpeg_path, input_path, output_path, settings,
             status_callback(message)
         logger.error(message)
         return False
+    # Un ratio de aspecto forzado necesita saber la geometría real del origen
+    # (sobre todo su SAR) para encajar la imagen sin deformarla.
+    settings = _with_aspect_box(ffmpeg_path, input_path, settings)
     settings["duration_seconds"] = _get_duration_seconds(ffmpeg_path, input_path)
 
     if ai_engines:
@@ -615,7 +662,7 @@ def generate_preview(ffmpeg_path, input_path, settings, progress_callback=None,
     )
 
     with tempfile.TemporaryDirectory() as tmpdir:
-        preview_settings = dict(settings)
+        preview_settings = _with_aspect_box(ffmpeg_path, input_path, settings)
         # El preview sólo necesita imagen: silenciamos el audio para evitar
         # errores opacos del muxer (p.ej. un mp4 con un audio source vorbis/
         # ac3/flac que -c:a copy no puede reempaquetar). El screenshot del
@@ -730,6 +777,198 @@ def generate_preview(ffmpeg_path, input_path, settings, progress_callback=None,
 # ---------------------------------------------------------------------------
 
 
+class _SourceGeometry(NamedTuple):
+    """Geometría con la que trabaja el render: la de la frame DECODIFICADA.
+
+    No es la que declara el contenedor. La rotación se la aplica FFmpeg al
+    decodificar (``autorotate``, activo por defecto) y su ``transpose``
+    devuelve el frame ya girado, con los lados cambiados y —medido con este
+    ffmpeg— el SAR invertido: un 320x240 SAR 8:9 marcado ``rotation=90`` sale
+    por el pipe como 240x320 SAR 9:8.
+
+    Es la única resolución de la fuente: ``frame_size``, el ``reshape``, el
+    tamaño del encoder, la resolución de export, el probe del "Model native"
+    y el ``-aspect`` leen todos estos campos. Si el render dimensiona con la
+    geometría codificada, el ``reshape`` lee la fila cruzada y el vídeo sale
+    girado y estirado (+77 % de DAR, medido en un 320x240 rot 90).
+    """
+
+    width: int
+    height: int
+    sar: tuple[int, int]   # SAR efectivo de la frame, (1, 1) si hay cuadrados
+    rotation: int          # ángulo del contenedor; diagnóstico
+
+
+def _resolve_source_geometry(info):
+    """Averigua una sola vez la geometría de la fuente a partir de la sonda."""
+    try:
+        width = int(info.get("width", 0) or 0)
+        height = int(info.get("height", 0) or 0)
+    except (TypeError, ValueError):
+        width = height = 0
+    if width <= 0 or height <= 0:
+        raise RuntimeError("Could not detect input video resolution.")
+
+    # El SAR es como el contenedor avisa de que sus píxeles no son cuadrados:
+    # un DVD anamórfico 720x480 llega con 8:9 (o 32:27 en 16:9) y así se ve
+    # 4:3 (o 16:9) en lugar de 3:2. ffprobe devuelve "1:1" cuando sí lo son.
+    try:
+        sar_num, sar_den = (int(v) for v in str(
+            info.get("sample_aspect_ratio") or "1:1").split(":"))
+    except (TypeError, ValueError):
+        sar_num, sar_den = 1, 1
+    if sar_num <= 0 or sar_den <= 0:
+        sar_num, sar_den = 1, 1
+
+    # El side data ``rotation`` viene como texto ("90", "-90") y no aparece en
+    # los ficheros sin matriz. Lo que no se entienda es 0, que es justo lo que
+    # hace FFmpeg cuando no hay matriz.
+    try:
+        rotation = int(round(float(info.get("rotation", 0) or 0))) % 360
+    except (TypeError, ValueError):
+        rotation = 0
+
+    if rotation in (90, 270):
+        width, height = height, width
+        sar_num, sar_den = sar_den, sar_num
+    return _SourceGeometry(width, height, (sar_num, sar_den), rotation)
+
+
+# ------------------------------------------------------- relación de aspecto
+# "Conservar el del origen" es lo de siempre: el vídeo sale con la forma que
+# tenía (con su SAR anamórfico si lo tenía). Los ratios del desplegable de
+# Compression Settings fuerzan la proporción de la SALIDA: la imagen no se
+# deforma nunca y lo que sobra se rellena con barras negras. Ambos caminos
+# (IA y compresión estándar) parten de la misma caja, calculada aquí.
+
+
+def _parse_aspect_ratio(value):
+    """Convierte la opción de la UI (``"16:9"``) en ``(16, 9)``.
+
+    ``None`` cuando no se está forzando ratio: ``"source"``, vacío o cualquier
+    cosa que no se entienda, que es exactamente el comportamiento de siempre.
+    """
+    text = str(value or "").strip().lower()
+    if text in ("", "source", "original", "auto", "none"):
+        return None
+    num_text, sep, den_text = text.partition(":")
+    try:
+        num, den = int(num_text), int(den_text)
+    except ValueError:
+        return None
+    if not sep or num <= 0 or den <= 0:
+        return None
+    return num, den
+
+
+def _even(value):
+    """Dimensión par (y como mínimo 2): lo que aceptan la mayoría de codecs.
+
+    Se redondea al par MÁS CERCANO, no siempre hacia arriba: con 16:9 sobre
+    una altura de 240 el ancho exacto es 426,67 y ``428`` deja el vídeo un
+    0,6 % más ancho que el ratio pedido (con 426 se queda un 0,3 % corto).
+    """
+    lower = (int(value) // 2) * 2
+    upper = lower + 2
+    return max(lower if (value - lower) <= (upper - value) else upper, 2)
+
+
+def _export_height(resolution):
+    """Altura de export elegida, o ``None`` si se dejó en "original"."""
+    text = str(resolution or "").strip()
+    if not text or text == "original":
+        return None
+    try:
+        return _even(int(text))
+    except ValueError:
+        return None
+
+
+def _fit_aspect_box(display_w, display_h, export_h, ratio):
+    """Caja de salida para un ratio forzado: ``(out_w, out_h, img_w, img_h)``.
+
+    ``display_w``/``display_h`` son las dimensiones de la imagen TAL COMO SE VE
+    (píxeles cuadrados), no las del contenedor: un 720x480 SAR 8:9 mide 640x480
+    a la vista, y sobre ese tamaño se calcula el encaje.
+
+    ``export_h`` es la altura que eligió el usuario (o ``None`` si dejó la
+    resolución en "original"). Con ella, la caja es exactamente
+    ``export_h * ratio`` de alto por ``ratio`` de ancho: se respeta la
+    resolución pedida y el ratio manda sobre el ancho. Sin ella no hay caja
+    máxima, así que sale la menor caja con ese ratio que CONTIENE la imagen
+    (nunca un recorte, y sin inventar barras de más).
+
+    Devuelve ``None`` si no hay ratio forzado: entonces la caja es la de
+    siempre y el SAR del origen se lleva al contenedor con ``-aspect``.
+    """
+    if ratio is None or display_w <= 0 or display_h <= 0:
+        return None
+    num, den = ratio
+    if export_h:
+        out_h = _even(export_h)
+        out_w = _even(out_h * num / den)
+    elif display_w * den > display_h * num:
+        # La imagen es más ancha que el ratio pedido: manda el ancho.
+        out_w = _even(display_w)
+        out_h = _even(out_w * den / num)
+    else:
+        out_h = _even(display_h)
+        out_w = _even(out_h * num / den)
+    # La imagen entra entera en la caja sin deformarse: se escala lo que
+    # quepa (el lado que tope manda) y el sobrante se rellena con barras.
+    scale = min(out_w / display_w, out_h / display_h)
+    img_w = min(_even(display_w * scale), out_w)
+    img_h = min(_even(display_h * scale), out_h)
+    return out_w, out_h, img_w, img_h
+
+
+def _pad_frame(im, out_w, out_h):
+    """Centra ``im`` (BGR uint8) en un lienzo negro de ``out_w`` x ``out_h``."""
+    if im.shape[0] == out_h and im.shape[1] == out_w:
+        return im
+    canvas = np.zeros((out_h, out_w) + im.shape[2:], dtype=np.uint8)
+    top = (out_h - im.shape[0]) // 2
+    left = (out_w - im.shape[1]) // 2
+    canvas[top:top + im.shape[0], left:left + im.shape[1]] = im
+    return canvas
+
+
+def _with_aspect_box(ffmpeg_path, input_path, settings):
+    """Deja en ``settings["aspect_box"]`` la caja de un ratio forzado.
+
+    ``build_args`` solo arma argumentos: no sondea el origen (sus tests la
+    llaman con rutas que no existen), así que el cálculo se hace aquí, donde ya
+    se conoce la geometría real y el SAR. Sin ratio forzado los ajustes se
+    devuelven tal cual, sin gastar un ``ffprobe``.
+    """
+    ratio = _parse_aspect_ratio((settings or {}).get("aspect"))
+    if ratio is None:
+        return settings
+    settings = dict(settings)
+    try:
+        src = _resolve_source_geometry(get_video_info(ffmpeg_path, input_path))
+    except Exception as exc:
+        # Un origen que no se puede sondear no puede dimensionar una caja:
+        # avisamos y salimos con el ratio del origen en vez de romper el render.
+        logger.warning(
+            "Could not resolve the source geometry for the %d:%d aspect "
+            "ratio (%s); keeping the source aspect ratio",
+            ratio[0], ratio[1], exc,
+        )
+        return settings
+    box = _fit_aspect_box(
+        src.width * src.sar[0], src.height * src.sar[1],
+        _export_height(settings.get("resolution")), ratio,
+    )
+    if box:
+        settings["aspect_box"] = box
+        logger.info(
+            "Aspect ratio %d:%d forced: %dx%d output with a %dx%d image",
+            ratio[0], ratio[1], box[0], box[1], box[2], box[3],
+        )
+    return settings
+
+
 def compress_video_with_ai(
     ffmpeg_path,
     input_path,
@@ -809,8 +1048,6 @@ def compress_video_with_ai(
     output_path = _make_temp_output_path(final_output_path)
 
     info = get_video_info(ffmpeg_path, input_path)
-    src_w = int(info.get("width", 0))
-    src_h = int(info.get("height", 0))
     # ffprobe devuelve el framerate en ``r_frame_rate`` (ej. "30000/1001"
     # ó "30/1"). Pasamos la cadena tal cual al encoder de FFmpeg (que acepta
     # la forma X/Y) y derivamos un float para matemáticas de progreso.
@@ -837,8 +1074,16 @@ def compress_video_with_ai(
         nb_frames_int = 0
     total_frames = nb_frames_int or est_total
 
-    if src_w == 0 or src_h == 0:
-        raise RuntimeError("Could not detect input video resolution.")
+    # Geometría de la frame que sale del decoder, resuelta una sola vez: todo
+    # lo que sigue (frame_size, reshape, tamaño del encoder, export, probe)
+    # lee estos campos.
+    src = _resolve_source_geometry(info)
+    if src.rotation:
+        logger.info(
+            "Source is tagged for %s° rotation: FFmpeg rotates it while "
+            "decoding, so the render works on %dx%d frames",
+            src.rotation, src.width, src.height,
+        )
 
     if status_callback:
         status_callback("AI pipeline: probing video info...")
@@ -860,8 +1105,8 @@ def compress_video_with_ai(
 
     chain_scale = _compute_total_scale(engines)
     scale = chain_scale if chain_scale > 1 else ui_scale
-    dst_w = src_w * scale
-    dst_h = src_h * scale
+    dst_w = src.width * scale
+    dst_h = src.height * scale
 
     # Si el usuario eligió una resolución de export (ej. 720p), usarla como
     # tamaño final del encoder.  El frame upscaled puede ser más grande
@@ -871,7 +1116,7 @@ def compress_video_with_ai(
     if export_res and export_res != "original":
         try:
             export_h = int(export_res)
-            export_w = int(src_w * (export_h / src_h))
+            export_w = int(src.width * (export_h / src.height))
             # Forzar par (requerido por la mayoría de codecs).
             export_w = export_w + (export_w % 2)
             export_h = export_h + (export_h % 2)
@@ -901,7 +1146,7 @@ def compress_video_with_ai(
     # medición falla por cualquier motivo, caemos al cálculo escalado.
     if settings.get("ai_native") and settings.get("resolution", "original") == "original":
         try:
-            probe = np.zeros((src_h, src_w, 3), dtype=np.uint8)
+            probe = np.zeros((src.height, src.width, 3), dtype=np.uint8)
             for _e in list(steps_antes) + list(steps_despues):
                 if getattr(_e, "_failed", False):
                     continue
@@ -929,6 +1174,62 @@ def compress_video_with_ai(
             logger.warning(
                 "Model native probe failed (%s); falling back to the "
                 "computed scaled resolution %dx%d", exc, dst_w, dst_h,
+            )
+
+    # --- Relación de aspecto de salida ------------------------------------
+    # Sin ratio forzado (lo de siempre) el tamaño del encoder es el de más
+    # arriba y el SAR del origen viaja al contenedor con ``-aspect`` (abajo).
+    # Con ratio forzado manda la caja: el encoder mide exactamente ese ratio
+    # (la altura elegida en Resolution manda, el ratio da el ancho) y cada
+    # frame se encaja dentro con barras negras en vez de estirarse.
+    aspect_box = _fit_aspect_box(
+        dst_w * src.sar[0], dst_h * src.sar[1],
+        _export_height(settings.get("resolution")),
+        _parse_aspect_ratio(settings.get("aspect")),
+    )
+    content_w = content_h = 0
+    if aspect_box:
+        dst_w, dst_h, content_w, content_h = aspect_box
+        logger.info(
+            "Aspect ratio forced: encoder sized to %dx%d with a %dx%d image",
+            dst_w, dst_h, content_w, content_h,
+        )
+        if status_callback:
+            status_callback(
+                f"Aspect ratio {settings.get('aspect')} selected: the output "
+                f"is {dst_w}x{dst_h} with the image at {content_w}x{content_h} "
+                f"and black bars to fill the rest."
+            )
+
+    # El tamaño final ya no cambia a partir de aquí, así que ya se puede
+    # fijar la relación de aspecto de salida. El encoder lee frames
+    # rawvideo (siempre de píxeles cuadrados), así que si la frame tiene SAR
+    # distinto de 1:1 hay que escribirlo: el upscale multiplica los dos lados
+    # por el MISMO factor y el SAR vale igual en el destino, con lo que el
+    # display aspect ratio sobrevive sin tocar ni un fotograma. Sin esto un
+    # 4:3 anamórfico salía 3:2 (+12,5 % de ancho) y un 16:9 salía 3:2
+    # (-15,6 %, justo lo que el usuario llamaba "apretado"). Con píxeles
+    # cuadrados no se añade nada y el comando queda como estaba. Con ratio
+    # forzado tampoco: las barras ya dejan la caja en píxeles cuadrados con
+    # la proporción pedida, así que un ``-aspect`` aquí la deformaría.
+    sar_num, sar_den = src.sar
+    aspect_args = []
+    if sar_num != sar_den and not aspect_box:
+        num, den = src.width * sar_num, src.height * sar_den
+        divisor = math.gcd(num, den)
+        display_aspect = f"{num // divisor}:{den // divisor}"
+        aspect_args = ["-aspect", display_aspect]
+        logger.info(
+            "Decoded frame has non-square pixels (SAR %s): encoding the "
+            "output as %s so the display aspect ratio matches the source",
+            f"{sar_num}:{sar_den}", display_aspect,
+        )
+        if status_callback:
+            turn = f", rotated {src.rotation}°" if src.rotation else ""
+            status_callback(
+                f"Source pixels are not square (SAR "
+                f"{info.get('sample_aspect_ratio')}{turn}): the output keeps "
+                f"display aspect {display_aspect} so it is not stretched."
             )
 
     # If interpolating, double the FPS for the encoder so the output
@@ -1039,10 +1340,13 @@ def compress_video_with_ai(
         "-v", "error",
         "pipe:1",
     ])
+    # Ojo: aquí NO se toca la rotación. La aplica FFmpeg al decodificar
+    # (``autorotate``), y por eso lo que sale del pipe mide ``src.width`` x
+    # ``src.height``, no lo que declara el contenedor.
     dec_kwargs = {
         "stdout": subprocess.PIPE,
         "stderr": subprocess.PIPE,
-        "bufsize": src_w * src_h * 3 * 4,  # buffer ~4 frames
+        "bufsize": src.width * src.height * 3 * 4,  # buffer ~4 frames
     }
     dec_kwargs.update(process_group_popen_kwargs())
     dec_proc = subprocess.Popen(dec_cmd, **dec_kwargs)
@@ -1074,6 +1378,7 @@ def compress_video_with_ai(
     ]
     if not is_gpu_codec:
         enc_cmd.extend(["-preset", preset])
+    enc_cmd.extend(aspect_args)
     # Only apply the default yuv420p pixel format if the codec-specific
     # extra args (e.g. 10-bit NVENC) haven't already overridden it.
     if "-pix_fmt" not in codec_extra_args:
@@ -1125,13 +1430,16 @@ def compress_video_with_ai(
         "timestamp": datetime.now().isoformat(),
         "input": input_path,
         "output": final_output_path,
-        "source_resolution": f"{src_w}x{src_h}",
+        "source_resolution": f"{src.width}x{src.height}",
+        "source_rotation": src.rotation,
         "ai_engine": chain_name,
         "ai_engines": engine_ids,
         "ai_scale": scale,
         "interpolation": do_interpolate,
         "export_resolution": settings.get("resolution", "original"),
+        "aspect_ratio": settings.get("aspect", "source"),
         "final_resolution": f"{dst_w}x{dst_h}",
+        "output_aspect": (aspect_args[1] if aspect_args else "1:1"),
         "codec": vcodec,
         "preset": preset,
         "bitrate_kbps": settings.get("bitrate", 1500),
@@ -1225,9 +1533,16 @@ def compress_video_with_ai(
         except Exception:
             logger.exception("Error killing %s subprocess", name)
 
-    frame_size = src_w * src_h * 3  # BGR24
+    frame_size = src.width * src.height * 3  # BGR24
     frame_num = 0
     t_start = time.time()
+    # Instante de la última publicación de métricas. El fps que se enseña es
+    # el de los últimos ``VENTANA_METRICAS_IA`` frames, no la media desde
+    # ``t_start``: el arranque del render (el primer frame, con cuDNN compilando
+    # y autotuneando kernels, y los primeros frames con la VRAM aún fría) se
+    # quedaba promediado para siempre, y en un clip corto eso hundía el
+    # número aunque el motor fuera igual de rápido de principio a fin.
+    t_ventana = t_start
     prev_front = None  # Salida del frente de la cadena (steps_antes) del frame anterior.
     # Telemetría (P0): presupuesto real por etapa. Nace de una medición donde
     # el 35 % del frame se iba en post-proceso CPU y el 18 % en PIL, sin que
@@ -1350,6 +1665,23 @@ def compress_video_with_ai(
                 resized = np.repeat(resized[..., None], 3, axis=2)
             return resized
 
+    def _fit_output(im):
+        """Lleva una frame de la cadena al tamaño exacto del encoder.
+
+        Sin ratio forzado es un resize a (dst_w, dst_h) como siempre. Con
+        ratio forzado la imagen se encaja en (content_w, content_h) -- su
+        tamaño VISIBLE, con el SAR del origen aplicado, así que un 4:3
+        anamórfico no sale estirado -- y se centra con barras negras en la caja
+        del ratio pedido.
+        """
+        if im.shape[0] == dst_h and im.shape[1] == dst_w:
+            return im
+        with stage_timer.stage("resize"):
+            if content_w:
+                scaled = _resize_frame(im, content_w, content_h)
+                return _pad_frame(scaled, dst_w, dst_h)
+            return _resize_frame(im, dst_w, dst_h)
+
     # --- P1: pre/post-proceso en GPU (apagado por defecto) -----------------
     # Se intenta DESPUÉS de conocer el tamaño final del encoder y antes del
     # bucle. Si algo no cuadra (preferencia apagada, sin CUDA, autocomprobación
@@ -1357,7 +1689,7 @@ def compress_video_with_ai(
     try:
         gpu_post_report = _configure_gpu_post_for_chain(
             steps_antes, steps_despues, interp_step,
-            dst_w, dst_h, src_w, src_h, _resize_frame, status_callback,
+            dst_w, dst_h, src.width, src.height, _resize_frame, status_callback,
         )
     except Exception as exc:
         # Un fallo aquí NUNCA puede impedir el render: se sigue por el camino
@@ -1399,7 +1731,8 @@ def compress_video_with_ai(
                 raw = dec_proc.stdout.read(frame_size)
                 if not raw or len(raw) < frame_size:
                     break  # EOF or incomplete frame
-                frame = np.frombuffer(raw, dtype=np.uint8).reshape((src_h, src_w, 3))
+                frame = np.frombuffer(raw, dtype=np.uint8).reshape(
+                    (src.height, src.width, 3))
 
 # --- Cadena de AI: frente (pasos previos a la interpolación) ---
             # Aplicamos en orden todas las engines que van ANTES del paso de
@@ -1446,18 +1779,13 @@ def compress_video_with_ai(
             prev_front = cur_front
 
             # Ajustar tamaño al encoder y escribir.
-            if upscaled.shape[0] != dst_h or upscaled.shape[1] != dst_w:
-                with stage_timer.stage("resize"):
-                    upscaled = _resize_frame(upscaled, dst_w, dst_h)
+            upscaled = _fit_output(upscaled)
 
             frames_to_write = []
             if interp_pending is not None:
                 if interp_pending.dtype != np.uint8:
                     interp_pending = np.clip(interp_pending, 0, 255).astype(np.uint8)
-                if interp_pending.shape[0] != dst_h or interp_pending.shape[1] != dst_w:
-                    with stage_timer.stage("resize"):
-                        interp_pending = _resize_frame(interp_pending, dst_w, dst_h)
-                frames_to_write.append(interp_pending)
+                frames_to_write.append(_fit_output(interp_pending))
             frames_to_write.append(upscaled)
 
             for out_frame in frames_to_write:
@@ -1488,17 +1816,27 @@ def compress_video_with_ai(
                 elapsed = time.time() - t_start
                 pct = min(95, int((elapsed / duration) * 50))  # rough estimate
                 progress_callback(pct)
-            if frame_num % 30 == 0 and (metrics_cb or status_callback):
-                elapsed = time.time() - t_start
-                speed = frame_num / elapsed if elapsed > 0 else 0
+            if frame_num % VENTANA_METRICAS_IA == 0 and (metrics_cb or status_callback):
+                ahora = time.time()
+                # Ritmo de AHORA, no promedio historico. La primera ventana
+                # arranca en t_start, asi que cubre los primeros 30 frames y
+                # solo ellos; a partir de ahi el numero se va recalculando
+                # sobre la ventana anterior. Si el reloj no avanza (o casi), se
+                # cae a la media global para no publicar un cero.
+                dt = ahora - t_ventana
+                speed = _fps_ventana(
+                    dt, VENTANA_METRICAS_IA, frame_num, ahora - t_start)
+                t_ventana = ahora
                 if metrics_cb:
                     # El MISMO numero que el texto de abajo, pero como dato.
                     # Maquetado en una frase no sirve: el desplegable de la
                     # bandeja no puede parsear una cadena que ademas esta
                     # escrita en ingles y puede cambiar de un dia para otro.
-                    _emit_metrics(metrics_cb, fps=speed or None,
-                                  frame=frame_num,
-                                  total_frames=total_frames)
+                    # Las claves llevan prefijo ``ai_`` para que no choquen
+                    # con las de ffmpeg (``enc_``) en el desplegable.
+                    _emit_metrics(metrics_cb, ai_fps=speed or None,
+                                  ai_frame=frame_num,
+                                  ai_total_frames=total_frames)
                 if status_callback:
                     mode_label = "AI upscale+interp" if do_interpolate else "AI upscale"
                     status_callback(

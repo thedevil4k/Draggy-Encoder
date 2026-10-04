@@ -19,7 +19,7 @@ from __future__ import annotations
 import os
 from datetime import datetime
 
-from PySide6.QtCore import QSize, Qt
+from PySide6.QtCore import QSize, Qt, Signal
 from PySide6.QtGui import QColor, QPainter, QTextCursor
 from PySide6.QtWidgets import (
     QFrame,
@@ -238,7 +238,15 @@ class TaskCard(QFrame):
 
 
 class TasksPanel(QWidget):
-    """Panel lateral colapsable: pestaña Tasks (renders del usuario) + Log."""
+    """Panel lateral colapsable: pestaña Tasks (renders del usuario) + Log.
+
+    ``cancel_requested`` lo emite el ``✕`` de cada fila de la cola con el
+    ``queue_id`` afectado. El panel NO decide qué hacer con ese item: borrar
+    una fila en espera es suyo, pero parar un render en marcha es cosa de
+    quien tiene al worker (MainWindow), así que el botón solo avisa.
+    """
+
+    cancel_requested = Signal(str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -503,7 +511,7 @@ class TasksPanel(QWidget):
             return row
         row = QueueRow(queue_id, name)
         row.btn_remove.clicked.connect(
-            lambda _checked=False, qid=queue_id: self.remove_queue_item(qid)
+            lambda _checked=False, qid=queue_id: self.cancel_requested.emit(qid)
         )
         if item is not None:
             row.set_details(item)
@@ -530,17 +538,56 @@ class TasksPanel(QWidget):
             self._queue_layout.removeWidget(row)
             row.deleteLater()
 
-    def remove_queue_item(self, queue_id: str):
-        """Quita un item de la cola (UI + persistencia)."""
+    def remove_queue_item(self, queue_id: str) -> str:
+        """Aplica el ``✕`` de UNA fila: cancela ese item y quita la fila.
+
+        Devuelve el resultado de ``task_queue.cancel``:
+
+        - ``"cancelled"``: estaba esperando y sale de la cola.
+        - ``"aborted"``: tenía un render en marcha. La fila NO se borra:
+          se repinta como ABORTED y se queda visible, porque el render lo
+          para quien llama (MainWindow) y su cierre necesita un item al que
+          escribirle el final. Borrarla aquí dejaba un ffmpeg escribiendo
+          un archivo que la app ya no contaba.
+        - ``"finished"``: ya estaba terminado; la fila se descarta de la
+          lista (no hay render que parar, sólo ocupaba sitio).
+        - ``"not_found"``: fila fantasma; se descarta sin tocar el archivo.
+        - ``"error"``: no se pudo guardar el cambio; la fila se queda como
+          estaba, que es preferible a mostrar un estado que no se guardó.
+        """
         try:
             import src.task_queue as task_queue
-            task_queue.remove(queue_id)
+            result = task_queue.cancel(queue_id)
         except Exception:
-            pass
+            result = "error"
+        if result == "aborted":
+            self.set_queue_status(queue_id, "aborted")
+            return result
+        if result == "error":
+            return result
+        if result in ("finished", "not_found"):
+            # ``cancel`` no toca los items terminales ni los que no existen;
+            # aquí sólo se olvidan de la lista.
+            try:
+                import src.task_queue as task_queue
+                task_queue.remove(queue_id)
+            except Exception:
+                pass
+        self._forget_queue_row(queue_id)
+        return result
+
+    def _forget_queue_row(self, queue_id: str):
+        """Quita la fila de la lista y recontesta el estado de la cola."""
         self._remove_queue_row(queue_id)
         if not self._queue_rows:
             self._queue_empty.show()
             self._queue_progress_label.setText("No queued jobs")
+        else:
+            pending = sum(
+                1 for row in self._queue_rows.values()
+                if row.pill.text() == _QUEUE_STATUS_META["queued"][0]
+            )
+            self._queue_progress_label.setText(f"{pending} job(s) queued")
         self.set_queue_running(self._queue_running)
 
     def clear_queue_rows(self):
@@ -583,12 +630,19 @@ class TasksPanel(QWidget):
 # ---------------------------------------------------------------------------
 
 _QUEUE_STATUS_META = {
-    "queued":  ("QUEUED", "#7f8fa6"),
-    "running": ("RUNNING", "#00d2c3"),
-    "done":    ("DONE ✓", "#27ae60"),
-    "failed":  ("FAILED", "#e74c3c"),
-    "aborted": ("ABORTED", "#e67e22"),
+    "queued":      ("QUEUED", "#7f8fa6"),
+    "validating":  ("CHECKING", "#f1c40f"),
+    "preparing":   ("PREPARING", "#f1c40f"),
+    "running":     ("RUNNING", "#00d2c3"),
+    "muxing":      ("MUXING", "#00d2c3"),
+    "publishing":  ("PUBLISHING", "#00d2c3"),
+    "done":        ("DONE ✓", "#27ae60"),
+    "failed":      ("FAILED", "#e74c3c"),
+    "aborted":     ("ABORTED", "#e67e22"),
 }
+# Estados sin render detrás: su ``✕`` ya no cancela nada, sólo saca la
+# fila terminada de la lista.
+_QUEUE_TERMINAL_STATUS = {"done", "failed", "aborted"}
 
 
 class QueueRow(QFrame):
@@ -598,6 +652,11 @@ class QueueRow(QFrame):
     debajo un ``QLabel`` con rich-text y todo el snapshot del item: rutas,
     pipeline, engines de IA (modelo + escala + modo), ajustes de compresión,
     audio y timestamps.
+
+    El ``✕`` es la acción individual sobre ese item: cancela el render en
+    marcha, saca de la cola el que está en espera y descarta de la lista
+    el que ya terminó (done/failed/aborted), que ya no tiene nada que
+    cancelar pero sí ocupa sitio.
     """
 
     def __init__(self, queue_id, name, parent=None):
@@ -638,12 +697,19 @@ class QueueRow(QFrame):
         self._paint("queued")
         header.addWidget(self.pill)
 
+        # Cancelar SOLO este item. En espera quita la fila; en marcha para
+        # el render (lo hace MainWindow, que es quien tiene al worker).
         self.btn_remove = QPushButton("\u2715")  # ✕
-        self.btn_remove.setFixedWidth(24)
-        self.btn_remove.setToolTip("Remove from queue")
+        self.btn_remove.setFixedWidth(26)
+        self.btn_remove.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_remove.setStyleSheet(
-            "background: transparent; color: #a0a0b0; border: none; font-size: 12px;"
+            "QPushButton { background: transparent; color: #8a93ab; "
+            "border: none; font-size: 14px; }"
+            "QPushButton:hover { color: #e74c3c; background: #2a1a22; "
+            "border-radius: 4px; }"
         )
+        self.btn_remove.setToolTip("Cancel this job")
+        header.addSpacing(4)
         header.addWidget(self.btn_remove)
 
         outer.addLayout(header)
@@ -688,8 +754,16 @@ class QueueRow(QFrame):
         )
 
     def set_status(self, status: str):
-        if status in _QUEUE_STATUS_META:
-            self._paint(status)
+        self._paint(status)
+        # El botón acompaña al estado: siempre disponible (un item ya
+        # terminado también se puede quitar de la lista), pero con el
+        # texto que dice qué va a hacer DE VERDAD.
+        if status in _QUEUE_TERMINAL_STATUS:
+            self.btn_remove.setToolTip("Remove this finished job from the list")
+        elif str(status) == "queued":
+            self.btn_remove.setToolTip("Cancel this job and remove it from the queue")
+        else:
+            self.btn_remove.setToolTip("Stop this render now")
 
 
 def _format_queue_item_details(item: dict) -> str:

@@ -14,7 +14,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from src.config import AUDIO_OPTIONS, FORMATS, RESOLUTIONS
+from src.config import ASPECT_RATIOS, AUDIO_OPTIONS, FORMATS, RESOLUTIONS
 from src.hardware.codecs import get_available_devices_with_codecs
 from src import preferences
 from src.ui.audio_fx_panel import AudioFxPanel
@@ -144,28 +144,42 @@ class SettingsPanel(QWidget):
         grid.addWidget(self.resolution_label, 5, 0)
         grid.addWidget(self.resolution_combo, 5, 1)
 
+        # Aspect ratio
+        self.aspect_label = QLabel("Aspect Ratio")
+        self.aspect_combo = QComboBox()
+        for key, text in ASPECT_RATIOS:
+            self.aspect_combo.addItem(text, key)
+        self.aspect_combo.setToolTip(
+            "Keep source aspect ratio exports the video with the same shape "
+            "it has on the source (anamorphic pixels included).\n"
+            "Any other ratio keeps the image undistorted and pads it with "
+            "black bars to reach the ratio you pick."
+        )
+        grid.addWidget(self.aspect_label, 6, 0)
+        grid.addWidget(self.aspect_combo, 6, 1)
+
         # Device
         self.device_label = QLabel("Device")
         self.device_combo = QComboBox()
         for device_name in self.available_devices.keys():
             self.device_combo.addItem(device_name)
         self.device_combo.currentIndexChanged.connect(self._on_device_changed)
-        grid.addWidget(self.device_label, 6, 0)
-        grid.addWidget(self.device_combo, 6, 1)
+        grid.addWidget(self.device_label, 7, 0)
+        grid.addWidget(self.device_combo, 7, 1)
 
         # Codec
         self.codec_label = QLabel("Codec")
         self.codec_combo = QComboBox()
-        grid.addWidget(self.codec_label, 7, 0)
-        grid.addWidget(self.codec_combo, 7, 1)
+        grid.addWidget(self.codec_label, 8, 0)
+        grid.addWidget(self.codec_combo, 8, 1)
 
         # Export format
         self.format_label = QLabel("Export")
         self.format_combo = QComboBox()
         for key, text in FORMATS:
             self.format_combo.addItem(text, key)
-        grid.addWidget(self.format_label, 8, 0)
-        grid.addWidget(self.format_combo, 8, 1)
+        grid.addWidget(self.format_label, 9, 0)
+        grid.addWidget(self.format_combo, 9, 1)
 
         # Audio
         self.audio_label = QLabel("Audio")
@@ -173,8 +187,8 @@ class SettingsPanel(QWidget):
         for key, text in AUDIO_OPTIONS:
             self.audio_combo.addItem(text, key)
         self.audio_combo.currentIndexChanged.connect(self._on_audio_changed)
-        grid.addWidget(self.audio_label, 9, 0)
-        grid.addWidget(self.audio_combo, 9, 1)
+        grid.addWidget(self.audio_label, 10, 0)
+        grid.addWidget(self.audio_combo, 10, 1)
 
         # Audio track (the ordinal is used with FFmpeg's 0:a:N mapping).
         # It stays hidden until an imported video has at least one audio
@@ -186,13 +200,13 @@ class SettingsPanel(QWidget):
         )
         self.audio_track_label.setVisible(False)
         self.audio_track_combo.setVisible(False)
-        grid.addWidget(self.audio_track_label, 10, 0)
-        grid.addWidget(self.audio_track_combo, 10, 1)
+        grid.addWidget(self.audio_track_label, 11, 0)
+        grid.addWidget(self.audio_track_combo, 11, 1)
 
         # Audio boost
         self.audio_boost_check = QCheckBox("Audio Boost (normalize volume)")
         self.audio_boost_check.setChecked(False)
-        grid.addWidget(self.audio_boost_check, 11, 1)
+        grid.addWidget(self.audio_boost_check, 12, 1)
 
         # Desplegable de Audio Boost avanzado. Va en la misma fila que la
         # casilla (a su izquierda), cerrado por defecto: el usuario que solo
@@ -209,11 +223,11 @@ class SettingsPanel(QWidget):
             "y limitación de picos. Sin tocar nada aquí, el boost se aplica\n"
             "igual que siempre."
         )
-        grid.addWidget(self.audio_fx_toggle, 11, 0, alignment=Qt.AlignLeft)
+        grid.addWidget(self.audio_fx_toggle, 12, 0, alignment=Qt.AlignLeft)
 
         self.audio_fx_panel = AudioFxPanel()
         self.audio_fx_panel.setVisible(False)
-        grid.addWidget(self.audio_fx_panel, 12, 0, 1, 2)
+        grid.addWidget(self.audio_fx_panel, 13, 0, 1, 2)
 
         self.audio_fx_toggle.toggled.connect(self._on_audio_fx_toggle_clicked)
         self.audio_fx_panel.changed.connect(self._on_audio_fx_changed)
@@ -221,7 +235,7 @@ class SettingsPanel(QWidget):
         # Trim
         self.trim_check = QCheckBox("Trim (only export a portion of the video)")
         self.trim_check.toggled.connect(self._on_trim_toggled)
-        grid.addWidget(self.trim_check, 12, 1)
+        grid.addWidget(self.trim_check, 13, 1)
 
         self.start_edit = QLineEdit("00:00:00")
         self.end_edit = QLineEdit("00:00:00")
@@ -232,7 +246,7 @@ class SettingsPanel(QWidget):
         trim_layout.addWidget(self.start_edit)
         trim_layout.addWidget(QLabel("End"))
         trim_layout.addWidget(self.end_edit)
-        grid.addLayout(trim_layout, 13, 1)
+        grid.addLayout(trim_layout, 14, 1)
 
         layout.addWidget(group)
         layout.addStretch()
@@ -389,6 +403,7 @@ class SettingsPanel(QWidget):
             "target_size_mb": self.value_spin.value(),
             "output_name": self.output_name_edit.text().strip(),
             "resolution": self.resolution_combo.currentData(),
+            "aspect": self.aspect_combo.currentData(),
             "device": self.device_combo.currentText(),
             "codec": self.codec_combo.currentData(),
             "format": self.format_combo.currentData(),

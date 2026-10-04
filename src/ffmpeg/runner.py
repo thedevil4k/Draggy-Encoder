@@ -150,6 +150,14 @@ def run_ffmpeg(ffmpeg_path, args, progress_callback=None, abort_event=None,
     ``speed`` y ``frame`` en cada tic, y hasta ahora se leian enteros y se
     tiraban: aqui se recuperan y se pasan como un dict, a lo mucho una vez
     por segundo, que es cada cuanto una persona puede leerlos.
+
+    Las claves llevan prefijo ``enc_`` (``enc_fps``, ``enc_speed``,
+    ``enc_frame``, ``enc_out_time``) porque este canal no es el unico que
+    escribe en el desplegable: el bucle de render de IA publica sus propias
+    cifras con prefijo ``ai_``. Con dos fuentes escribiendo en la misma clave
+    ``fps``, la que hablaba ultimo borraba a la otra y no habia forma de saber
+    a quien pertenecía el numero que se veia en pantalla. Prefijar es lo que
+    hace falta para que ambas convivan.
     """
     # Human-readable FFmpeg statistics are written with carriage returns and
     # are therefore buffered by ``for line in stdout`` until the encode ends.
@@ -183,6 +191,8 @@ def run_ffmpeg(ffmpeg_path, args, progress_callback=None, abort_event=None,
     # bloque -progress llega cada ``stats_period`` (100 ms), que para una
     # persona es ruido: se guarda lo ultimo y se emite como mucho una vez
     # por segundo.
+    # ``latest`` lleva prefijo ``enc_`` en todas sus claves: lo que hay aqui
+    # es siempre lo que dijo ffmpeg, nunca lo que va contando el motor de IA.
     latest = {}
     last_metrics_emit = [0.0]
 
@@ -236,24 +246,23 @@ def run_ffmpeg(ffmpeg_path, args, progress_callback=None, abort_event=None,
             # puede comerse el dato, solo la publicacion.
             if key.strip() in ("fps", "frame"):
                 try:
-                    latest["fps" if key.strip() == "fps" else "frame"] = (
-                        float(value.strip()))
+                    latest["enc_" + key.strip()] = float(value.strip())
                 except ValueError:
                     pass
             elif key.strip() == "speed":
                 texto = value.strip()
                 try:
                     # ffmpeg escribe "1.25x"; el numero solo, sin la x.
-                    latest["speed"] = float(texto.rstrip("x"))
+                    latest["enc_speed"] = float(texto.rstrip("x"))
                 except ValueError:
                     pass
             elif key.strip() == "out_time":
-                latest["out_time"] = _parse_time_to_seconds(value.strip())
+                latest["enc_out_time"] = _parse_time_to_seconds(value.strip())
             else:
                 try:
                     # out_time_us y out_time_ms son microsegundos las dos
                     # (el nombre en "_ms" es historico).
-                    latest["out_time"] = float(value.strip()) / 1_000_000.0
+                    latest["enc_out_time"] = float(value.strip()) / 1_000_000.0
                 except ValueError:
                     pass
 
@@ -416,7 +425,7 @@ def get_video_info(ffmpeg_path, video_path):
             ffprobe,
             "-v", "error",
             "-select_streams", "v:0",
-            "-show_entries", "format=duration,size,bit_rate:stream=width,height,r_frame_rate,codec_name,nb_frames",
+            "-show_entries", "format=duration,size,bit_rate:stream=width,height,r_frame_rate,codec_name,nb_frames,sample_aspect_ratio:stream_side_data=rotation",
             "-of", "default=noprint_wrappers=1",
             video_path,
         ]
@@ -698,10 +707,27 @@ def build_args(input_path, output_path, settings, loudnorm_meas=None):
     else:
         args.extend(["-b:v", f"{settings.get('bitrate', 1500)}k"])
 
-    # Resolución
-    resolution = settings.get("resolution")
-    if resolution and resolution != "original":
-        args.extend(["-vf", f"scale=-2:{resolution}"])
+    # Relación de aspecto y resolución.
+    # ``aspect_box`` (out_w, out_h, img_w, img_h) lo calcula el pipeline, que
+    # es quien conoce el SAR del origen: la imagen se escala a su tamaño
+    # visible, se centra con barras negras en la caja del ratio pedido y queda
+    # con píxeles cuadrados. Sin ratio forzado (``aspect`` = "source", que es
+    # el defecto) el vídeo sale con la proporción de siempre, y entonces la
+    # resolución elegida sigue mandando: ``-2`` da la paridad y el SAR lo
+    # conserva FFmpeg, con lo que el display aspect ratio no se toca.
+    aspect_box = settings.get("aspect_box")
+    if aspect_box:
+        out_w, out_h, img_w, img_h = (int(v) for v in aspect_box)
+        args.extend([
+            "-vf",
+            f"scale={img_w}:{img_h},"
+            f"pad={out_w}:{out_h}:(ow-iw)/2:(oh-ih)/2:color=black,"
+            f"setsar=1",
+        ])
+    else:
+        resolution = settings.get("resolution")
+        if resolution and resolution != "original":
+            args.extend(["-vf", f"scale=-2:{resolution}"])
 
     # Audio con soporte de audio boost (single-pass o two-pass lineal)
     audio = settings.get("audio", "copy")

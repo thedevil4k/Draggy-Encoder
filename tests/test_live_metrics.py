@@ -178,7 +178,8 @@ def test_un_porcentaje_se_escribe_como_lo_lee_una_persona(valor, esperado):
 
 def test_un_porcentaje_que_no_es_numero_no_revienta_la_pantalla():
     """Un dato corrupto se enseña como "no sé", no como un fallo."""
-    for basura in ("mucho", object(), [], float("nan")):
+    for basura in ("mucho", object(), [], float("nan"), float("inf"),
+                   float("-inf")):
         assert format_percent(basura) == "—"
 
 

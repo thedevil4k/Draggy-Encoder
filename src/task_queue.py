@@ -20,6 +20,7 @@ API:
 - ``enqueue(*, name, input_path, output_path, settings, ai_engines,
   pipeline_order) -> str`` (devuelve el nuevo id)
 - ``remove(queue_id) -> bool``
+- ``cancel(queue_id) -> str`` (cancela UN item: ver sus códigos)
 - ``clear() -> bool``
 - ``list_items(limit=None) -> list[dict]`` (orden de encolado)
 - ``get_item(queue_id) -> dict | None``
@@ -60,6 +61,12 @@ _ALLOWED_TRANSITIONS = {
     "failed": {"failed"},
     "aborted": {"aborted"},
 }
+# Estados en los que el item ya tiene un render en marcha detrás. Cancelar
+# aquí no es borrar una fila: es parar ese render, y por eso ``cancel`` NO
+# borra el item sino que lo deja marcado como ``aborted`` (quien llama es el
+# responsable de detener el proceso; al cerrarse, el worker vuelve por su
+# propio camino y la fila queda coherente).
+_ACTIVE_STATUS = {"validating", "preparing", "running", "muxing", "publishing"}
 _LOCK = threading.Lock()
 
 
@@ -222,6 +229,51 @@ def first_pending() -> Optional[dict]:
 
 def count() -> int:
     return len(list_items())
+
+
+def is_active(queue_id: str) -> bool:
+    """¿El item tiene un render en marcha ahora mismo?"""
+    item = get_item(queue_id)
+    return bool(item) and str(item.get("status")) in _ACTIVE_STATUS
+
+
+def cancel(queue_id: str) -> str:
+    """Cancela UN item de la cola sin tocar los demás.
+
+    Devuelve qué pasó, para que la UI sepa si tiene que hacer algo más:
+
+    - ``"cancelled"``: estaba esperando su turno; sale de la cola.
+    - ``"aborted"``: estaba en marcha. El item queda marcado ``aborted``
+      (NO se borra: el render sigue vivo hasta que quien llama lo para,
+      y su cierre necesita un item al que escribirle el final).
+    - ``"finished"``: ya estaba en un estado terminal; nada que cancelar.
+    - ``"not_found"`` / ``"error"``: no existe o no se pudo guardar.
+
+    Quitar la fila a pelo (``remove``) con un render en marcha dejaba al
+    worker escribiendo un archivo que la app ya no contaba; por eso el
+    borrado y la parada van en la misma decisión.
+    """
+    with _LOCK:
+        items = _load_raw()
+        idx = _get_index(items, queue_id)
+        if idx < 0:
+            return "not_found"
+        current = str(items[idx].get("status") or "queued")
+        if current in _ACTIVE_STATUS:
+            items[idx]["status"] = "aborted"
+            items[idx]["error"] = "Cancelled by user."
+            items[idx]["finished_at"] = _now()
+            items[idx].setdefault("state_history", []).append({
+                "from": current,
+                "to": "aborted",
+                "at": _now(),
+                "error": "Cancelled by user.",
+            })
+            return "aborted" if _save_raw(items) else "error"
+        if current in _TERMINAL_STATUS:
+            return "finished"
+        items.pop(idx)
+        return "cancelled" if _save_raw(items) else "error"
 
 
 def remove(queue_id: str) -> bool:

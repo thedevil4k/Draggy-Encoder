@@ -68,9 +68,10 @@ def _assert_slug(engine_id) -> str:
 #                     FaceRestore. Anything else groups under "Other".
 #   hf_repo_id:       str, HuggingFace "<owner>/<repo>" pair.
 #   hf_url:           str, full HTTPS clone URL.
-#   size_estimate:    str, human-readable on-disk size ("~67 MB").
-#   sample_shape:     str, declarative input/output shape description
-#                     ("1x3xHxW -> 1x3x(4H)x(4W)").
+#   size_estimate:    str, human-readable on-disk size ("~67 MB").    #   sample_shape:     str, declarative input/output shape description
+    #                     ("1x3xHxW -> 1x3x(4H)x(4W)"). OJO: es texto
+    #                     orientativo para la fila; la escala REAL de un
+    #                     upscale se lee del fichero instalado, no de aquí.
 #   license:          str, SPDX-ish identifier (Apache-2.0, MIT, BSD-3,
 #                     Custom). Used to surface licensing in the UI.
 #   popularity_score: int 0-100, hand-curated proxy for "how many users
@@ -162,9 +163,12 @@ CATALOG = [
         "sentinel": "README.md",
         "lfs_warning": False,
         "similar_models_url": "https://openmodeldb.info/models/4x-realesr-animevideo-v3",
-        # Como en video2x: el modelo admite 2x, 3x y 4x (la escala elegida
-        # se comunica a la engine vía _target_scale y el encoder re-encaja).
-        "supported_scales": [2, 3, 4],
+        # SIN ``supported_scales`` a propósito: un modelo no admite varias
+        # escalas, cada fichero hornea la suya. video2x tenía 2x/3x/4x porque
+        # son tres pesos distintos; aquí el .onnx/.pth es un x4 y ofrecer x2 o
+        # x3 sólo significaba ejecutar el upscale entero para tirar el
+        # resultado hacia abajo. La escala real de cada fichero instalado se
+        # lee del modelo (src.ai.architectures.detect_model_file_scale).
     },
     {
         "engine_id": "upscale-realesr-general-x4v3",
@@ -535,6 +539,12 @@ def get_scale_factor(engine_id: str) -> int:
     """Parse the scale factor from sample_shape (e.g. 4 for 4x upscale).
 
     Returns 1 if the scale factor cannot be determined.
+
+    Es la escala que el catálogo DECLARA, no la que el modelo hace: sirve
+    para la ficha del engine, nunca para dimensionar un render. Para lo
+    último está ``src.ai.architectures.detect_model_file_scale``, que lee
+    el fichero instalado (un "x2plus" de AI-Forever resulta ser un x4 y el
+    catálogo no puede saberlo).
     """
     import re
     entry = get_entry(engine_id)
@@ -547,28 +557,6 @@ def get_scale_factor(engine_id: str) -> int:
         return int(m.group(1))
     return 1
 
-
-def get_supported_scales(engine_id: str) -> list:
-    """Factores de upscale que el catálogo declara para una engine.
-
-    Cuando el entry tiene ``supported_scales`` (p.ej. AnimeVideo v3 con
-    ``[2, 3, 4]`` como en video2x) se devuelve esa lista; si no, una lista
-    con un único factor derivado de ``sample_shape`` (o vacía si no se
-    puede determinar).
-    """
-    entry = get_entry(engine_id)
-    if not entry:
-        return []
-    supported = entry.get("supported_scales")
-    if isinstance(supported, list):
-        try:
-            scales = sorted({int(s) for s in supported if int(s) > 1})
-        except (TypeError, ValueError):
-            scales = []
-        if scales:
-            return scales
-    native = get_scale_factor(engine_id)
-    return [native] if native > 1 else []
 
 
 # ---------------------------------------------------------------------------

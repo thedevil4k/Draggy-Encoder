@@ -34,39 +34,34 @@ NODE_CATEGORY = {
 
 
 # -----------------------------------------------------------------------
-# Scale parsing from model filenames.
+# Escala nativa de un modelo: se lee el fichero, no su nombre
 # -----------------------------------------------------------------------
 
 
-def _parse_model_scale_from_name(fname: str) -> int:
-    """Extract an upscale factor (2, 3, 4, 8...) from a weight filename.
+def _detect_file_scale(model_path: str):
+    """Escala NATIVA de un fichero de pesos: ``(escala, probada)``.
 
-    Handles the naming conventions found in the Real-ESRGAN / Real-CUGAN /
-    OmniSR ecosystem, both orders ("x4plus", "x4v3", "4x-UltraSharp") and
-    with or without separators. Returns 1 when no scale can be parsed.
+    La escala se lee por dentro -- grafo del ONNX o formas de los tensores
+    del state_dict -- porque el nombre y el catálogo mienten:
+    ``OmniSR_X2_DIV2K.onnx`` es un x8, los "x2plus" de AI-Forever son x4 y
+    el catálogo declaraba 2x/3x/4x para un único .onnx que sólo hace x4.
+
+    Ofrecer un factor que el modelo no tiene significa pagar el upscale
+    entero para luego tirar el resultado hacia abajo (perf-audit.md §3.5),
+    así que cuando la escala no se puede PROBAR se devuelve la pista del
+    nombre marcada como no probada y la UI no la ofrece.
     """
-    import re
-
-    # ``(\d+)x`` or ``x(\d+)`` where the following character is a word
-    # boundary or separator, so "x4plus"/"x4v3" and "4x-UltraSharp" match
-    # but "anime6B" (no x) and "somethingdx" (x only) do not.
-    patterns = [
-        # x2, x4, x8... possibly followed by plus/vN or ending the name
-        re.compile(r"[xX](\d+)(?=(?:plus|v\d+)?(?:$|[\s_.-]))", re.IGNORECASE),
-        # 2x, 4x ... prefixed to the name
-        re.compile(r"(?:^|[\s_.-])(\d+)[xX](?=(?:plus|v\d+)?(?:$|[\s_.-]))", re.IGNORECASE),
-    ]
-    best = 1
-    for _rx in patterns:
-        for _m in _rx.finditer(fname):
-            try:
-                _v = int(_m.group(1))
-            except (TypeError, ValueError):
-                continue
-            # Ignore absurd numbers that look like model versions/resolutions.
-            if 1 < _v <= 64:
-                best = max(best, _v)
-    return best
+    from src.ai.architectures import get_model_file_scale, parse_scale_from_name
+    proven = get_model_file_scale(model_path)
+    if proven > 1:
+        hint = parse_scale_from_name(os.path.basename(model_path))
+        if hint > 1 and hint != proven:
+            logger.info(
+                "%s really upscales x%d (its name says x%d)",
+                os.path.basename(model_path), proven, hint,
+            )
+        return proven, True
+    return parse_scale_from_name(os.path.basename(model_path)), False
 
 
 # -----------------------------------------------------------------------
@@ -535,68 +530,50 @@ class AIWorkflowStep(QFrame):
         self.engine_changed.emit(self.name, info.get("engine_id", ""))
 
     def _populate_scale_dropdown(self, engine_id):
-        """Populate the scale dropdown with available scale factors for this engine."""
+        """Rellena el desplegable con los factores que esta engine SÍ puede hacer.
+
+        Cada opción sale de un fichero instalado cuya escala se ha podido
+        PROBAR leyendo el modelo. Un modelo no admite varias escalas: cada
+        fichero hornea la suya, así que la opción significa "este fichero
+        produce x4" y nada más. Con un solo factor real no hay elección (se
+        muestra fijo); si no se puede probar ninguno, no se inventa ninguno
+        y el pipeline mide el frame real al renderizar.
+        """
         self.combo_scale.blockSignals(True)
         self.combo_scale.clear()
 
-        # Find all model files for this engine_id.
-        models = [m for m in self._all_model_files if m["engine_id"] == engine_id]
-        # Deduplicate scales, keep first occurrence for each scale.
+        # Un factor por fichero; los duplicados (p.ej. un .onnx y su .pth,
+        # que son el mismo upscale) colapsan en una sola opción.
         seen_scales = {}
-        for m in models:
-            s = m.get("scale", 1)
-            if s not in seen_scales:
+        for m in self._all_model_files:
+            if m.get("engine_id") != engine_id or not m.get("scale_proven"):
+                continue
+            try:
+                s = int(m.get("scale", 1))
+            except (TypeError, ValueError):
+                continue
+            if s > 1 and s not in seen_scales:
                 seen_scales[s] = m
 
-        # Scales que declara el catálogo (p.ej. AnimeVideo v3 soporta
-        # 2x/3x/4x como en video2x). Si el nombre del archivo no las
-        # revela todas, completamos el dropdown con ellas: la escala se
-        # comunica luego a la engine vía _target_scale y el encoder
-        # re-encaja el frame al factor elegido.
-        try:
-            from src.ai.registry import get_supported_scales
-            catalog_scales = get_supported_scales(engine_id) or []
-        except Exception:
-            catalog_scales = []
+        scales = sorted(seen_scales)
 
         def _data_for_scale(s):
-            # Prefiere el modelo real con esa escala; si no existe
-            # (archivo sin sufijo de escala), usa cualquier modelo de
-            # la engine — la engine upscala a su nativa y el encoder
-            # dimensiona al factor elegido.
-            m = seen_scales.get(s)
-            if m is not None:
-                return dict(m)
+            m = seen_scales[s]
+            # ``native``: esta opción ES la salida del modelo, sin re-encaje
+            # del encoder a otro factor. El pipeline mide un frame de la
+            # cadena para dimensionar el encoder con la medida real.
             return {
                 "engine_id": engine_id,
-                "model_path": None,
+                "model_path": m.get("model_path"),
                 "scale": s,
+                "native": True,
             }
 
-        scales = sorted({s for s in seen_scales if s > 1} | set(catalog_scales))
-
-        if len(scales) > 1:
-            # "Model native": la resolución de salida es EXACTAMENTE la que
-            # produce el modelo (su escala nativa), sin re-encaje del
-            # encoder a un factor elegido. Lleva ``scale`` = nativa del
-            # catálogo (para que la UI muestre la resolución real) y el
-            # flag ``native`` que el pipeline usa para medir el frame real.
-            native_scale = max(scales)
-            native_data = _data_for_scale(native_scale)
-            native_data["native"] = True
-
-            self.combo_scale.clear()
-            self.combo_scale.addItem("Model native", native_data)
+        if scales:
             for s in scales:
                 self.combo_scale.addItem(f"{s}x", _data_for_scale(s))
             self.combo_scale.setCurrentIndex(0)
-            self.combo_scale.setEnabled(True)
-            self.combo_scale.setVisible(True)
-        elif len(scales) == 1:
-            s = scales[0]
-            self.combo_scale.addItem(f"{s}x", _data_for_scale(s))
-            self.combo_scale.setCurrentIndex(0)
-            self.combo_scale.setEnabled(False)
+            self.combo_scale.setEnabled(len(scales) > 1)
             self.combo_scale.setVisible(True)
         else:
             self.combo_scale.setVisible(False)
@@ -682,8 +659,10 @@ class AIWorkflowStep(QFrame):
     def _scan_model_files(self):
         """Scan installed engine directories for .pth/.onnx model files.
 
-        Returns a list of dicts with keys: label, data, engine_id, model_path, scale.
-        For upscale engines, extracts scale factor from filename (x2, x4, x8).
+        Returns a list of dicts with keys: label, data, engine_id,
+        model_path, scale, scale_proven. La escala se lee del FICHERO
+        (grafo ONNX o tensores del state_dict), no del nombre ni del
+        catálogo: ``scale_proven`` dice si se pudo demostrar.
         """
         import re
         from src.ai.registry import get_engine_dir
@@ -715,6 +694,8 @@ class AIWorkflowStep(QFrame):
                     "label": display_name,
                     "data": {"engine_id": eid, "model_path": None, "scale": 1},
                     "engine_id": eid,
+                    "scale": 1,
+                    "scale_proven": False,
                 })
                 continue
 
@@ -744,22 +725,10 @@ class AIWorkflowStep(QFrame):
                 if _skip:
                     continue
 
-                # Extract scale from filename: x2, x3, x4, x8, 4x, 2x, etc.
-                # Cubre nombres reales del ecosistema: "x4plus", "x4v3",
-                # "realesr-animevideov3-x4", "4x-UltraSharp", "Real_CUGAN_x2".
-                scale = _parse_model_scale_from_name(fname)
-                if scale < 2:
-                    # Ninguna pista en el nombre (p.ej. "model.safetensors"):
-                    # cae a la escala declarada en el catálogo si es una
-                    # engine upscale conocida y tiene escala > 1.
-                    try:
-                        from src.ai.registry import get_entry, get_scale_factor as _cat_scale
-                        _entry = get_entry(eid) or {}
-                        if _entry.get("category") == "Upscale":
-                            _cs = int(_cat_scale(eid) or 1)
-                            scale = _cs if _cs > 1 else 1
-                    except Exception:
-                        pass
+                # Escala real del fichero, leída por dentro (ver
+                # _detect_file_scale). Nada de fiarse del nombre: el
+                # dropdown de escala sólo ofrece factores probados.
+                scale, scale_proven = _detect_file_scale(mp)
 
                 # Build a human label.
                 short_name = os.path.splitext(fname)[0]
@@ -769,7 +738,12 @@ class AIWorkflowStep(QFrame):
                                "003_realSR_BSRGAN_DFO_s64w8_SwinIR-M_"]:
                     if short_name.startswith(prefix):
                         short_name = short_name[len(prefix):]
-                label = f"{display_name} — {short_name} ({scale}x)"
+                # El factor se muestra como lo que es: probado o dudoso.
+                if scale > 1:
+                    factor = f"({scale}x)" if scale_proven else f"(~{scale}x?)"
+                else:
+                    factor = ""
+                label = f"{display_name} — {short_name} {factor}".rstrip()
 
                 results.append({
                     "label": label,
@@ -777,6 +751,7 @@ class AIWorkflowStep(QFrame):
                     "engine_id": eid,
                     "model_path": mp,
                     "scale": scale,
+                    "scale_proven": scale_proven,
                 })
 
         return results
@@ -843,13 +818,25 @@ class AIWorkflowStep(QFrame):
                     "mode": scale_data.get("mode", "upscale"),
                     "native": bool(scale_data.get("native", False)),
                 }
-        for m in getattr(self, "_all_model_files", []):
-            if m.get("engine_id") == engine_id:
-                return {
-                    "engine_id": engine_id,
-                    "model_path": m.get("model_path"),
-                    "scale": m.get("scale", 1),
-                }
+        # Sin desplegable (una sola escala real, o ninguna demostrable): se
+        # usa el primer fichero de la engine, prefiriendo los que tienen la
+        # escala probada, que es lo que el encoder puede esperar.
+        candidates = [
+            m for m in getattr(self, "_all_model_files", [])
+            if m.get("engine_id") == engine_id
+        ]
+        proven = [m for m in candidates if m.get("scale_proven")]
+        for m in (proven or candidates):
+            return {
+                "engine_id": engine_id,
+                "model_path": m.get("model_path"),
+                "scale": m.get("scale", 1),
+                # Un fichero de pesos tiene una única salida; si no sabemos
+                # cuál es, el pipeline la midiendo (native=True) es lo
+                # único honesto: mejor un frame de prueba que un factor
+                # inventado por el nombre.
+                "native": True,
+            }
         return {"engine_id": engine_id, "model_path": None, "scale": 1}
 
 

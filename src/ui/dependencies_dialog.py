@@ -1168,7 +1168,7 @@ class DependenciesDialog(QDialog):
         try:
             import os
             from src.ai.user_models import get_model, register
-            from src.ai.architectures import detect_arch_and_scale
+            from src.ai.architectures import detect_arch_and_scale, detect_model_file_scale
         except Exception as exc:
             logger.warning("user-model refresh helpers unavailable: %s", exc)
             return
@@ -1195,6 +1195,10 @@ class DependenciesDialog(QDialog):
         arch, scale = (None, None)
         if weight_path and os.path.isfile(weight_path):
             arch, scale = detect_arch_and_scale(weight_path)
+            if not scale:
+                # Un .onnx no se puede leer con torch, pero su escala sí se
+                # puede demostrar leyendo el grafo (src.ai.architectures).
+                scale = detect_model_file_scale(weight_path)
 
         fields = {}
         if weight_file:

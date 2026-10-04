@@ -269,6 +269,8 @@ class ONNXRUNTIMEInferenceEngine(AIInferenceEngine):
         self._gpu_post_conversion_note = ""
         # Aviso si el .onnx trae un tamaño de entrada fijo (export mal hecho).
         self._fixed_input_note = ""
+        # Escala nativa del modelo, medida una vez (ver get_scale_factor).
+        self._native_scale = None
         # Motivo por el que el camino GPU se abandonó a mitad de render (si
         # pasó). El pipeline lo lee al terminar para avisar en la UI.
         self._gpu_post_failure = None
@@ -868,17 +870,50 @@ class ONNXRUNTIMEInferenceEngine(AIInferenceEngine):
             }
         return info
 
-    def get_scale_factor(self) -> int:
-        """Intenta determinar el factor de escala del modelo."""
-        native = 2
+    def _detect_native_scale(self) -> int:
+        """Factor de escala REAL del .onnx, leído por dentro.
+
+        Las formas declaradas sólo sirven si H y W están fijos. En los SR
+        exportados son dinámicas (``['batch', 3, 'height', 'width']`` en
+        entrada y salida) y entonces la escala se lee del grafo
+        (``Resize``/``Upsample``/``ConvTranspose``). Antes esto devolvía 2
+        a ciegas para todo modelo dinámico, así que un x4 real se
+        dimensionaba como si fuera x2: la mitad de píxeles de los que el
+        modelo produce de verdad.
+        """
+        scale = 0
         if self._input_shape and self._output_shape:
             try:
-                in_h = self._input_shape[2] if len(self._input_shape) > 2 else 1
-                out_h = self._output_shape[2] if len(self._output_shape) > 2 else 1
+                in_h = int(self._input_shape[2])
+                out_h = int(self._output_shape[2])
                 if in_h > 0 and out_h > 0:
-                    native = max(1, out_h // in_h)
-            except (TypeError, IndexError):
-                pass
+                    scale = max(1, out_h // in_h)
+            except (TypeError, ValueError, IndexError):
+                scale = 0
+        if scale <= 1:
+            try:
+                from src.ai.architectures import detect_onnx_scale
+                scale = int(detect_onnx_scale(self.model_path))
+            except Exception as exc:
+                logger.debug("native scale from graph failed: %s", exc)
+                scale = 0
+        if scale <= 1:
+            # Último recurso: la pista del nombre del fichero.
+            try:
+                from src.ai.architectures import parse_scale_from_name
+                scale = int(parse_scale_from_name(os.path.basename(self.model_path)))
+            except Exception:
+                scale = 0
+        if scale > 1:
+            logger.info("ONNX native scale: x%d (%s)", scale,
+                        os.path.basename(self.model_path))
+        return max(1, int(scale))
+
+    def get_scale_factor(self) -> int:
+        """Factor de escala del modelo (2, 4, etc.)."""
+        if self._native_scale is None:
+            self._native_scale = self._detect_native_scale()
+        native = self._native_scale
         # La escala solicitada por la UI manda si es menor que la nativa.
         if self._target_scale and 1 < self._target_scale < native:
             return int(self._target_scale)

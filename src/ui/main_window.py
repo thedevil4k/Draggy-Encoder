@@ -54,6 +54,7 @@ from src.ui.audio_preview import AudioPreviewEngine
 from src.ui.settings_panel import SettingsPanel
 from src.ui.tasks_panel import TasksPanel
 from src.ui.tray_dashboard import TrayController, eta_text
+from src.ui.metrics_strip import MetricsStripController
 from src.ui.update_banner import UpdateBanner
 from src.ui.update_chain import _UpdateChainController, notify_log
 from src.runtimes.manager import (
@@ -591,13 +592,15 @@ class CompressionWorker(QThread):
                         f"{node_label} could not load.\nDetails: {detail}\n{hint}"
                     )
 
-                # Escala objetivo: la que el usuario eligió en el dropdown
-                # del nodo Upscale (p.ej. x2 con un peso nativo x4). Si es
-                # válida y menor que la nativa, se la comunicamos a la
-                # engine para que reporte esa escala (el frame sigue
-                # upscaleando a la nativa y el encoder re-encaja el tamaño).
-                # En modo "Model native" (info.native) NO forzamos nada:
-                # la engine reporta su escala real y el pipeline mide el
+                # Escala objetivo: la del fichero elegido en el desplegable
+                # del nodo Upscale. El desplegable sólo ofrece factores que
+                # el fichero puede hacer DE VERDAD (se leen del modelo), así
+                # que lo normal es que coincidan y aquí no haya nada que
+                # forzar. Si algún camino antiguo trae un factor menor que
+                # la nativa (p.ej. un motor del Hub con escala deducida del
+                # catálogo), se comunica a la engine para que reporte esa y el
+                # encoder re-encaje el tamaño. Con info.native NO se fuerza
+                # nada: la engine reporta su escala real y el pipeline mide el
                 # frame de la cadena para la resolución de salida.
                 try:
                     _us = info.get("scale") if isinstance(info, dict) else None
@@ -749,6 +752,11 @@ class MainWindow(QMainWindow):
         # pedimos al worker del chain que pare. Esto evita que el QThread
         # quede como zombi heredado por Qt sin control.
         self.destroyed.connect(self._shutdown_chain)
+        # La franja de metricas del borde inferior. Se queda en None
+        # hasta que _setup_ui la construya: los helpers de muestreo se
+        # llaman tambien antes (y despues) de que exista, y tienen que
+        # aguantar ese None.
+        self._metrics_strip = None
         self._setup_tray_icon()
         self._setup_ui()
 
@@ -796,8 +804,31 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
 
+    def _metrics_sampling_start(self):
+        """Hay un render en marcha: la franja del borde inferior arranca.
+
+        No abre NVML aqui. Eso lo hace el primer tic del controlador, que
+        es justo cuando ya hay algo que medir; construir la ventana no se
+        lleva por delante la inicializacion del driver.
+        """
+        strip = getattr(self, "_metrics_strip", None)
+        if strip is not None:
+            strip.start()
+
+    def _metrics_sampling_stop(self):
+        """Se acabó el render: la franja vuelve a "—" y se suelta NVML."""
+        strip = getattr(self, "_metrics_strip", None)
+        if strip is not None:
+            strip.stop()
+
     def _tray_sampling_start(self):
-        """Avisa de que hay un render en marcha. La bandeja se encarga."""
+        """Hay un render en marcha. Arranca la bandeja y la franja.
+
+        Un solo interruptor para los dos: si uno de ellos se encendiera
+        en un camino del render y el otro no, acabarian pidiendo NVML dos
+        veces y mediendo cosas distintas en la misma pantalla.
+        """
+        self._metrics_sampling_start()
         if self._tray is not None:
             self._tray.start()
             self._tray.set_task(getattr(self, "_current_task_name", ""))
@@ -809,6 +840,7 @@ class MainWindow(QMainWindow):
 
     def _tray_sampling_stop(self):
         """Se acabó el render: se para el muestreo y se suelta NVML."""
+        self._metrics_sampling_stop()
         if self._tray is not None:
             self._tray.stop()
 
@@ -839,7 +871,11 @@ class MainWindow(QMainWindow):
 
         central = QWidget()
         self.setCentralWidget(central)
-        root_layout = QHBoxLayout(central)
+        # Layout raiz en vertical, aunque a dia de hoy solo tenga el
+        # splitter dentro: es lo que deja la franja de metricas abajo del
+        # todo y cruzando el panel de tareas. Con un solo widget, cambiar
+        # la orientacion no mueve nada de lo que ya habia.
+        root_layout = QVBoxLayout(central)
         root_layout.setContentsMargins(0, 0, 0, 0)
         root_layout.setSpacing(0)
 
@@ -1072,6 +1108,7 @@ class MainWindow(QMainWindow):
         self.tasks_panel.btn_clear.clicked.connect(self._on_clear_task_history)
         self.tasks_panel.btn_start_queue.clicked.connect(self._start_queue)
         self.tasks_panel.btn_clear_queue.clicked.connect(self._on_clear_queue)
+        self.tasks_panel.cancel_requested.connect(self._on_cancel_queue_item)
 
         self.splitter = QSplitter(Qt.Orientation.Horizontal)
         self.splitter.setChildrenCollapsible(True)
@@ -1081,6 +1118,14 @@ class MainWindow(QMainWindow):
         self.splitter.setStretchFactor(1, 1)
         self.splitter.setSizes([980, 320])
         root_layout.addWidget(self.splitter)
+
+        # Franja de metricas: GPU, CPU y VRAM abajo del todo y a lo ancho
+        # de la ventana. Va en el layout raiz y no dentro de una columna
+        # para que cruce tambien el panel de tareas, que es donde se mira
+        # el progreso de una cola larga. El muestreo NO arranca aqui: lo
+        # enciende y lo apaga el render (ver _metrics_sampling_start).
+        self._metrics_strip = MetricsStripController(self)
+        root_layout.addWidget(self._metrics_strip.widget())
 
         # Overlay a pantalla completa que se muestra mientras se arrastra un
         # video sobre la ventana: indica que se acepta el drop en cualquier
@@ -1773,15 +1818,15 @@ class MainWindow(QMainWindow):
             return
 
         if self._close_followup_complete:
-            super().closeEvent(event)
+            self._cerrar_ya(event)
             return
 
         if self._close_consumed:
-            super().closeEvent(event)
+            self._cerrar_ya(event)
             return
 
         if self._close_after_worker:
-            super().closeEvent(event)
+            self._cerrar_ya(event)
             return
 
         if (
@@ -1798,12 +1843,12 @@ class MainWindow(QMainWindow):
 
         pending = self._collect_pending_close_updates()
         if not pending:
-            super().closeEvent(event)
+            self._cerrar_ya(event)
             return
 
         decision = self._show_close_update_dialog(pending)
         if decision == "skip_close":
-            super().closeEvent(event)
+            self._cerrar_ya(event)
             return
         if decision == "cancel_close":
             event.ignore()
@@ -1817,6 +1862,23 @@ class MainWindow(QMainWindow):
 
         event.ignore()
         self._start_close_update_chain(pending)
+
+    def _cerrar_ya(self, event):
+        """El cierre que sí va en serio: para la franja y cierra.
+
+        Va en un helper y no al principio de ``closeEvent`` porque este
+        metodo tambien acaba en ``event.ignore()``: si un render está
+        corriendo, o hay una cadena de auto-update en vuelo, o el usuario
+        contesta "Cancelar" al dialogo, la ventana se queda abierta. Parar
+        el muestreo ahi dejaria una franja congelada en el ultimo numero
+        que se leyo, que es justo lo que hace parecer roto el panel.
+
+        ``stop()`` es idempotente, asi que los cinco caminos por los que
+        esto se puede llamar mas de una vez —incluido el reintento cuando
+        el chain vuelve a pedir cerrar— no rompen nada.
+        """
+        self._metrics_sampling_stop()
+        super().closeEvent(event)
 
     def _auto_update_enabled(self):
         """Lee la preferencia 'auto_update_all_on_close' (con fallback legacy)."""
@@ -2872,6 +2934,88 @@ class MainWindow(QMainWindow):
             else:
                 self._on_status_message(f"Queued {queued} videos with the current settings.")
 
+    def _on_cancel_queue_item(self, queue_id: str):
+        """``✕`` en una fila de la cola: cancela ESE job, y solo ese.
+
+        Un job en espera sale de la cola y el total de la pasada baja con
+        él, para que la barra no prometa renders que el usuario ya no
+        quiere. El que está EN MARCHA se para de verdad (el mismo camino
+        que el botón Abort): quitarlo de la fila sin detenerlo dejaba un
+        ffmpeg escribiendo un archivo que la app ya no contaba, y su cierre
+        ya no tenía item al que escribirle el final.
+        """
+        try:
+            import src.task_queue as task_queue
+            item = task_queue.get_item(queue_id) or {}
+            in_flight = task_queue.is_active(queue_id)
+        except Exception:
+            item, in_flight = {}, False
+        name = str(item.get("name") or queue_id)
+
+        if not in_flight:
+            # En espera (o ya terminado): sale de la lista sin preguntar.
+            result = self.tasks_panel.remove_queue_item(queue_id)
+            if result == "cancelled":
+                self._on_status_message(f"Queue item cancelled: {name}")
+                self.tasks_panel.append_log(f"Queue item cancelled: {name}")
+                # El total de la pasada baja con el: ese render ya no lo
+                # va a ejecutar nadie y no puede seguir contando.
+                self._retarget_queue_total()
+            elif result == "finished":
+                self.tasks_panel.append_log(f"Queue item dismissed: {name}")
+            return
+
+        # Render en marcha: pararlo tira el trabajo hecho, así que se pregunta.
+        ret = QMessageBox.question(
+            self,
+            "Cancel render",
+            f"Stop the render in progress?\n\n{name}",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if ret != QMessageBox.Yes:
+            return
+        result = self.tasks_panel.remove_queue_item(queue_id)
+        if result != "aborted":
+            return
+        # El item queda marcado aborted por el panel; ahora toca el proceso.
+        if self._abort_running_worker(cleanup_partial_output=True):
+            # ``_on_worker_finished`` ve ``abort_event`` y cierra la cola
+            # él mismo con "aborted": aquí NO se cuenta nada para no
+            # duplicar el avance ni arrancar dos renders a la vez.
+            self._cleanup_after_abort()
+            self._on_status_message(f"Render cancelled: {name}")
+            return
+        # No había worker detrás (fila obsoleta): la cola no puede quedarse
+        # esperando a un render que ya no existe, así que se cierra la cuenta.
+        self.tasks_panel.append_log(f"Render cancelled: {name} (nothing was running)")
+        if getattr(self, "_queue_active", False):
+            self._advance_queue_after_worker("aborted", "Cancelled by user")
+
+    def _retarget_queue_total(self):
+        """Recalcula el total de la pasada tras cancelar un job en espera.
+
+        Sin esto la barra queda en "1/4 done" para siempre: el job cancelado
+        ya no lo va a ejecutar nadie, así que deja de contar.
+        """
+        if not getattr(self, "_queue_active", False):
+            return
+        try:
+            import src.task_queue as task_queue
+            pending = sum(
+                1 for it in task_queue.list_items()
+                if it.get("status") == "queued"
+            )
+        except Exception:
+            return
+        done = getattr(self, "_queue_done", 0)
+        worker = getattr(self, "worker", None)
+        running = 1 if worker is not None and worker.isRunning() else 0
+        self._queue_total = max(done + pending + running, done)
+        self.tasks_panel.set_queue_progress(done, self._queue_total)
+        if self._tray is not None:
+            self._tray.set_queue(done, self._queue_total)
+
     def _on_clear_queue(self):
         ret = QMessageBox.question(
             self,
@@ -2882,11 +3026,35 @@ class MainWindow(QMainWindow):
         )
         if ret != QMessageBox.Yes:
             return
+        # Vaciar el archivo con un render en marcha dejaba a ese worker sin
+        # item al que escribirle el final (cola descuadrada y un ffmpeg
+        # escribiendo un archivo que ya nadie cuenta). Se para primero por
+        # su mismo camino que el ``✕`` de la fila y luego se limpia todo.
+        try:
+            import src.task_queue as task_queue
+            running_id = next(
+                (
+                    it["queue_id"] for it in task_queue.list_items()
+                    if it.get("queue_id") and task_queue.is_active(it["queue_id"])
+                ),
+                None,
+            )
+        except Exception:
+            running_id = None
+        if running_id:
+            self._on_cancel_queue_item(running_id)
         try:
             import src.task_queue as task_queue
             task_queue.clear()
         except Exception:
             pass
+        # La cola vacía no puede dejar la barra prometiendo renders que ya
+        # no existen. Si había un render en marcha (que se acaba de parar),
+        # ese es el único trabajo que queda por cerrar.
+        worker = getattr(self, "worker", None)
+        running = worker is not None and worker.isRunning()
+        self._queue_done = getattr(self, "_queue_done", 0)
+        self._queue_total = self._queue_done + (1 if running else 0)
         self.tasks_panel.clear_queue_rows()
         self._on_status_message("Queue cleared.")
 

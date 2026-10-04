@@ -72,7 +72,7 @@ def eta_text(elapsed_seconds, pct):
 
 
 def speed_text(fps=None, speed=None):
-    """La velocidad de render, en las dos unidades que existen.
+    """La velocidad de ffmpeg, en las dos unidades que existen.
 
     ffmpeg manda ``fps`` y ``speed`` (multiplicador de tiempo real) y los dos
     son verdad, pero en un render corto ``fps`` sale 0 porque ffmpeg no ha
@@ -92,6 +92,24 @@ def speed_text(fps=None, speed=None):
     except (TypeError, ValueError):
         pass
     return "  ·  ".join(partes) if partes else None
+
+
+def rend_text(fps=None):
+    """La velocidad del render de IA: solo su propio fps.
+
+    Deliberadamente **otra** función y no ``speed_text`` con un ``speed`` de
+    ``False``: el render de IA va a tantos frames por segundo y punto, no tiene
+    multiplicador contra el tiempo del archivo. Mantenerlas separadas es lo
+    que impide que las dos velocidades vuelvan a la misma casilla, que es como
+    se llegó a comparar un x2 contra un x3 creyendo que la GPU tardaba el doble
+    en uno que en el otro.
+    """
+    try:
+        if fps is not None and float(fps) > 0:
+            return format_fps(fps)
+    except (TypeError, ValueError):
+        pass
+    return None
 
 
 def metric_lines(metrics):
@@ -222,9 +240,12 @@ class TrayDashboard(QWidget):
         self._sub.setText("  ·  ".join(trozos))
 
         lineas = []
-        velocidad = speed_text(state.get("fps"), state.get("speed"))
-        if velocidad:
-            lineas.append("REND  %s" % velocidad)
+        rend = rend_text(state.get("ai_fps"))
+        if rend:
+            lineas.append("REND  %s" % rend)
+        enc = speed_text(state.get("enc_fps"), state.get("enc_speed"))
+        if enc:
+            lineas.append("ENC   %s" % enc)
         lineas.extend(metric_lines(state.get("metrics")))
         self._metrics.setText("\n".join(lineas))
 
@@ -250,8 +271,15 @@ class TrayController(QObject):
     """
 
     # Claves que el canal de métricas puede traer. Se copian tal cual al
-    # estado; lo que no venga, se queda como estaba.
-    CAMPOS_METRICAS = ("fps", "speed", "frame", "out_time", "total_frames")
+    # estado; lo que no venga, se queda como estaba. Los dos prefijos van
+    # porque las cifras las escriben dos fuentes distintas —el bucle de render
+    # de IA y ffmpeg— y antes compartían nombre: la que hablaba último pisaba
+    # a la otra y el número que se veía en el desplegable no sabía de quién
+    # era. Con ``ai_`` y ``enc_`` conviven y se enseñan por separado.
+    CAMPOS_METRICAS = (
+        "ai_fps", "ai_frame", "ai_total_frames",
+        "enc_fps", "enc_speed", "enc_frame", "enc_out_time",
+    )
 
     def __init__(self, parent=None, on_open=None, on_quit=None):
         super().__init__(parent)
@@ -362,10 +390,13 @@ class TrayController(QObject):
         self._refresh()
 
     def update_metrics(self, ev):
-        """El canal del worker. Un dict plano que se mezcla tal cual.
+        """El canal del worker. Un dict plano que se copia tal cual.
 
-        La IA manda ``fps`` y ffmpeg manda ``fps``/``speed``/``frame``; los
-        dos rellenan el mismo estado y el desplegable enseña lo que haya.
+        Viene de dos Productores que ya no se pisan: el bucle de render de IA
+        manda ``ai_fps``/``ai_frame``/``ai_total_frames`` y ffmpeg manda
+        ``enc_fps``/``enc_speed``/``enc_frame``/``enc_out_time``. Cada uno rellena
+        su lado del estado y el desplegable enseña los dos, cada uno en su
+        línea.
         """
         if not isinstance(ev, dict):
             return
@@ -388,8 +419,9 @@ class TrayController(QObject):
         state.setdefault("task_name", "")
         state.setdefault("pct", 0)
         state.setdefault("eta", None)
-        state.setdefault("fps", None)
-        state.setdefault("speed", None)
+        state.setdefault("ai_fps", None)
+        state.setdefault("enc_fps", None)
+        state.setdefault("enc_speed", None)
         state.setdefault("metrics", {})
         try:
             self.dashboard.set_state(state)

@@ -1001,6 +1001,274 @@ def detect_arch_and_scale(weight_path: str):
     return detected
 
 
+# -----------------------------------------------------------------------
+# Escala NATIVA de un fichero de pesos (la verdad, no la del nombre)
+# -----------------------------------------------------------------------
+#
+# Un modelo no "admite" varias escalas: cada fichero hornea UNA en sus
+# pesos. Por eso la UI no puede ofrecer x2/x3/x4 para un solo .onnx x4 --
+# elegir x2 ahí no hace que la red produzca x2, sólo que se tire el
+# resultado x4 hacia abajo (peor calidad y el doble de cómputo, ver
+# perf-audit.md §3.5). Las varias escalas de una familia son VARIOS
+# ficheros (OmniSR_X3/X4, RealESRGAN_x2plus/x4plus...), y cada uno con
+# la suya. Estas funciones leen la escala del fichero de verdad.
+
+#: Nombres de fichero que se parecen a una escala pero no lo son.
+_SCALE_NAME_RE = None
+
+
+def parse_scale_from_name(fname: str) -> int:
+    """Factor de upscale (2, 3, 4, 8...) que sugiere el NOMBRE del fichero.
+
+    Cubre las convenciones del ecosistema Real-ESRGAN / Real-CUGAN /
+    OmniSR en ambos órdenes ("x4plus", "x4v3", "4x-UltraSharp"). Es sólo
+    una **pista**: el nombre miente (``OmniSR_X2_DIV2K.onnx`` es un x8 y
+    los "x2plus" de AI-Forever son x4), así que sólo se usa cuando el
+    fichero no se puede inspeccionar.
+    """
+    global _SCALE_NAME_RE
+    if _SCALE_NAME_RE is None:
+        import re
+        _SCALE_NAME_RE = [
+            # x2, x4, x8... seguidos de plus/vN o del final del nombre
+            re.compile(r"[xX](\d+)(?=(?:plus|v\d+)?(?:$|[\s_.-]))"),
+            # 2x, 4x ... por delante del nombre
+            re.compile(r"(?:^|[\s_.-])(\d+)[xX](?=(?:plus|v\d+)?(?:$|[\s_.-]))"),
+        ]
+    best = 1
+    for rx in _SCALE_NAME_RE:
+        for m in rx.finditer(fname or ""):
+            try:
+                value = int(m.group(1))
+            except (TypeError, ValueError):
+                continue
+            # Ignorar números absurdos que parecen versión o resolución.
+            if 1 < value <= 64:
+                best = max(best, value)
+    return best
+
+
+def _onnx_dim(value) -> int:
+    """``dim_value`` de un eje ONNX, o 0 si es dinámico (``dim_param``)."""
+    try:
+        dim = int(value)
+    except (TypeError, ValueError):
+        return 0
+    return dim if dim > 0 else 0
+
+
+def _onnx_upsample_factors(onnx, graph) -> float:
+    """Producto de los factores espaciales de subida de un grafo ONNX.
+
+    Recorre los ops que cambian la resolución: ``Resize``/``Upsample`` (su
+    eje H, índice 2 de ``scales``) y ``ConvTranspose`` (su ``strides``).
+    ``DepthToSpace`` (PixelShuffle) NO cuenta: cambia canales por píxeles
+    sin mover H/W, que es justo por lo que la red sube x4 en features y
+    luego las reparte en un x4 de salida.
+
+    Validado con los ONNX instalados: AnimeVideo v3 → 4 (Resize 4),
+    General x4v3 → 4, OmniSR_X2_DIV2K → 8, OmniSR_X4_DIV2K → 16; los
+    cuatro coinciden con un forward real.
+    """
+    from onnx import numpy_helper
+
+    initializers = {}
+    try:
+        initializers = {
+            i.name: numpy_helper.to_array(i) for i in graph.initializer
+        }
+    except Exception:
+        pass
+    # Constantes producidas por un nodo Constant (así exporta el conversor
+    # de Real-ESRGAN: ``/Constant_output_0`` con scales=[1,1,4,4]).
+    constants = {}
+    for node in graph.node:
+        if node.op_type == "Constant" and node.output:
+            for attr in node.attribute:
+                if attr.name == "value":
+                    try:
+                        constants[node.output[0]] = numpy_helper.to_array(attr.t)
+                    except Exception:
+                        pass
+
+    def _scales_value(name):
+        if not name:
+            return None
+        if name in initializers:
+            return initializers[name]
+        return constants.get(name)
+
+    factor = 1.0
+    for node in graph.node:
+        if node.op_type in ("Resize", "Upsample"):
+            scales = None
+            for attr in node.attribute:
+                if attr.name == "scales":
+                    scales = onnx.helper.get_attribute_value(attr)
+            if scales is None and len(node.input) > 2:
+                scales = _scales_value(node.input[2])
+            if scales is not None:
+                try:
+                    factor *= float(scales[2])
+                except (TypeError, ValueError, IndexError):
+                    continue
+        elif node.op_type == "ConvTranspose":
+            for attr in node.attribute:
+                if attr.name == "strides":
+                    try:
+                        factor *= float(onnx.helper.get_attribute_value(attr)[2])
+                    except (TypeError, ValueError, IndexError):
+                        continue
+    return factor
+
+
+def detect_onnx_scale(onnx_path: str) -> int:
+    """Escala nativa de un ``.onnx`` leyéndolo por dentro (sin inferencia).
+
+    Primero mira las formas declaradas (si entrada y salida tienen H/W
+    fijos, el cociente ES la escala). Si son dinámicas -- que es lo
+    habitual en los SR exportados, p.ej. ``['batch',3,'height','width']``
+    en ambos lados -- calcula el producto de los ops de subida del grafo.
+    Devuelve 1 si no se puede determinar.
+    """
+    import os
+    if not onnx_path or not os.path.isfile(onnx_path):
+        return 1
+    try:
+        from src.runtimes.manager import import_local_runtime
+        onnx = import_local_runtime("onnx")
+    except Exception as exc:
+        logger.info("detect_onnx_scale: onnx runtime unavailable (%s)", exc)
+        return 1
+    try:
+        # load_external_data=False: sólo queremos la topología del grafo,
+        # no los pesos (así se lee un modelo de 70 MB en milisegundos).
+        model = onnx.load(onnx_path, load_external_data=False)
+    except Exception as exc:
+        logger.info("detect_onnx_scale: could not read %s: %s", onnx_path, exc)
+        return 1
+
+    try:
+        graph = model.graph
+        in_dims = [_onnx_dim(d.dim_value) for d in graph.input[0].type.tensor_type.shape.dim]
+        out_dims = [_onnx_dim(d.dim_value) for d in graph.output[0].type.tensor_type.shape.dim]
+    except Exception:
+        return 1
+
+    # Formas fijas: el cociente de salida/entrada es la escala exacta.
+    if len(in_dims) >= 4 and len(out_dims) >= 4 and in_dims[2] and out_dims[2]:
+        scale = round(out_dims[2] / in_dims[2])
+        if 1 < scale <= 64:
+            return int(scale)
+
+    try:
+        scale = round(_onnx_upsample_factors(onnx, graph))
+    except Exception as exc:
+        logger.info("detect_onnx_scale: no graph scale in %s (%s)", onnx_path, exc)
+        return 1
+    return int(scale) if 1 < scale <= 64 else 1
+
+
+def detect_model_file_scale(model_path: str) -> int:
+    """Escala NATIVA de un fichero de pesos, sea del tipo que sea.
+
+    ``.onnx`` → se lee el grafo. ``.pth/.pt/.bin/.safetensors`` → se leen
+    las formas de los tensores. Devuelve 1 si no se puede determinar.
+    """
+    import os
+    if not model_path or not os.path.isfile(model_path):
+        return 1
+    ext = os.path.splitext(model_path)[1].lower()
+    if ext == ".onnx":
+        return detect_onnx_scale(model_path)
+    _arch, scale = detect_arch_and_scale(model_path)
+    try:
+        scale = int(scale)
+    except (TypeError, ValueError):
+        return 1
+    return scale if 1 < scale <= 64 else 1
+
+
+#: Sesión donde se cachea lo detectado (fingerprints, no pesos).
+SCALES_FILENAME = "model_scales.json"
+
+#: Sube esto si cambia la forma de detectar la escala.
+SCALES_VERSION = 1
+
+_SCALE_CACHE: dict = {}
+
+
+def _scales_path() -> str:
+    import os
+    from src.config import ensure_runtime_dirs, get_session_dir
+    ensure_runtime_dirs()
+    return os.path.join(get_session_dir(), SCALES_FILENAME)
+
+
+def _load_scale_cache() -> dict:
+    import json
+    try:
+        with open(_scales_path(), "r", encoding="utf-8") as handle:
+            data = json.load(handle) or {}
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _save_scale_cache(data: dict) -> None:
+    import json
+    import os
+    try:
+        path = _scales_path()
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as handle:
+            json.dump(data, handle, indent=2)
+        os.replace(tmp, path)
+    except Exception as exc:
+        logger.warning("could not persist model scales: %s", exc)
+
+
+def model_file_fingerprint(model_path: str) -> str:
+    """``tamaño_mtime`` del fichero: cambia si se re-descarga el modelo."""
+    import os
+    try:
+        st = os.stat(model_path)
+        return f"{st.st_size}_{st.st_mtime_ns}"
+    except OSError:
+        return ""
+
+
+def get_model_file_scale(model_path: str, fallback: int = 0) -> int:
+    """Escala nativa de un fichero con caché por huella (rápido en la UI).
+
+    Es la función que usa el nodo Upscale al listar modelos: escanea la
+    carpeta de un motor en cada refresco y no puede pagar 0.1 s por peso.
+    La clave de caché es ``ruta|tamaño_mtime``, así que si el usuario
+    sustituye un modelo por otro se vuelve a medir. Si el fichero no se
+    puede inspeccionar devuelve ``fallback`` (el nombre, si el llamante
+    lo deduce) y, en último término, 1.
+    """
+    import os
+    if not model_path or not os.path.isfile(model_path):
+        return max(1, int(fallback or 1))
+    key = f"{os.path.normcase(os.path.abspath(model_path))}|{model_file_fingerprint(model_path)}"
+    if key in _SCALE_CACHE:
+        scale = _SCALE_CACHE[key]
+    else:
+        data = _load_scale_cache()
+        if key in data:
+            scale = int(data[key])
+        else:
+            scale = detect_model_file_scale(model_path)
+            if scale > 1:
+                data[key] = scale
+                _save_scale_cache(data)
+        _SCALE_CACHE[key] = scale
+    if scale > 1:
+        return scale
+    return max(1, int(fallback or 1))
+
+
 def build_model_from_state_dict(state_dict: dict, scale: int = 4):
     """Detect architecture from state_dict keys and build+load it.
 

@@ -226,6 +226,20 @@ RESOLUTIONS = [
     ("480", "480p (SD)"),
 ]
 
+# Relación de aspecto de la SALIDA. "source" es lo de siempre: el vídeo
+# conserva la proporción con la que se grabó (incluidos los píxeles no
+# cuadrados de un DVD anamórfico). Los demás valores obligan a esa proporción:
+# la imagen no se deforma y lo que sobra se rellena con barras negras, así que
+# la altura elegida en Resolution manda y el ratio da el ancho.
+ASPECT_RATIOS = [
+    ("source", "Keep source aspect ratio"),
+    ("1:1", "1:1 (square)"),
+    ("4:3", "4:3"),
+    ("16:9", "16:9"),
+    ("9:16", "9:16 (vertical)"),
+    ("18:9", "18:9"),
+]
+
 # URLs de descarga de FFmpeg por defecto (builds estáticas GPL).
 # Windows: gyan.dev dejó de publicar builds "full" en zip (ahora solo .7z,
 # que nuestro extractor no soporta) y su build "essentials" NO incluye

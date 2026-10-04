@@ -2423,45 +2423,110 @@ def test_import_step_click_emits_import_clicked(qapp):
         widget.deleteLater()
 
 
-def test_workflow_scale_dropdown_offers_model_native(qapp, isolated_engines_state):
-    """The Upscale node's scale dropdown offers 'Model native' first and
-    carries the native flag + real model path so the pipeline can size the
-    encoder to the model's own output."""
+def _upscale_widget_with_models(qapp, tmp_path, monkeypatch, engine_id, files):
+    """Instala ``files`` en un engine y devuelve su nodo Upscale.
+
+    ``files`` son ``(nombre, factor_onnx_o_None)``; ``None`` escribe basura
+    para representar un fichero que no se puede inspeccionar. La caché de
+    escalas se manda a tmp para no dejar basura en ``bin/.session``.
+    """
+    import src.ai.architectures as arch
     import src.ai.engines_state as es
     from src.ai.registry import get_engine_dir
     from src.ui.workflow_widget import WorkflowWidget
 
-    eid = "upscale-realesr-animevideov3"  # catalog declares 2x/3x/4x
-    target = get_engine_dir(eid)
+    monkeypatch.setattr(arch, "_scales_path", lambda: str(tmp_path / "scales.json"))
+    monkeypatch.setattr(arch, "_SCALE_CACHE", {})
+
+    target = get_engine_dir(engine_id)
     os.makedirs(target, exist_ok=True)
-    # Real weight file with an unambiguous x4 scale in the name.
-    open(os.path.join(target, "realesr-animevideov3-x4.pth"), "w").close()
-    es.mark_installed(eid, install_path=target)
+    for fname, scale in files:
+        path = os.path.join(target, fname)
+        if scale is None:
+            with open(path, "w") as handle:
+                handle.write("no es un modelo")
+        else:
+            _write_upscaler_onnx(path, scale)
+    es.mark_installed(engine_id, install_path=target)
 
     widget = WorkflowWidget()
-    try:
-        ups = next(s for s in widget.middle_steps if s.name == "Upscale")
-        ups.set_active(True)
-        ups.combo.setCurrentIndex(0)  # select the installed engine
+    step = next(s for s in widget.middle_steps if s.name == "Upscale")
+    step.set_active(True)
+    step.combo.setCurrentIndex(0)
+    return widget, step
 
-        assert not ups.combo_scale.isHidden()
-        assert ups.combo_scale.count() >= 4  # Model native + x2/x3/x4
-        texts = [ups.combo_scale.itemText(i) for i in range(ups.combo_scale.count())]
-        assert texts[0] == "Model native", texts
-        # Default selection IS Model native -> output = exactly the model's.
-        assert ups.combo_scale.currentIndex() == 0
+
+def test_workflow_scale_dropdown_only_offers_real_factors(qapp, tmp_path,
+                                                          monkeypatch,
+                                                          isolated_engines_state):
+    """The Upscale node only offers factors an installed model can REALLY do.
+
+    AnimeVideo v3 is a single x4 model: the catalog used to claim 2x/3x/4x
+    (copied from video2x, where they are three different weights) and the
+    node dutifully offered scales the network cannot produce.
+    """
+    widget, ups = _upscale_widget_with_models(
+        qapp, tmp_path, monkeypatch, "upscale-realesr-animevideov3",
+        # Un x4 cuyo nombre dice x2, para que sólo el grafo pueda responder.
+        [("realesr-animevideov3-x2.onnx", 4)],
+    )
+    try:
+        # One real factor -> nothing to choose, and NOT a dropdown with
+        # invented 2x/3x entries.
+        assert ups.combo_scale.count() == 1, [
+            ups.combo_scale.itemText(i) for i in range(ups.combo_scale.count())]
+        assert not ups.combo_scale.isEnabled()
+        assert ups.combo_scale.itemText(0) == "4x"
 
         info = ups.get_selected_model_info()
-        assert info["native"] is True
-        assert info["scale"] == 4  # native scale from the catalog
+        assert info["scale"] == 4           # read from the model, not the name
+        assert info["native"] is True       # output = the model's own size
         assert info["model_path"] is not None
-        # Switching to an explicit scale clears the native flag.
-        for i in range(ups.combo_scale.count()):
-            if ups.combo_scale.itemText(i) == "2x":
-                ups.combo_scale.setCurrentIndex(i)
-        info2 = ups.get_selected_model_info()
-        assert info2["native"] is False
-        assert info2["scale"] == 2
+    finally:
+        widget.deleteLater()
+
+
+def test_workflow_scale_dropdown_lists_each_real_factor(qapp, tmp_path,
+                                                       monkeypatch,
+                                                       isolated_engines_state):
+    """Several scales only show up when several installed models prove them."""
+    widget, ups = _upscale_widget_with_models(
+        qapp, tmp_path, monkeypatch, "upscale-omnisr-x4",
+        [("OmniSR_X4_DIV2K.onnx", 4), ("OmniSR_X3_DIV2K.onnx", 3),
+         # Un fichero que no se puede inspeccionar: no se ofrece nada por él.
+         ("sin_escala.onnx", None)],
+    )
+    try:
+        texts = [ups.combo_scale.itemText(i)
+                 for i in range(ups.combo_scale.count())]
+        assert texts == ["3x", "4x"], texts
+        assert ups.combo_scale.isEnabled()
+
+        paths = {ups.combo_scale.itemText(i): ups.combo_scale.itemData(i)
+                 for i in range(ups.combo_scale.count())}
+        assert paths["3x"]["model_path"].endswith("OmniSR_X3_DIV2K.onnx")
+        assert paths["4x"]["model_path"].endswith("OmniSR_X4_DIV2K.onnx")
+        # Cada opción es la salida nativa de su fichero: el pipeline mide
+        # el frame real en vez de forzar un factor.
+        assert all(v["native"] for v in paths.values())
+    finally:
+        widget.deleteLater()
+
+
+def test_workflow_scale_dropdown_hidden_when_nothing_is_provable(qapp, tmp_path,
+                                                                 monkeypatch,
+                                                                 isolated_engines_state):
+    """Sin escala demostrable no se ofrece ninguna: el render la mide."""
+    widget, ups = _upscale_widget_with_models(
+        qapp, tmp_path, monkeypatch, "upscale-omnisr-x4",
+        [("modelo.onnx", None)],
+    )
+    try:
+        assert ups.combo_scale.isHidden()
+        info = ups.get_selected_model_info()
+        # native=True: sin escala conocida, el pipeline mide el frame real.
+        assert info["native"] is True
+        assert info["scale"] == 1
     finally:
         widget.deleteLater()
 
@@ -5103,14 +5168,239 @@ def test_tasks_panel_queue_tab_smoke(qapp):
     assert panel._queue_progress_label.text() == "No queued jobs"
 
 
+def test_task_queue_cancel_one_item(tmp_path, monkeypatch):
+    """``cancel`` quita SÓLO el item pedido y dice qué pasó con él."""
+    import src.task_queue as tq
+
+    monkeypatch.setattr(tq, "_path", lambda: str(tmp_path / "queue.json"))
+    keep = tq.enqueue(name="keep.mp4", input_path="/in/keep.mp4",
+                      output_path="/out/keep.mp4", settings={})
+    drop = tq.enqueue(name="drop.mp4", input_path="/in/drop.mp4",
+                      output_path="/out/drop.mp4", settings={})
+
+    assert tq.cancel("no-existe") == "not_found"
+    assert tq.cancel(drop) == "cancelled"
+    assert [i["queue_id"] for i in tq.list_items()] == [keep]
+    assert tq.first_pending()["queue_id"] == keep
+
+    # En marcha: NO se borra (el render sigue vivo hasta que lo pare quien
+    # llama); queda marcado aborted para que su cierre tenga dónde escribir.
+    assert tq.set_status(keep, "running") is True
+    assert tq.is_active(keep) is True
+    assert tq.cancel(keep) == "aborted"
+    assert tq.get_item(keep)["status"] == "aborted"
+    assert tq.get_item(keep)["error"] == "Cancelled by user."
+    assert tq.is_active(keep) is False
+
+    # Terminal: se queda donde está para que la UI decida si lo descarta.
+    assert tq.cancel(keep) == "finished"
+    assert tq.get_item(keep)["status"] == "aborted"
+
+
+def test_queue_row_cancel_button_state_follows_status(qapp):
+    """El ``✕`` de cada fila siempre se puede pulsar y dice qué va a hacer."""
+    from src.ui.tasks_panel import QueueRow
+
+    row = QueueRow("q1", "movie.mp4")
+    row.set_status("queued")
+    assert row.btn_remove.isEnabled() is True
+    assert "Cancel" in row.btn_remove.toolTip()
+
+    row.set_status("running")
+    assert row.btn_remove.isEnabled() is True
+    assert "Stop this render" in row.btn_remove.toolTip()
+
+    # Un job terminado no se cancela (no hay render), pero sí se quita de
+    # la lista: el botón no se apaga, cambia de tarea.
+    row.set_status("done")
+    assert row.btn_remove.isEnabled() is True
+    assert "finished" in row.btn_remove.toolTip()
+
+
+def test_queue_row_cancel_button_emits_request(qapp, tmp_path, monkeypatch):
+    """El ``✕`` pide la cancelación; no borra nada por su cuenta.
+
+    Parar un render en marcha es cosa de quien tiene al worker (MainWindow),
+    así que el panel sólo avisa del ``queue_id`` afectado.
+    """
+    import src.task_queue as tq
+    from src.ui.tasks_panel import TasksPanel
+
+    monkeypatch.setattr(tq, "_path", lambda: str(tmp_path / "queue.json"))
+    qid = tq.enqueue(name="movie.mp4", input_path="/in/movie.mp4",
+                     output_path="/out/movie.mp4", settings={})
+
+    panel = TasksPanel()
+    asked = []
+    panel.cancel_requested.connect(asked.append)
+    panel.rebuild_queue(tq.list_items())
+
+    panel._queue_rows[qid].btn_remove.click()
+    assert asked == [qid]
+    # Sigue en la cola: nadie ha borrado nada todavía.
+    assert qid in panel._queue_rows
+    assert tq.get_item(qid)["status"] == "queued"
+
+
+def test_cancel_pending_queue_item_drops_row_and_retargets_total(
+    qapp, tmp_path, monkeypatch
+):
+    """Cancelar un job EN ESPERA lo saca de la lista y baja el total."""
+    import src.task_queue as tq
+    from src.ui.main_window import MainWindow
+    from src.ui.tasks_panel import TasksPanel
+
+    monkeypatch.setattr(tq, "_path", lambda: str(tmp_path / "queue.json"))
+    first = tq.enqueue(name="a.mp4", input_path="/in/a.mp4",
+                       output_path="/out/a.mp4", settings={})
+    second = tq.enqueue(name="b.mp4", input_path="/in/b.mp4",
+                        output_path="/out/b.mp4", settings={})
+
+    panel = TasksPanel()
+    panel.rebuild_queue(tq.list_items())
+
+    mw = MainWindow.__new__(MainWindow)
+    mw.tasks_panel = panel
+    mw._queue_active = True
+    mw._queue_done = 0
+    mw._queue_total = 2
+    mw.worker = None
+    mw._tray = None
+    messages = []
+    mw._on_status_message = messages.append
+
+    mw._on_cancel_queue_item(second)
+
+    assert second not in panel._queue_rows          # fuera de la lista
+    assert tq.get_item(second) is None             # fuera del archivo
+    assert first in panel._queue_rows              # el otro sigue ahí
+    assert any("cancelled" in m for m in messages)
+    # El total baja con el job cancelado: la barra no puede seguir
+    # prometeniendo un render que el usuario ya no quiere.
+    assert mw._queue_total == 1
+    assert panel._queue_progress_label.text() == "Queue: 0/1 done"
+
+
+def test_cancel_running_queue_item_aborts_worker_after_confirm(
+    qapp, tmp_path, monkeypatch
+):
+    """Cancelar el job EN MARCHA para el render, previa confirmación."""
+    from PySide6.QtWidgets import QMessageBox
+    import src.task_queue as tq
+    from src.ui.main_window import MainWindow
+    from src.ui.tasks_panel import TasksPanel
+
+    monkeypatch.setattr(tq, "_path", lambda: str(tmp_path / "queue.json"))
+    qid = tq.enqueue(name="long.mp4", input_path="/in/long.mp4",
+                     output_path="/out/long.mp4", settings={})
+    assert tq.set_status(qid, "running") is True
+
+    panel = TasksPanel()
+    panel.rebuild_queue(tq.list_items())
+
+    mw = MainWindow.__new__(MainWindow)
+    mw.tasks_panel = panel
+    mw._queue_active = True
+    mw._queue_done = 0
+    mw._queue_total = 1
+    aborted = []
+    mw._abort_running_worker = lambda cleanup_partial_output: (
+        aborted.append(cleanup_partial_output) or True
+    )
+    mw._cleanup_after_abort = lambda: aborted.append("cleanup")
+    advanced = []
+    mw._advance_queue_after_worker = lambda *a: advanced.append(a)
+    mw._on_status_message = lambda message: None
+
+    asked = []
+    monkeypatch.setattr(
+        QMessageBox, "question",
+        staticmethod(lambda *a, **k: asked.append(a) or QMessageBox.No),
+    )
+    mw._on_cancel_queue_item(qid)
+    assert len(asked) == 1                       # preguntó antes de parar
+    assert aborted == []                          # y respeta el "No"
+    assert tq.get_item(qid)["status"] == "running"
+
+    monkeypatch.setattr(
+        QMessageBox, "question",
+        staticmethod(lambda *a, **k: QMessageBox.Yes),
+    )
+    mw._on_cancel_queue_item(qid)
+    assert aborted == [True, "cleanup"]           # paró el worker
+    assert tq.get_item(qid)["status"] == "aborted"
+    # La fila NO se borra (queda el veredicto) y su botón deja de prometer
+    # que va a parar algo.
+    assert qid in panel._queue_rows
+    assert panel._queue_rows[qid].pill.text() == "ABORTED"
+    # El avance lo cuenta el cierre del worker; si se contara aqui, la cola
+    # sumaria dos veces el mismo job.
+    assert advanced == []
+
+
+def test_clear_queue_stops_the_running_render_first(qapp, tmp_path, monkeypatch):
+    """Vaciar la cola con un render en marcha lo para ANTES de borrar el
+    archivo: si no, su cierre se queda sin item al que escribir y la cola
+    descuadra."""
+    from PySide6.QtWidgets import QMessageBox
+    import src.task_queue as tq
+    from src.ui.main_window import MainWindow
+    from src.ui.tasks_panel import TasksPanel
+
+    monkeypatch.setattr(tq, "_path", lambda: str(tmp_path / "queue.json"))
+    running = tq.enqueue(name="run.mp4", input_path="/in/run.mp4",
+                         output_path="/out/run.mp4", settings={})
+    waiting = tq.enqueue(name="wait.mp4", input_path="/in/wait.mp4",
+                         output_path="/out/wait.mp4", settings={})
+    assert tq.set_status(running, "running") is True
+
+    panel = TasksPanel()
+    panel.rebuild_queue(tq.list_items())
+
+    class _Worker:
+        def isRunning(self):
+            return True
+
+    mw = MainWindow.__new__(MainWindow)
+    mw.tasks_panel = panel
+    mw._queue_active = True
+    mw._queue_done = 0
+    mw._queue_total = 2
+    mw.worker = _Worker()
+    stopped = []
+    mw._abort_running_worker = lambda cleanup_partial_output: (
+        stopped.append(running) or True
+    )
+    mw._cleanup_after_abort = lambda: None
+    mw._advance_queue_after_worker = lambda *a: None
+    mw._on_status_message = lambda message: None
+    monkeypatch.setattr(
+        QMessageBox, "question", staticmethod(lambda *a, **k: QMessageBox.Yes)
+    )
+
+    mw._on_clear_queue()
+
+    assert stopped == [running]      # parado, no solo borrado
+    assert tq.list_items() == []     # archivo limpio
+    assert panel._queue_rows == {}
+    # Solo queda cerrar el render parado: ni 2/2 ni una barra prometerlo.
+    assert mw._queue_total == 1
+    assert panel._queue_progress_label.text() == "No queued jobs"
+
+
 # ---------------------------------------------------------------------------
 # 12. Model scale: filename parsing + target scale honored by engines
 # ---------------------------------------------------------------------------
 
 
 def test_parse_model_scale_from_name_real_world_names():
-    """Escalas extraídas de nombres reales de pesos del ecosistema."""
-    from src.ui.workflow_widget import _parse_model_scale_from_name as _ps
+    """Escalas extraídas de nombres reales de pesos del ecosistema.
+
+    El nombre es sólo una PISTA: la escala de verdad se lee del fichero
+    (``detect_model_file_scale``), porque estos nombres no siempre dicen la
+    verdad.
+    """
+    from src.ai.architectures import parse_scale_from_name as _ps
 
     assert _ps("RealESRGAN_x4plus.pth") == 4
     assert _ps("realesr-animevideov3-x4.pth") == 4
@@ -5126,11 +5416,31 @@ def test_parse_model_scale_from_name_real_world_names():
 
 
 def test_parse_model_scale_from_name_unknown_returns_one():
-    from src.ui.workflow_widget import _parse_model_scale_from_name as _ps
+    from src.ai.architectures import parse_scale_from_name as _ps
 
     assert _ps("model.safetensors") == 1
     assert _ps("SwinIR_003_realSR_BSRGAN_DFOWMFC_s64w8_SwinIR-L.pth") == 1
     assert _ps("") == 1
+
+
+def test_detect_file_scale_marks_whether_it_was_proven(tmp_path, monkeypatch):
+    """La UI sólo ofrece factores PROBADOS; el nombre sólo entra como pista."""
+    import src.ai.architectures as arch
+    from src.ui.workflow_widget import _detect_file_scale
+
+    monkeypatch.setattr(arch, "_scales_path", lambda: str(tmp_path / "scales.json"))
+    monkeypatch.setattr(arch, "_SCALE_CACHE", {})
+
+    path = _write_upscaler_onnx(tmp_path / "jamas-x2.onnx", 3)
+    assert _detect_file_scale(path) == (3, True)
+
+    # Sin poder inspeccionarlo: la pista del nombre, marcada como no probada.
+    roto = tmp_path / "roto_x2.onnx"
+    roto.write_bytes(b"nope")
+    scale, proven = _detect_file_scale(str(roto))
+    assert (scale, proven) == (2, False)
+    assert _detect_file_scale(str(tmp_path / "nada_x8.pth")) == (8, False)
+    assert _detect_file_scale(str(tmp_path / "model.pth")) == (1, False)
 
 
 def test_pytorch_engine_get_scale_factor_honors_target(tmp_path, monkeypatch):
@@ -5175,6 +5485,198 @@ def test_onnx_engine_get_scale_factor_honors_target():
 
     eng._target_scale = 2
     assert eng.get_scale_factor() == 2
+
+
+# -----------------------------------------------------------------------
+# 12b. Escala NATIVA de un modelo: se lee el fichero, no su nombre
+# -----------------------------------------------------------------------
+#
+# El nombre y el catálogo mienten (``OmniSR_X2_DIV2K.onnx`` es un x8, los
+# "x2plus" de AI-Forever son x4, el catálogo declaraba 2x/3x/4x para un
+# .onnx que sólo hace x4). Un factor que el modelo no tiene significa pagar
+# el upscale entero para tirar el resultado hacia abajo (perf-audit §3.5).
+
+
+def _onnx_module():
+    from src.runtimes.manager import import_local_runtime
+    try:
+        return import_local_runtime("onnx")
+    except Exception as exc:  # pragma: no cover - entorno sin runtime
+        pytest.skip(f"runtime de onnx no disponible: {exc}")
+
+
+def _write_upscaler_onnx(path, scale, fixed_shapes=False):
+    """ONNX mínimo que sube ``scale``x con formas dinámicas (como los SR reales)."""
+    onnx = _onnx_module()
+    import numpy as np
+    from onnx import TensorProto, helper, numpy_helper
+
+    scales = numpy_helper.from_array(
+        np.array([1.0, 1.0, float(scale), float(scale)], dtype=np.float32), "sc"
+    )
+    node = helper.make_node("Resize", ["input", "", "sc"], ["output"], mode="nearest")
+    h_in, w_in = (32, 32) if fixed_shapes else ("h", "w")
+    h_out, w_out = (32 * scale, 32 * scale) if fixed_shapes else ("oh", "ow")
+    graph = helper.make_graph(
+        [node], "upscaler",
+        [helper.make_tensor_value_info("input", TensorProto.FLOAT, ["n", 3, h_in, w_in])],
+        [helper.make_tensor_value_info("output", TensorProto.FLOAT, ["n", 3, h_out, w_out])],
+        [scales],
+    )
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+    onnx.save(model, str(path))
+    return str(path)
+
+
+def _write_pixelshuffle_only_onnx(path):
+    """Grafo con DepthToSpace pero SIN subir: no se puede probar nada."""
+    onnx = _onnx_module()
+    from onnx import TensorProto, helper
+
+    node = helper.make_node("DepthToSpace", ["input"], ["output"],
+                            mode="CRD", blocksize=4)
+    graph = helper.make_graph(
+        [node], "shuffle",
+        [helper.make_tensor_value_info("input", TensorProto.FLOAT, ["n", 48, "h", "w"])],
+        [helper.make_tensor_value_info("output", TensorProto.FLOAT, ["n", 3, "h", "w"])],
+        [],
+    )
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+    onnx.save(model, str(path))
+    return str(path)
+
+
+def test_detect_onnx_scale_reads_the_graph_not_the_name(tmp_path):
+    """Un x3 se detecta como x3 aunque el fichero se llame x2."""
+    from src.ai.architectures import detect_onnx_scale
+
+    path = _write_upscaler_onnx(tmp_path / "model-x2.onnx", 3)
+    assert detect_onnx_scale(path) == 3
+
+
+def test_detect_onnx_scale_uses_fixed_shapes_when_declared(tmp_path):
+    from src.ai.architectures import detect_onnx_scale
+
+    path = _write_upscaler_onnx(tmp_path / "fixed.onnx", 3, fixed_shapes=True)
+    assert detect_onnx_scale(path) == 3
+
+
+def test_detect_onnx_scale_does_not_invent_a_factor(tmp_path):
+    """Sin ops de subida demostrables devuelve 1: no inventa un factor."""
+    from src.ai.architectures import detect_onnx_scale
+
+    assert detect_onnx_scale(_write_pixelshuffle_only_onnx(
+        tmp_path / "shuffle.onnx")) == 1
+    roto = tmp_path / "roto.onnx"
+    roto.write_bytes(b"esto no es un onnx")
+    assert detect_onnx_scale(str(roto)) == 1
+    assert detect_onnx_scale(str(tmp_path / "no-existe.onnx")) == 1
+    assert detect_onnx_scale("") == 1
+
+
+def test_detect_onnx_scale_of_the_installed_x4_model():
+    """El realesr-animevideov3 del repo es x4 de verdad (Resize 4 + DepthToSpace 4)."""
+    from src.ai.architectures import detect_onnx_scale
+
+    path = os.path.join("bin", "models", "Upscale", "realesr-animevideov3",
+                        "realesr-animevideov3.onnx")
+    if not os.path.isfile(path):
+        pytest.skip("el modelo real no está instalado")
+    assert detect_onnx_scale(path) == 4
+
+
+def test_onnx_engine_reports_the_real_scale_of_a_dynamic_model(tmp_path):
+    """Con formas dinámicas la engine decía x2 para un x4 real (la mitad de píxeles)."""
+    from src.ai.inference import ONNXRUNTIMEInferenceEngine
+
+    path = _write_upscaler_onnx(tmp_path / "x4.onnx", 4)
+    eng = ONNXRUNTIMEInferenceEngine(path, "upscale-realesr-animevideov3")
+    eng._input_shape = ["n", 3, "h", "w"]      # dinámicas, como los SR reales
+    eng._output_shape = ["n", 3, "oh", "ow"]
+    assert eng.get_scale_factor() == 4
+    # Se midió una sola vez y se cachea.
+    assert eng._native_scale == 4
+
+    # Un target menor sigue mandando (el encoder se re-encaja a lo pedido).
+    eng._target_scale = 2
+    assert eng.get_scale_factor() == 2
+
+
+def test_get_model_file_scale_caches_by_fingerprint(tmp_path, monkeypatch):
+    """La UI escanea la carpeta en cada refresco: la escala no se re-mide cada vez."""
+    import src.ai.architectures as arch
+
+    monkeypatch.setattr(arch, "_scales_path", lambda: str(tmp_path / "scales.json"))
+    monkeypatch.setattr(arch, "_SCALE_CACHE", {})
+
+    path = tmp_path / "x4.onnx"
+    _write_upscaler_onnx(path, 4)
+    assert arch.get_model_file_scale(str(path)) == 4
+
+    calls = []
+    real = arch.detect_model_file_scale
+
+    def _counting(target):
+        calls.append(target)
+        return real(target)
+
+    monkeypatch.setattr(arch, "detect_model_file_scale", _counting)
+    assert arch.get_model_file_scale(str(path)) == 4
+    assert calls == [], "la segunda llamada debe salir de la caché"
+
+    # Si el fichero cambia, la huella cambia y se vuelve a medir. (La huella
+    # es tamaño + mtime, como la de model_ratings; por eso aquí se fuerza el
+    # mtime en vez de confiar en la granularidad del reloj de ficheros.)
+    _write_upscaler_onnx(path, 2)
+    st = os.stat(path)
+    os.utime(path, (st.st_atime + 10, st.st_mtime + 10))
+    assert arch.get_model_file_scale(str(path)) == 2
+    assert len(calls) == 1
+
+    # Lo que no se puede inspeccionar cae en el fallback del llamante.
+    roto = tmp_path / "roto.onnx"
+    roto.write_bytes(b"nope")
+    assert arch.get_model_file_scale(str(roto)) == 1
+    assert arch.get_model_file_scale(str(roto), fallback=4) == 4
+    assert arch.get_model_file_scale(str(tmp_path / "nada.onnx"), fallback=2) == 2
+
+    # Y la caché se persiste de verdad (si el os.replace falla en silencio lo
+    # único que se nota es un .tmp huérfano y la UI vuelve a medirlo todo).
+    assert (tmp_path / "scales.json").is_file()
+    assert not (tmp_path / "scales.json.tmp").exists()
+    monkeypatch.setattr(arch, "_SCALE_CACHE", {})
+    calls = []
+    monkeypatch.setattr(arch, "detect_model_file_scale",
+                        lambda p: calls.append(p) or 99)
+    assert arch.get_model_file_scale(str(path)) == 2  # el x2 cacheado
+    assert calls == [], "la caché en disco no se está usando"
+
+
+def test_detect_model_file_scale_dispatch(tmp_path, monkeypatch):
+    """La extensión decide cómo se lee: grafo para .onnx, tensores para el resto."""
+    import src.ai.architectures as arch
+
+    monkeypatch.setattr(arch, "_scales_path", lambda: str(tmp_path / "scales.json"))
+    monkeypatch.setattr(arch, "_SCALE_CACHE", {})
+
+    assert arch.detect_model_file_scale(
+        _write_upscaler_onnx(tmp_path / "x3.onnx", 3)) == 3
+
+    seen = {}
+
+    def _fake_weights(path):
+        seen["path"] = path
+        return ("srvgg", 4)
+
+    monkeypatch.setattr(arch, "detect_arch_and_scale", _fake_weights)
+    pth = tmp_path / "cualquiera.pth"
+    pth.write_bytes(b"pesos")
+    assert arch.detect_model_file_scale(str(pth)) == 4
+    assert seen["path"] == str(pth)
+
+    monkeypatch.setattr(arch, "detect_arch_and_scale", lambda _p: (None, None))
+    assert arch.detect_model_file_scale(str(pth)) == 1
+    assert arch.detect_model_file_scale("") == 1
 
 
 # ---------------------------------------------------------------------------

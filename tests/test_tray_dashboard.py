@@ -20,6 +20,7 @@ la ventana cerrada es una aplicación que no se cierra.
 """
 
 import os
+import time
 
 import pytest
 
@@ -30,6 +31,7 @@ from src.ui.tray_dashboard import (
     eta_text,
     metric_lines,
     queue_text,
+    rend_text,
     speed_text,
 )
 
@@ -49,6 +51,24 @@ from src.ui.tray_dashboard import (
 ])
 def test_la_velocidad_se_escribe_en_las_unidades_que_existen(fps, speed, esperado):
     assert speed_text(fps, speed) == esperado
+
+
+@pytest.mark.parametrize("fps,esperado", [
+    (147.2, "147.2 fps"),
+    (20.0, "20.0 fps"),
+    (0, None),
+    (None, None),
+])
+def test_el_render_de_ia_solo_tiene_fps(fps, esperado):
+    """El render de IA no tiene multiplicador: va a tantos frames y punto.
+
+    ``speed`` es de ffmpeg, que mide contra la duracion del archivo. Meterlo
+    aqui seria inventar una unidad que no existe, y ademas fue justo lo que
+    hizo que las dos velocidades acabaran en la misma casilla: una sola linea
+    que decia "REND 20.0 fps - 7.5x" sin poder decir quien habia escrito cada
+    numero.
+    """
+    assert rend_text(fps) == esperado
 
 
 def test_la_cola_no_se_inventa_una_cuanda_que_no_existe():
@@ -132,7 +152,8 @@ def test_la_barra_y_el_desplegable_no_pueden_discrepar_sobre_el_eta():
 def _estado(**extra):
     base = {
         "active": True, "task_name": "entrada.mkv", "pct": 40,
-        "eta": "ETA ~00:12", "metrics": {}, "fps": None, "speed": None,
+        "eta": "ETA ~00:12", "metrics": {},
+        "ai_fps": None, "enc_fps": None, "enc_speed": None,
     }
     base.update(extra)
     return base
@@ -161,7 +182,7 @@ def test_con_render_enseña_tarea_porcentaje_eta_y_cifras(qapp):
     dash = TrayDashboard()
     try:
         dash.set_state(_estado(
-            pct=40, eta="ETA ~00:12", fps=147.2, speed=7.2,
+            pct=40, eta="ETA ~00:12", ai_fps=20.0, enc_fps=147.2, enc_speed=7.2,
             metrics={"cpu_percent": 84, "gpu_percent": 88,
                      "gpu_name": "NVIDIA GeForce RTX 3060",
                      "vram_used_mb": 3255, "vram_total_mb": 12288},
@@ -172,8 +193,8 @@ def test_con_render_enseña_tarea_porcentaje_eta_y_cifras(qapp):
         assert "40 %" in textos["sub"]
         assert "ETA ~00:12" in textos["sub"]
         assert "4 de 7 en cola" in textos["sub"]
-        assert "147.2 fps" in textos["metrics"]
-        assert "7.2x" in textos["metrics"]
+        assert "REND  20.0 fps" in textos["metrics"]
+        assert "ENC   147.2 fps  ·  7.2x" in textos["metrics"]
         assert "CPU  84 %" in textos["metrics"]
         assert "GPU  88 %" in textos["metrics"]
         assert "3.2 / 12.0 GB" in textos["metrics"]
@@ -240,24 +261,89 @@ def test_el_widget_no_se_come_los_clics_para_que_el_menu_no_se_cierre(qapp):
 # ---------------------------------------------------------------------------
 
 def test_el_canal_de_metricas_es_plano_igual_que_el_de_ffmpeg():
-    """Las dos fuentes de cifras hablan el mismo idioma.
+    """Las dos fuentes de cifras hablan el mismo idioma: un dict plano.
 
     El bucle de IA y ``run_ffmpeg`` mandan los dos por el mismo canal. Antes
     el de IA usaba un envoltorio ``{"metric": ..., "value": ...}`` copiado
     del de las fases, y el consumidor tenía que adivinar de qué render salía
     cada número. Con el envoltorio, en un render de compresión normal —el
     camino más común— la línea de velocidad no aparecía nunca.
+
+    Y ahora, además, cada fuente **prefija** sus claves (``ai_`` y ``enc_``).
+    Compartían nombre, se pisaban y el número que se veía en pantalla no
+    sabía de quién era.
     """
     from src.processing.pipeline import _emit_metrics
 
     recibidos = []
-    _emit_metrics(recibidos.append, fps=12.5, frame=300)
-    assert recibidos == [{"fps": 12.5, "frame": 300}]
+    _emit_metrics(recibidos.append, ai_fps=12.5, ai_frame=300,
+                  ai_total_frames=900)
+    assert recibidos == [{"ai_fps": 12.5, "ai_frame": 300,
+                          "ai_total_frames": 900}]
 
-    # Y el de ffmpeg, que ya era plano, encaja en el mismo estado: el
-    # consumidor es uno solo y acepta las dos fuentes sin distinguirlas.
+    # Las dos fuentes caben en el mismo estado, cada una en su lado.
     campos = set(TrayController.CAMPOS_METRICAS)
-    assert {"fps", "speed", "frame"} <= campos
+    assert {"ai_fps", "ai_frame", "ai_total_frames"} <= campos
+    assert {"enc_fps", "enc_speed", "enc_frame"} <= campos
+
+
+def test_ninguna_fuente_vuelve_a_escribir_en_una_clave_sin_prefijo():
+    """La ventaja del prefijo solo existe si las claves viejas no vuelven.
+
+    Sin esto, añadir un ``fps=`` en cualquier sitio reintroduce el pisado en
+    silencio: los tests de arriba seguirían en verde porque comprueban las
+    claves nuevas, y el fallo volvería a ser invisible.
+
+    Se mira solo lo que forma parte del canal —los ``_emit_metrics(...)`` del
+    pipeline y el ``latest`` que ``run_ffmpeg`` publica—, no cualquier
+    diccionario del módulo: ``failure["frame"]``, por ejemplo, es el detalle de
+    una engine que ha fallado y no tiene nada que ver con esto.
+    """
+    import ast
+    import inspect
+
+    import src.ffmpeg.runner as runner_mod
+    import src.processing.pipeline as pipeline_mod
+
+    sin_prefijo = {"fps", "speed", "frame", "out_time", "total_frames"}
+
+    arbol = ast.parse(inspect.getsource(pipeline_mod))
+    publicadas = 0
+    for nodo in ast.walk(arbol):
+        if not isinstance(nodo, ast.Call):
+            continue
+        func = nodo.func
+        nombre = getattr(func, "id", None) or getattr(func, "attr", None)
+        if nombre != "_emit_metrics":
+            continue
+        publicadas += 1
+        for kw in nodo.keywords:
+            if kw.arg in sin_prefijo:
+                pytest.fail(
+                    f"pipeline.py:{nodo.lineno} publica {kw.arg}= sin "
+                    "prefijo; use ai_ o enc_ para que las dos fuentes de "
+                    "cifras no se pisen")
+    assert publicadas >= 1, (
+        "el AST ha dejado de ver los _emit_metrics() y este test pasaria "
+        "sin comprobar nada")
+
+    arbol = ast.parse(inspect.getsource(runner_mod))
+    guardadas = 0
+    for nodo in ast.walk(arbol):
+        if not (isinstance(nodo, ast.Subscript)
+                and isinstance(nodo.value, ast.Name)
+                and nodo.value.id == "latest"
+                and isinstance(nodo.slice, ast.Constant)):
+            continue
+        guardadas += 1
+        clave = nodo.slice.value
+        if isinstance(clave, str) and clave in sin_prefijo:
+            pytest.fail(
+                f"runner.py:{nodo.lineno} publica latest[{clave!r}] sin "
+                "prefijo; use enc_ para que no choque con el canal de la IA")
+    assert guardadas >= 1, (
+        "el AST ha dejado de ver los latest[...] de run_ffmpeg y este test "
+        "pasaria sin comprobar nada")
 
 
 def test_un_canal_de_metricas_roto_no_tumba_un_render():
@@ -267,8 +353,8 @@ def test_un_canal_de_metricas_roto_no_tumba_un_render():
     def _reventon(_campos):
         raise RuntimeError("el desplegable se ha caído")
 
-    _emit_metrics(_reventon, fps=1.0)   # no lanza
-    _emit_metrics(None, fps=1.0)        # sin canal, no hace nada
+    _emit_metrics(_reventon, ai_fps=1.0)   # no lanza
+    _emit_metrics(None, ai_fps=1.0)        # sin canal, no hace nada
 
 
 def test_el_canal_de_metricas_tiene_las_mismas_claves_que_las_que_se_pintan():
@@ -323,13 +409,27 @@ def test_ffmpeg_manda_las_cifras_que_ya_calculaba_y_el_progreso_no_cambia(tmp_pa
     assert pcts == sorted(pcts), f"el progreso retrocedió: {pcts}"
     assert pcts[-1] == 100
 
-    # Las métricas: un dict plano con las cifras que ya traía ffmpeg.
+    # Las métricas: un dict plano con las cifras que ya traía ffmpeg, ahora
+    # con prefijo ``enc_`` para que no se pisen con las del render de IA.
+    # Se busca el último bloque con cifras de verdad, no el último a secas:
+    # ffmpeg necesita ~1 s para tener un promedio, y su ``fps`` sale a 0
+    # durante el primer segundo (por eso el desplegable enseña también el
+    # multiplicador). El bloque de "end" sale con lo que hubiera en ese
+    # momento, así que mirar solo el último es mirar el peor caso.
     assert metricas, "ffmpeg mandó progreso pero ninguna métrica"
-    ultima = metricas[-1]
+    con_cifras = [m for m in metricas
+                  if "enc_fps" in m and "enc_speed" in m
+                  and float(m["enc_speed"]) > 0 and m.get("enc_out_time")]
+    assert con_cifras, (
+        f"ninguno de los {len(metricas)} bloques trajo velocidad y tiempo de "
+        f"salida: ultimo={metricas[-1]}")
+    ultima = con_cifras[-1]
     assert isinstance(ultima, dict)
-    assert "fps" in ultima and "speed" in ultima
-    assert float(ultima["speed"]) > 0, "una velocidad de 0 no dice nada"
-    assert ultima["out_time"] > 0, "el tiempo de salida tambien viene en el bloque"
+    assert float(ultima["enc_speed"]) > 0, "una velocidad de 0 no dice nada"
+    assert ultima["enc_out_time"] > 0, "el tiempo de salida tambien viene en el bloque"
+    assert not ({"fps", "speed", "frame", "out_time"} & set(ultima)), (
+        "ffmpeg vuelve a publicar en la clave sin prefijo: el desplegable no "
+        "puede saber de quién es el número")
 
     # Y el throttle: ffmpeg emite cada 100 ms y esto publica mucho menos.
     assert len(metricas) < 20, (
@@ -445,26 +545,62 @@ def test_sin_muestreo_el_desplegable_sigue_diciendo_la_verdad(qapp, monkeypatch)
         control.deleteLater()
 
 
-def test_el_controlador_mezcla_el_canal_de_metricas_tal_cual(qapp):
-    """Un dict plano, mezclado como llega, sin adivinar de dónde viene.
+def test_el_controlador_acepta_las_dos_fuentes_por_separado(qapp):
+    """Cada fuente rellena su lado y ninguna pisa a la otra.
 
-    La IA manda ``fps`` y ffmpeg manda ``fps``/``speed``/``frame``; los dos
-    rellenan el mismo estado. Con un envoltorio por un lado —que fue como
-    empezó— el camino más común, que es la compresión, no enseñaba nunca la
-    velocidad.
+    Este es el Arrangement del arreglo. Antes las dos escribían ``fps`` en el
+    mismo estado, así que el último en hablar —ffmpeg, al final del render—
+    borraba el ritmo del motor de IA, y comparar un x2 con un x3 acababa
+    comparando el motor de IA contra el codificador. Con los prefijos, los
+    dos números están a la vez y se sabe de quién es cada uno.
     """
     control = TrayController()
     try:
         control.start()
-        control.update_metrics({"fps": 12.5, "frame": 300})
-        assert "12.5 fps" in control.texts()["metrics"]
-        control.update_metrics({"fps": 99.0, "speed": 4.2})
-        assert "99.0 fps" in control.texts()["metrics"]
-        assert "4.2x" in control.texts()["metrics"]
+        control.update_metrics({"ai_fps": 20.0, "ai_frame": 300,
+                                "ai_total_frames": 900})
+        control.update_metrics({"enc_fps": 147.2, "enc_speed": 7.2,
+                                "enc_frame": 310})
+        texto = control.texts()["metrics"]
+        assert "REND  20.0 fps" in texto
+        assert "ENC   147.2 fps  ·  7.2x" in texto
+
+        # Y al revés: si habla ffmpeg otra vez, el fps del render sigue ahí.
+        control.update_metrics({"enc_fps": 90.0})
+        texto = control.texts()["metrics"]
+        assert "REND  20.0 fps" in texto
+        assert "ENC   90.0 fps" in texto
+
         # Una basura no rompe nada ni borra lo que ya habia.
         control.update_metrics(None)
         control.update_metrics("no soy un dict")
-        assert "99.0 fps" in control.texts()["metrics"]
+        assert "20.0 fps" in control.texts()["metrics"]
+    finally:
+        control.stop()
+        control.deleteLater()
+
+
+@pytest.mark.parametrize("evento,esperado", [
+    ({"ai_fps": 20.0}, "REND  20.0 fps"),
+    ({"enc_fps": 147.2, "enc_speed": 7.2}, "ENC   147.2 fps  ·  7.2x"),
+])
+def test_con_una_sola_fuente_solo_se_enseña_esa(qapp, evento, esperado):
+    """Un render de compresión no tiene motor de IA: no hay linea REND.
+
+    Enseñar las dos siempre, aunque una esté vacía, llenaría el desplegable de
+    guiones. Y enseñar la de ffmpeg donde antes no había nada se notaría: es un
+    cambio de una línea visible, no un detalle de refactor.
+    """
+    control = TrayController()
+    try:
+        control.start()
+        control.update_metrics(evento)
+        texto = control.texts()["metrics"]
+        assert esperado in texto
+        if "ai_fps" in evento:
+            assert "ENC" not in texto
+        else:
+            assert "REND" not in texto
     finally:
         control.stop()
         control.deleteLater()
@@ -482,7 +618,7 @@ def test_el_rato_de_espera_entre_un_render_y_otro(qapp, monkeypatch):
     try:
         control.start()
         control.set_task("primero.mkv")
-        control.update_metrics({"fps": 200.0})
+        control.update_metrics({"ai_fps": 200.0})
         control.stop()
 
         control.start()
@@ -584,3 +720,151 @@ def test_el_canal_de_metricas_llega_a_los_cuatro_caminos_de_render():
     assert "metrics_callback" in inspect.signature(
         __import__("src.ffmpeg.runner", fromlist=["run_ffmpeg"]).run_ffmpeg
     ).parameters
+
+
+def test_la_ventana_no_lee_ninguna_clave_del_canal_de_metricas():
+    """El ETA de la barra se calcula con su propio reloj, no con el del desplegable.
+
+    ``_on_worker_progress`` mide el tiempo desde que se lanzo el worker y se
+    lleva el porcentaje. Si en algun momento empezara a leer el canal de
+    metricas, el prefijo de las claves seria cosa suya y habria dos sitios
+    cambiando el mismo nombre a la vez. Se comprueba por AST porque el
+    proposito es que el cambio no se note hasta que se rompe.
+    """
+    import ast
+    from pathlib import Path
+
+    raiz = Path(__file__).resolve().parent.parent
+    arbol = ast.parse((raiz / "src" / "ui" / "main_window.py").read_text(
+        encoding="utf-8"))
+    claves = {"fps", "speed", "frame", "out_time", "total_frames",
+              "ai_fps", "ai_frame", "ai_total_frames",
+              "enc_fps", "enc_speed", "enc_frame", "enc_out_time"}
+    leidas = []
+    for nodo in ast.walk(arbol):
+        if isinstance(nodo, ast.Subscript) and isinstance(nodo.slice, ast.Constant):
+            if nodo.slice.value in claves:
+                leidas.append((nodo.lineno, nodo.slice.value))
+    assert leidas == [], (
+        f"main_window.py lee claves del canal de metricas en {leidas}: ese "
+        "estado es de tray_dashboard, no suyo, y duplicaria el formato")
+
+
+# ---------------------------------------------------------------------------
+# El ritmo: ventana movil, no media historica
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("dt,frames,frame_num,elapsed,esperado", [
+    # La ventana manda aunque la media global diga otra cosa. Este es el
+    # Arrangement entero: 30 frames en 1 s son 30 fps, aunque el render lleve
+    # 300 frames en 20 s (15 fps de media) porque arranco lento.
+    (1.0, 30, 300, 20.0, 30.0),
+    (2.0, 30, 30, 30.0, 15.0),
+    # Reloj parado o sin dato: se cae a la media global, y si tampoco, a cero.
+    # Nunca a una excepcion — esto va en el bucle de un render en curso.
+    (0, 30, 300, 20.0, 15.0),
+    (None, 30, 300, 20.0, 15.0),
+    (0, 30, 0, 0, 0.0),
+    (0, 30, 300, None, 0.0),
+])
+def test_el_fps_es_el_de_la_ventana_no_la_media_historica(
+        dt, frames, frame_num, elapsed, esperado):
+    from src.processing.pipeline import _fps_ventana
+    assert _fps_ventana(dt, frames, frame_num, elapsed) == pytest.approx(esperado)
+
+
+class _EngineLentaAlArranque:
+    """Engine de mentira: los primeros frames cuestan, luego no.
+
+    Reproduce lo que pasa en un render de verdad, que es donde se ve el
+    problema: el primer frame paga la compilación de kernels de cuDNN, la
+    VRAM está fría y el proceso de ffmpeg acaba de arrancar. Con la media
+    desde el inicio, ese arranque se quedaba promediado para siempre.
+    """
+
+    engine_id = "lenta-al-arranque"
+    _mode = "upscale"
+
+    def __init__(self, frames_lentos=30, retardo=0.05):
+        self._frames_lentos = int(frames_lentos)
+        self._retardo = retardo
+        self._n = 0
+        self._failed = False
+
+    def get_scale_factor(self):
+        return 1
+
+    def process_frame(self, frame):
+        self._n += 1
+        if self._n <= self._frames_lentos:
+            time.sleep(self._retardo)
+        return frame
+
+
+def test_el_bucle_de_render_publica_ai_fps_que_ya_no_arrastra_el_arranque(tmp_path):
+    """    Render de verdad: la ultima cifra mide el ritmo, no el promedio.
+
+    Tres cosas se comprueban aqui, y las tres se derivan del mismo cambio:
+
+      * las claves llevan prefijo ``ai_`` y no vuelve ninguna sin prefijo, que
+        es lo que hacia que el numero del desplegable no dijera de quien era;
+      * se publica cada 30 frames, como antes (la frecuencia no cambia, lo que
+        cambia es que se mide);
+      * y el numero de la ultima ventana es mucho mayor que la media global,
+        porque la media arrastra los 30 frames lentos del arranque y la ventana
+        ya solo mira los ultimos 30, que vuelan.
+    """
+    import subprocess
+    import time as _time
+
+    from src.ffmpeg.manager import get_local_ffmpeg_path
+    from src.processing.pipeline import (
+        VENTANA_METRICAS_IA, compress_video_with_ai)
+
+    ffmpeg = get_local_ffmpeg_path()
+    if not (ffmpeg and os.path.exists(ffmpeg)):
+        pytest.skip("No hay FFmpeg local en este checkout")
+
+    total = VENTANA_METRICAS_IA * 3
+    src = os.path.join(str(tmp_path), "src.mp4")
+    rc = subprocess.run(
+        [ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
+         "-f", "lavfi", "-i", f"testsrc=duration=3:size=320x240:rate=30",
+         "-c:v", "libx264", "-preset", "ultrafast", src],
+        capture_output=True, timeout=120).returncode
+    if rc != 0 or not os.path.exists(src):
+        pytest.skip("no se pudo generar el clip de prueba con FFmpeg")
+
+    recibidos = []
+    t0 = _time.time()
+    ok = compress_video_with_ai(
+        ffmpeg, src, os.path.join(str(tmp_path), "dst.mp4"),
+        {
+            "audio": "noaudio", "format": "mp4", "codec": "libx264",
+            "preset": "ultrafast", "bitrate": "600",
+            "pixel_format": "yuv420p", "resolution": "original",
+        },
+        inference_engines=[_EngineLentaAlArranque()],
+        metrics_cb=recibidos.append,
+    )
+    total_segundos = _time.time() - t0
+    assert ok is True
+    assert recibidos, "el render no publico ninguna metrica"
+
+    sin_prefijo = {"fps", "speed", "frame", "out_time", "total_frames"}
+    for evento in recibidos:
+        assert not (set(evento) & sin_prefijo), (
+            f"el render volvio a publicar sin prefijo: {evento}")
+        assert "ai_fps" in evento and "ai_frame" in evento
+    assert [e["ai_frame"] for e in recibidos] == [
+        VENTANA_METRICAS_IA * (i + 1) for i in range(len(recibidos))]
+    assert len(recibidos) == 3, (
+        f"han salido {len(recibidos)} bloques para {total} frames: la ventana "
+        f"de {VENTANA_METRICAS_IA} frames no es la que se publica")
+
+    ultima = recibidos[-1]["ai_fps"]
+    media_global = total / max(total_segundos, 1e-6)
+    assert ultima > 3 * media_global, (
+        f"la ventana dio {ultima:.1f} fps y la media global {media_global:.1f} "
+        "fps: el arranque sigue promediandose, asi que la ventana no esta "
+        "midiendo lo que dice medir")
