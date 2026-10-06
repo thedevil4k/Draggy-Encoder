@@ -13,6 +13,10 @@ DRAGGY ENCODER combines FFmpeg-based encoding with ONNX/PyTorch AI models for vi
 - NVENC / AMF / QuickSync GPU encoder support
 - Two-pass EBU R128 loudness normalization (audio boost)
 - Side-by-side preview comparison with zoom + pan
+- Persistent render queue: queue several videos and cancel any single job
+- Pick which audio track to keep, or keep all of them
+- Live GPU / CPU / VRAM meters while a render runs
+- AI engines rated by speed and quality **measured on your own machine**
 - Multi-language UI (English / Spanish)
 - Auto-update chain for dependencies
 - PyInstaller-ready for portable Windows/Linux distribution
@@ -77,10 +81,19 @@ solution to an old driver when it is not.
 DRAGGY_ENCODER/
 ├── main.py                  # Entry point
 ├── requirements.txt          # Python dependencies
+├── requirements-build.txt    # Extra pins used only when freezing a bundle
 ├── LICENSE                   # MIT
-├── assets/                   # UI icons (8 PNGs)
+├── perf-audit.md             # Notes from the performance audit
+├── assets/                   # UI icons (the packaged app bundles this whole folder)
+├── screenshots/              # Images used by this README
+├── tests/                    # pytest suite (`python -m pytest tests -q`)
+│   └── data/                 # Reference data as plain modules (no binaries)
+├── packaging/linux/          # AppImage + Flatpak metadata and build helpers
+├── .github/workflows/        # Installer and AppImage builds, release artifacts
+├── draggy_encoder.spec       # PyInstaller spec (bundles all of assets/)
+├── draggy_encoder.iss        # Inno Setup script for the Windows installer
 ├── bin/                      # Downloaded binaries (auto-generated, gitignored)
-│   ├── .session/             # Preferences & engine state
+│   ├── .session/             # Preferences, queue & render history, engine state
 │   ├── ffmpeg/               # FFmpeg (auto-downloaded on first run)
 │   ├── runtimes/             # PyTorch + ONNX Runtime (pip install --target)
 │   ├── models/               # Downloaded AI model weights
@@ -273,11 +286,78 @@ python main.py
 
 ## Usage
 
-1. **Import a video** — Drag and drop or browse
+1. **Import a video** — Drag and drop or browse (several at once is fine)
 2. **Configure AI workflow** — Select upscale (x2‑x4) and/or interpolation (double FPS)
-3. **Adjust export settings** — Codec, bitrate, resolution, format, audio
+3. **Adjust export settings** — Codec, bitrate, resolution, format, audio track
 4. **Preview** — Compare original vs compressed frame
-5. **Compress** — GPU accelerated encode with audio passthrough
+5. **Compress** — GPU accelerated encode with audio passthrough, or **Add to
+   queue** to line up several videos and run them one after another
+
+## Render queue
+
+The **Queue** tab on the right lists the videos you have lined up, and it
+survives closing the app: the queue is a small JSON file in your session
+folder, so a crash or a reboot does not lose the list.
+
+- **Cancel one job** — every row has a visible ✕. On a job that is waiting it
+  leaves the queue; on the render that is running it asks first, stops the
+  process and leaves the row as **ABORTED** so you can see what happened. The
+  same thing happens with `Delete` / `Backspace` on the focused row.
+- **Remove finished jobs** — *Remove finished* clears the DONE / FAILED /
+  ABORTED rows in one click and leaves the pending jobs and the running render
+  alone. Without it, a batch of twenty videos leaves twenty rows behind and
+  the only cleanup is *Clear queue*, which throws away the work you have not
+  started yet.
+- **Right-click a row** — the same cancel action, plus **Open output folder** and
+  **Copy path**. The verb follows the row's state (*Cancel job* while it waits,
+  *Stop render* while it runs, *Remove from list* once it is done), and the two
+  path actions are greyed out when the job has no path to work with.
+- **Start queue** — runs the waiting jobs in order, one at a time, showing
+  `Queue: 2/5 done` so a long batch is not a black box.
+
+The **Tasks** tab shows the same renders as cards with a phase per step (AI,
+audio, mux). Each card has its own ✕: on a running render it confirms, stops
+the process and the card settles to **ABORTED**; on a finished one it just
+removes that entry from the history.
+
+> The `N job(s) queued` counter shows how many jobs are **waiting**, not how
+> many rows are on screen. Finished rows are not pending work, so they are not
+> counted (a panel with nine DONE rows and one waiting job says `1`, not `10`).
+
+## Screenshots
+
+| Manage Dependencies | Tray dashboard |
+|---|---|
+| ![Dependencies panel](screenshots/DraggyEncoder-screenshot-dependencies.png) | ![Tray dashboard](screenshots/DraggyEncoder-tray-dashboard.png) |
+
+## What stays on your machine
+
+None of what you type, download or render belongs in this repository. The
+program keeps all of it outside the git tree, and `.gitignore` is what keeps it
+that way:
+
+| What | Where it lives |
+|---|---|
+| Preferences, session state, your HuggingFace token | `bin/.session/` (or `personal/`), ignored |
+| AI model weights (hundreds of MB) | `bin/models/`, downloaded on demand, ignored |
+| FFmpeg build and the AI runtimes | `bin/ffmpeg/`, `bin/runtimes/`, downloaded, ignored |
+| Render and FFmpeg logs | `bin/logs/`, ignored |
+| Videos and audio you render or preview | wherever you save them; if that is inside the checkout, the extensions the app produces (`.mp4 .mkv .avi .wmv .mov .webm`, `.mp3 .aac .m4a .mka .opus .wav .flac`) are ignored |
+| Queue and render history | your session folder: `bin/.session/` on Windows, `${XDG_DATA_HOME:-~/.local/share}/draggy-encoder` on Linux, ignored |
+| Benchmark probes and model derivatives | `tmp-*/`, ignored |
+| PyInstaller output | `build/`, `dist/`, ignored |
+
+One deliberate exception, and it is harmless: `screenshots/` holds the images
+used above. Everything else the app downloads or writes at runtime is ignored.
+
+> Because the PyInstaller spec bundles the whole `assets/` folder, anything
+> that lands there ships inside every installer. Keep it to the icons the app
+> actually loads — a stray 25 MB file or an unrelated data file makes every
+> release bigger for no reason.
+
+If you fork this and add your own token, keep it out of commits. A token in a
+`personal/` folder that somebody `force`-added is a token in the history, and
+rotating it is the only real fix.
 
 ## License
 

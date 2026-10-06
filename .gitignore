@@ -7,6 +7,14 @@ __pycache__/
 venv/
 env/
 
+# Tests y cobertura
+.pytest_cache/
+.cache/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+
 # IDEs
 .vscode/
 .idea/
@@ -20,23 +28,57 @@ personal/
 .env.*
 *.pem
 *.key
+*.token
+huggingface_token*
+.netrc
+# Las preferencias viven en bin/.session y guardan el token de HuggingFace
+# que haya introducido el usuario: nunca deben versionarse.
 
 # Herramientas de escritorio
 .freebuff/
 
 # Outputs y temporales
+# Vídeo: los seis contenedores que ofrece el desplegable de formato.
 *.mkv
 *.mp4
 *.avi
 *.wmv
 *.mov
 *.webm
+# Audio: lo que producen el boost de volumen, la vista previa y el mux
+# (AAC/MP3 en la salida, .mka/.m4a/.opus como intermedios). Sin estas, un
+# render acústico dentro del repo se colaba en un `git add -A`.
+*.mp3
+*.aac
+*.m4a
+*.mka
+*.opus
+*.wav
+*.flac
 *.tmp
 *.log
 
 # Sondas y artefactos de medición locales (modelos derivados, capturas,
-# scripts de benchmark). No son parte del programa ni del bundle.
-tmp-perf/
+# scripts de benchmark). No son parte del programa ni del bundle. El patrón
+# es tmp-*/ a propósito: estas carpetas se crean y se borran solas con cada
+# medición, y no queremos que una de ellas acabe en un `git add -A`.
+tmp-*/
+
+# Pesos de modelo. Los modelos se descargan a bin/models en el primer
+# arranque; un .onnx/.pth suelto en el repo pesa cientos de MB y no es
+# código: son datos del usuario y descargas de terceros.
+*.onnx
+*.pth
+*.pt
+*.safetensors
+*.ckpt
+
+# Restos que no usa ninguna parte del build. El .spec empaqueta la carpeta
+# assets/ entera, asi que si vuelven a entrar aqui viajaran dentro de cada
+# instalador: el redist de MSVC (25 MB) no lo carga nadie — la app indica la
+# URL oficial de Microsoft — y items.yml es un catalogo de otro proyecto.
+assets/VC_redist.x64.exe
+assets/items.yml
 
 # PyInstaller
 build/

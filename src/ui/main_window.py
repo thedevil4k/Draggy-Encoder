@@ -698,6 +698,60 @@ class RedetectWorker(QThread):
             self.error.emit(str(exc))
 
 
+class QueueRun:
+    """Dueño del estado de una pasada de cola: activa, hechos y total.
+
+    Antes eran tres atributos sueltos (``_queue_active``, ``_queue_done``,
+    ``_queue_total``) que NADIE inicializaba: por eso sus treinta y pico
+    lecturas iban cada una envuelta en un ``getattr`` con un valor de
+    regalía, y como los escribía gente distinta desde sitios distintos,
+    cada uno podía moverse sin los otros dos.
+
+    Aquí los tres campos nacen siempre, y cambiar cualquiera pasa por un
+    método que además deja el total en un estado coherente con lo hecho
+    (``retarget`` nunca deja que el total baje por debajo de ``done``: si no,
+    la barra acaba diciendo "3/2 done").
+
+    ``TasksPanel`` no lleva copia de esto: MainWindow le pasa ESTE objeto
+    (``TasksPanel.set_queue_pass``) y el panel le pregunta ``.active``.
+    """
+
+    def __init__(self, active: bool = False, done: int = 0, total: int = 0):
+        self.active = bool(active)
+        self.done = max(0, int(done))
+        self.total = max(0, int(total))
+
+    def start(self, total: int) -> None:
+        """Arranca una pasada de ``total`` renders, contando desde cero."""
+        self.active = True
+        self.done = 0
+        self.total = max(0, int(total))
+
+    def stop(self) -> None:
+        """La pasada se ha agotado; el contador se queda para el resumen."""
+        self.active = False
+
+    def count_done(self) -> int:
+        """Un render más terminado. Devuelve el total de hechos."""
+        self.done += 1
+        return self.done
+
+    def retarget(self, pending: int, running: int = 0) -> int:
+        """Reajusta el total al cancelar jobs que quedan en espera.
+
+        El total no puede bajar de ``done``: los ya terminados cuentan igual,
+        y sin ese suelo la barra acaba diciendo "3/2 done".
+        """
+        self.total = max(
+            self.done + max(0, int(pending)) + max(0, int(running)), self.done
+        )
+        return self.total
+
+    def settle_to_work_left(self, running: int) -> None:
+        """Tras vaciar la cola a mitad, solo queda el render en marcha."""
+        self.total = self.done + max(0, int(running))
+
+
 class MainWindow(QMainWindow):
     def __init__(self, ffmpeg_path, hardware_info, compatible_codecs, parent=None):
         super().__init__(parent)
@@ -712,6 +766,10 @@ class MainWindow(QMainWindow):
         self.worker = None
         self.preview_worker = None
         self._preview_task_id = None
+        # El estado de una pasada de cola (activa / hechos / total) tiene UN
+        # dueño, y nace aqui con el resto del estado y no dentro de
+        # ``_setup_ui``: se lee desde metodos a los que la UI no llega.
+        self._queue_run = QueueRun()
         # Carpeta de output inicial: prefiere ``last_output_dir`` si la
         # preferencia ``auto_open_last_output`` está activa y la carpeta
         # sigue existiendo; cae al Desktop si falta o falla.
@@ -832,10 +890,9 @@ class MainWindow(QMainWindow):
         if self._tray is not None:
             self._tray.start()
             self._tray.set_task(getattr(self, "_current_task_name", ""))
-            if getattr(self, "_queue_active", False):
+            if self._queue_run.active:
                 self._tray.set_queue(
-                    getattr(self, "_queue_done", 0),
-                    getattr(self, "_queue_total", 0),
+                    self._queue_run.done, self._queue_run.total
                 )
 
     def _tray_sampling_stop(self):
@@ -1104,7 +1161,10 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.progress)
 
         # --- Tasks panel (right side, collapsible) ---
+        # El panel recibe una REFERENCIA al dueño de la pasada en vez de
+        # abrirse su propio booleano "en marcha".
         self.tasks_panel = TasksPanel()
+        self.tasks_panel.set_queue_pass(self._queue_run)
         self.tasks_panel.btn_clear.clicked.connect(self._on_clear_task_history)
         self.tasks_panel.btn_start_queue.clicked.connect(self._start_queue)
         self.tasks_panel.btn_clear_queue.clicked.connect(self._on_clear_queue)
@@ -2815,7 +2875,7 @@ class MainWindow(QMainWindow):
             # que un cierre se escriba entero y sin fundirse, lo decide el
             # modulo. La ventana solo dice si hay una cola en marcha.
             phase_writer.note_render_event(
-                task_id, ev, getattr(self, "_queue_active", False))
+                task_id, ev, self._queue_run.active)
         except Exception:
             pass
 
@@ -2993,7 +3053,7 @@ class MainWindow(QMainWindow):
         # No había worker detrás (fila obsoleta): la cola no puede quedarse
         # esperando a un render que ya no existe, así que se cierra la cuenta.
         self.tasks_panel.append_log(f"Render cancelled: {name} (nothing was running)")
-        if getattr(self, "_queue_active", False):
+        if self._queue_run.active:
             self._advance_queue_after_worker("aborted", "Cancelled by user")
 
     def _retarget_queue_total(self):
@@ -3002,7 +3062,7 @@ class MainWindow(QMainWindow):
         Sin esto la barra queda en "1/4 done" para siempre: el job cancelado
         ya no lo va a ejecutar nadie, así que deja de contar.
         """
-        if not getattr(self, "_queue_active", False):
+        if not self._queue_run.active:
             return
         try:
             import src.task_queue as task_queue
@@ -3012,13 +3072,13 @@ class MainWindow(QMainWindow):
             )
         except Exception:
             return
-        done = getattr(self, "_queue_done", 0)
+        done = self._queue_run.done
         worker = getattr(self, "worker", None)
         running = 1 if worker is not None and worker.isRunning() else 0
-        self._queue_total = max(done + pending + running, done)
-        self.tasks_panel.set_queue_progress(done, self._queue_total)
+        self._queue_run.retarget(pending, running)
+        self.tasks_panel.set_queue_progress(done, self._queue_run.total)
         if self._tray is not None:
-            self._tray.set_queue(done, self._queue_total)
+            self._tray.set_queue(done, self._queue_run.total)
 
     def _on_remove_finished(self):
         """"Remove finished": fuera las filas done/failed/aborted de un golpe.
@@ -3141,14 +3201,21 @@ class MainWindow(QMainWindow):
         # ese es el único trabajo que queda por cerrar.
         worker = getattr(self, "worker", None)
         running = worker is not None and worker.isRunning()
-        self._queue_done = getattr(self, "_queue_done", 0)
-        self._queue_total = self._queue_done + (1 if running else 0)
+        self._queue_run.settle_to_work_left(1 if running else 0)
         self.tasks_panel.clear_queue_rows()
+        # La pasada sigue viva (el render parado tiene que cerrar su item),
+        # asi que la etiqueta NO cae sola al texto de cola vacia: hay que
+        # decirle la cuenta nueva. Sin esto se queda el "Queue running: 0/2
+        # done" de antes y la barra promete los dos jobs que el usuario acaba
+        # de borrar.
+        self.tasks_panel.set_queue_progress(
+            self._queue_run.done, self._queue_run.total
+        )
         self._on_status_message("Queue cleared.")
 
     def _start_queue(self):
         """Arranca la cola: ejecuta los items "queued" en secuencia."""
-        if getattr(self, "_queue_active", False):
+        if self._queue_run.active:
             return
         try:
             import src.task_queue as task_queue
@@ -3157,24 +3224,23 @@ class MainWindow(QMainWindow):
                 return
             # Total de jobs que va a ejecutar ESTA pasada (solo los "queued";
             # los ya terminados/failed no se vuelven a tocar).
-            self._queue_total = sum(
+            pending = sum(
                 1 for it in task_queue.list_items()
                 if it.get("status") == "queued"
             )
         except Exception:
             self._on_status_message("Could not read the queue.")
             return
-        self._queue_done = 0
-        self._queue_active = True
-        self.tasks_panel.set_queue_running(True, total=self._queue_total)
+        self._queue_run.start(pending)
+        self.tasks_panel.set_queue_running(True, total=self._queue_run.total)
         self._on_status_message(
-            f"Queue started: {self._queue_total} render(s) pending."
+            f"Queue started: {self._queue_run.total} render(s) pending."
         )
         self._start_next_queue_item()
 
     def _start_next_queue_item(self):
         """Ejecuta el siguiente item "queued"; al agotarse resume la UI."""
-        if not getattr(self, "_queue_active", False):
+        if not self._queue_run.active:
             return
         try:
             import src.task_queue as task_queue
@@ -3182,9 +3248,9 @@ class MainWindow(QMainWindow):
         except Exception:
             item = None
         if item is None:
-            self._queue_active = False
-            total = getattr(self, "_queue_total", 0)
-            done = getattr(self, "_queue_done", 0)
+            self._queue_run.stop()
+            total = self._queue_run.total
+            done = self._queue_run.done
             self.tasks_panel.set_queue_progress(done, total)
             self.tasks_panel.set_queue_running(False)
             self._on_status_message(
@@ -3197,8 +3263,8 @@ class MainWindow(QMainWindow):
         task_queue.set_status(queue_id, "running")
         self.tasks_panel.set_queue_status(queue_id, "running")
 
-        done = getattr(self, "_queue_done", 0)
-        total = getattr(self, "_queue_total", 0)
+        done = self._queue_run.done
+        total = self._queue_run.total
         self._on_status_message(
             f"Queue [{done + 1}/{total}]: {item.get('name') or queue_id} — running..."
         )
@@ -3212,9 +3278,9 @@ class MainWindow(QMainWindow):
             self.tasks_panel.append_log(
                 f"Queue item failed (missing input): {item.get('name')}"
             )
-            self._queue_done = done + 1
+            self._queue_run.count_done()
             self.tasks_panel.set_queue_progress(
-                self._queue_done, getattr(self, "_queue_total", 0)
+                self._queue_run.done, self._queue_run.total
             )
             self._start_next_queue_item()
             return
@@ -3251,9 +3317,9 @@ class MainWindow(QMainWindow):
                 f"Queue item {status}: {name}"
                 + (f" ({error})" if error else "")
             )
-            self._queue_done = getattr(self, "_queue_done", 0) + 1
+            self._queue_run.count_done()
             self.tasks_panel.set_queue_progress(
-                self._queue_done, getattr(self, "_queue_total", 0)
+                self._queue_run.done, self._queue_run.total
             )
         self._start_next_queue_item()
 
@@ -3278,7 +3344,7 @@ class MainWindow(QMainWindow):
         ):
             self._mark_task_finished("aborted")
             self._cleanup_after_abort()
-            if getattr(self, "_queue_active", False):
+            if self._queue_run.active:
                 self._advance_queue_after_worker("aborted", "Aborted by user")
             return
 
@@ -3366,7 +3432,7 @@ class MainWindow(QMainWindow):
         # ---------------- Standard worker-finished -----------------
         # Publishing is a distinct state: only enter it after all render
         # phases passed and before the atomic rename.
-        if worker.success and getattr(self, "_queue_active", False):
+        if worker.success and self._queue_run.active:
             try:
                 import src.task_queue as task_queue
                 task_queue.set_status(worker.task_id, "publishing")
@@ -3394,7 +3460,7 @@ class MainWindow(QMainWindow):
         mode = getattr(worker, "mode", "compress")
         self._mark_task_finished("success" if worker.success else "failed")
 
-        if getattr(self, "_queue_active", False):
+        if self._queue_run.active:
             # Modo cola: sin diálogos modales por item; marcamos y
             # seguimos con el siguiente render programado.
             self._advance_queue_after_worker(

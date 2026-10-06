@@ -5140,6 +5140,13 @@ def test_tasks_panel_queue_tab_smoke(qapp):
     panel.tabs.setCurrentIndex(2)  # pestaña Queue
     from PySide6.QtWidgets import QApplication
     QApplication.processEvents()
+    # El "¿hay pasada?" lo tiene su dueño, no el panel: aqui se cablea igual
+    # que lo hace MainWindow al construirlo, y el boton se apaga porque el
+    # dueño dice que si, no porque se le avise aparte.
+    from src.ui.main_window import QueueRun
+    run = QueueRun()
+    panel.set_queue_pass(run)
+    run.start(2)
     panel.set_queue_running(True, total=2)
     assert panel.btn_start_queue.isEnabled() is False
     assert panel._queue_progress_bar.isVisible()
@@ -5148,6 +5155,7 @@ def test_tasks_panel_queue_tab_smoke(qapp):
     assert panel._queue_progress_label.text() == "Queue: 1/2 done"
     panel.set_queue_progress(2, 2)
     assert panel._queue_progress_label.text() == "Queue finished"
+    run.stop()
     panel.set_queue_running(False)
     assert panel.btn_start_queue.isEnabled() is True
 
@@ -5247,7 +5255,7 @@ def test_cancel_pending_queue_item_drops_row_and_retargets_total(
 ):
     """Cancelar un job EN ESPERA lo saca de la lista y baja el total."""
     import src.task_queue as tq
-    from src.ui.main_window import MainWindow
+    from src.ui.main_window import MainWindow, QueueRun
     from src.ui.tasks_panel import TasksPanel
 
     monkeypatch.setattr(tq, "_path", lambda: str(tmp_path / "queue.json"))
@@ -5261,9 +5269,8 @@ def test_cancel_pending_queue_item_drops_row_and_retargets_total(
 
     mw = MainWindow.__new__(MainWindow)
     mw.tasks_panel = panel
-    mw._queue_active = True
-    mw._queue_done = 0
-    mw._queue_total = 2
+    mw._queue_run = QueueRun(active=True, total=2)
+    panel.set_queue_pass(mw._queue_run)
     mw.worker = None
     mw._tray = None
     messages = []
@@ -5277,7 +5284,7 @@ def test_cancel_pending_queue_item_drops_row_and_retargets_total(
     assert any("cancelled" in m for m in messages)
     # El total baja con el job cancelado: la barra no puede seguir
     # prometeniendo un render que el usuario ya no quiere.
-    assert mw._queue_total == 1
+    assert mw._queue_run.total == 1
     assert panel._queue_progress_label.text() == "Queue: 0/1 done"
 
 
@@ -5287,7 +5294,7 @@ def test_cancel_running_queue_item_aborts_worker_after_confirm(
     """Cancelar el job EN MARCHA para el render, previa confirmación."""
     from PySide6.QtWidgets import QMessageBox
     import src.task_queue as tq
-    from src.ui.main_window import MainWindow
+    from src.ui.main_window import MainWindow, QueueRun
     from src.ui.tasks_panel import TasksPanel
 
     monkeypatch.setattr(tq, "_path", lambda: str(tmp_path / "queue.json"))
@@ -5300,9 +5307,8 @@ def test_cancel_running_queue_item_aborts_worker_after_confirm(
 
     mw = MainWindow.__new__(MainWindow)
     mw.tasks_panel = panel
-    mw._queue_active = True
-    mw._queue_done = 0
-    mw._queue_total = 1
+    mw._queue_run = QueueRun(active=True, total=1)
+    panel.set_queue_pass(mw._queue_run)
     aborted = []
     mw._abort_running_worker = lambda cleanup_partial_output: (
         aborted.append(cleanup_partial_output) or True
@@ -5344,7 +5350,7 @@ def test_clear_queue_stops_the_running_render_first(qapp, tmp_path, monkeypatch)
     descuadra."""
     from PySide6.QtWidgets import QMessageBox
     import src.task_queue as tq
-    from src.ui.main_window import MainWindow
+    from src.ui.main_window import MainWindow, QueueRun
     from src.ui.tasks_panel import TasksPanel
 
     monkeypatch.setattr(tq, "_path", lambda: str(tmp_path / "queue.json"))
@@ -5363,9 +5369,8 @@ def test_clear_queue_stops_the_running_render_first(qapp, tmp_path, monkeypatch)
 
     mw = MainWindow.__new__(MainWindow)
     mw.tasks_panel = panel
-    mw._queue_active = True
-    mw._queue_done = 0
-    mw._queue_total = 2
+    mw._queue_run = QueueRun(active=True, total=2)
+    panel.set_queue_pass(mw._queue_run)
     mw.worker = _Worker()
     stopped = []
     mw._abort_running_worker = lambda cleanup_partial_output: (
@@ -5384,8 +5389,11 @@ def test_clear_queue_stops_the_running_render_first(qapp, tmp_path, monkeypatch)
     assert tq.list_items() == []     # archivo limpio
     assert panel._queue_rows == {}
     # Solo queda cerrar el render parado: ni 2/2 ni una barra prometerlo.
-    assert mw._queue_total == 1
-    assert panel._queue_progress_label.text() == "No queued jobs"
+    # El panel ahora sabe que hay pasada en marcha (se lo pregunta al
+    # dueño, no lleva su propio booleano), asi que no cae al texto de cola
+    # vacia: lo que se le dice es la cuenta real que queda por cerrar.
+    assert mw._queue_run.total == 1
+    assert panel._queue_progress_label.text() == "Queue: 0/1 done"
 
 
 # ---------------------------------------------------------------------------
@@ -5464,7 +5472,7 @@ def test_purge_finished_only_drops_terminal(tmp_path, monkeypatch):
 def test_remove_finished_keeps_pending_and_running(qapp, tmp_path, monkeypatch):
     """"Remove finished" despeja la tanda sin tocar lo que sigue vivo."""
     import src.task_queue as tq
-    from src.ui.main_window import MainWindow
+    from src.ui.main_window import MainWindow, QueueRun
     from src.ui.tasks_panel import TasksPanel
 
     monkeypatch.setattr(tq, "_path", lambda: str(tmp_path / "queue.json"))
@@ -5488,9 +5496,8 @@ def test_remove_finished_keeps_pending_and_running(qapp, tmp_path, monkeypatch):
 
     mw = MainWindow.__new__(MainWindow)
     mw.tasks_panel = panel
-    mw._queue_active = False
-    mw._queue_done = 0
-    mw._queue_total = 0
+    mw._queue_run = QueueRun()
+    panel.set_queue_pass(mw._queue_run)
     mw.worker = None
     mw._tray = None
     messages = []
@@ -5509,13 +5516,191 @@ def test_remove_finished_keeps_pending_and_running(qapp, tmp_path, monkeypatch):
     assert len(tq.list_items()) == 2
 
 
+def _queue_context_actions(panel, queue_id):
+    """``(accion, etiqueta, activada)`` del menú de esa fila, sin separadores."""
+    menu = panel._build_queue_context_menu(queue_id)
+    return [
+        (action, action.text(), action.isEnabled())
+        for action in menu.actions()
+        if not action.isSeparator()
+    ]
+
+
+def test_right_click_on_a_queue_row_opens_that_row_menu(qapp, tmp_path,
+                                                        monkeypatch):
+    """Clic derecho -> la fila pide su menu -> el panel lo monta y lo abre."""
+    from PySide6.QtCore import QPoint, Qt
+    from PySide6.QtGui import QContextMenuEvent
+    import src.task_queue as tq
+    from src.ui.tasks_panel import TasksPanel
+
+    monkeypatch.setattr(tq, "_path", lambda: str(tmp_path / "queue.json"))
+    qid = tq.enqueue(name="movie.mp4", input_path="/in/movie.mp4",
+                     output_path="/out/movie.mp4", settings={})
+
+    abiertos = []
+
+    def fake_show(self, queue_id, pos):
+        abiertos.append((queue_id, pos))
+
+    monkeypatch.setattr(TasksPanel, "_show_queue_context_menu", fake_show)
+
+    panel = TasksPanel()
+    panel.rebuild_queue(tq.list_items())
+    row = panel._queue_rows[qid]
+    assert row.contextMenuPolicy() == Qt.ContextMenuPolicy.CustomContextMenu
+
+    row.context_menu_requested.emit(qid, QPoint(120, 240))
+    assert abiertos == [(qid, QPoint(120, 240))]
+
+    # El evento real de Qt: la fila pide el foco (para que el Delete que vaya
+    # después tire de ESTA fila) y pide el menu en coordenadas de pantalla.
+    # Se mira que se pida, no que quede con foco: eso depende de que la
+    # ventana esté activa, y offscreen nunca la activa.
+    pedido_foco = []
+    monkeypatch.setattr(row, "setFocus", lambda *a: pedido_foco.append(True))
+    row.contextMenuEvent(QContextMenuEvent(
+        QContextMenuEvent.Reason.Mouse, QPoint(5, 5), QPoint(120, 240),
+    ))
+    assert pedido_foco == [True]
+    assert abiertos[-1] == (qid, QPoint(120, 240))
+
+
+def test_queue_context_menu_verb_follows_the_row_status(qapp, tmp_path,
+                                                        monkeypatch):
+    """El menú no dice siempre "cancelar": dice lo que va a hacer de verdad."""
+    import src.task_queue as tq
+    from src.ui.tasks_panel import TasksPanel
+
+    monkeypatch.setattr(tq, "_path", lambda: str(tmp_path / "queue.json"))
+    qid = tq.enqueue(name="movie.mp4", input_path="/in/movie.mp4",
+                     output_path="/out/movie.mp4", settings={})
+
+    panel = TasksPanel()
+    asked = []
+    panel.cancel_requested.connect(asked.append)
+    panel.rebuild_queue(tq.list_items())
+
+    def primera_etiqueta():
+        return _queue_context_actions(panel, qid)[0][1]
+
+    assert primera_etiqueta() == "Cancel job"        # esperando: sale de la cola
+    panel.set_queue_status(qid, "running")
+    assert primera_etiqueta() == "Stop render"       # en marcha: para ffmpeg
+    panel.set_queue_status(qid, "done")
+    assert primera_etiqueta() == "Remove from list"  # terminado: solo ocupa
+
+    # Las tres son el mismo gesto que el aspa: una sola signal, no dos caminos
+    # que puedan dejar de parecerse.
+    for _ in range(3):
+        panel._build_queue_context_menu(qid).actions()[0].trigger()
+    assert asked == [qid, qid, qid]
+
+
+def test_queue_context_menu_opens_output_folder_and_copies_path(qapp, tmp_path,
+                                                                monkeypatch):
+    """Las dos acciones de rutas van a lo que dicen, y al item de esa fila."""
+    from PySide6.QtWidgets import QApplication
+    import src.task_queue as tq
+    import src.ui.tasks_panel as tp
+    from src.ui.tasks_panel import TasksPanel
+
+    monkeypatch.setattr(tq, "_path", lambda: str(tmp_path / "queue.json"))
+    salida = tmp_path / "renders"
+    entrada = tmp_path / "origen"
+    qid = tq.enqueue(name="movie.mp4", input_path=str(entrada / "movie.mp4"),
+                     output_path=str(salida / "movie.mp4"), settings={})
+
+    abiertas = []
+    monkeypatch.setattr(tp, "open_folder",
+                        lambda path, *a, **k: abiertas.append(path))
+
+    panel = TasksPanel()
+    panel.rebuild_queue(tq.list_items())
+    acciones = _queue_context_actions(panel, qid)
+
+    assert [label for _a, label, _on in acciones] == [
+        "Cancel job", "Open output folder", "Copy path",
+    ]
+    assert all(activada for _a, _label, activada in acciones)
+
+    acciones[1][0].trigger()
+    assert abiertas == [str(salida)]     # la carpeta de SALIDA, no la de origen
+
+    acciones[2][0].trigger()
+    assert QApplication.clipboard().text() == str(salida / "movie.mp4")
+
+
+def test_queue_context_menu_path_actions_are_disabled_without_paths(qapp):
+    """Sin rutas no hay nada que abrir ni que copiar: se apagan, no rompen."""
+    from src.ui.tasks_panel import TasksPanel
+
+    panel = TasksPanel()
+    panel._queue_row("sin-rutas", "orphan.mp4").set_details({"name": "orphan.mp4"})
+
+    assert [
+        (label, activada)
+        for _a, label, activada in _queue_context_actions(panel, "sin-rutas")
+    ] == [
+        ("Cancel job", True),          # siempre se puede quitar la fila
+        ("Open output folder", False),  # no hay de dónde abrir nada
+        ("Copy input path", False),
+    ]
+
+
+def test_queue_run_owns_the_pass_state_and_the_panel_only_asks(qapp):
+    """Un solo dueño: el panel no guarda copia, se lo pregunta."""
+    from src.ui.main_window import QueueRun
+    from src.ui.tasks_panel import TasksPanel
+
+    # Los tres campos NACEN, sin valor de regalía que envolver en un getattr.
+    run = QueueRun()
+    assert (run.active, run.done, run.total) == (False, 0, 0)
+
+    run.start(3)
+    assert (run.active, run.done, run.total) == (True, 0, 3)
+    assert run.count_done() == 1
+    assert run.count_done() == 2
+    assert (run.done, run.total) == (2, 3)
+
+    run.stop()
+    assert run.active is False
+    assert (run.done, run.total) == (2, 3)   # el resumen necesita la cuenta
+
+    # El total nunca baja de lo hecho: si bajara, la barra dice "3/2 done".
+    run.retarget(0, 0)
+    assert run.total == 2
+    run.retarget(4, 1)
+    assert run.total == 7
+
+    # Cola vaciada a mitad: solo queda el render parado por cerrar.
+    run.settle_to_work_left(1)
+    assert run.total == 3
+
+    # El panel no tiene el atributo: si lo tuviera, dos copias que alguien
+    # tendria que acordarse de mantener al dia.
+    panel = TasksPanel()
+    assert not hasattr(panel, "_queue_running")
+    panel.set_queue_pass(run)
+    panel._queue_row("q", "job.mp4")
+    panel._sync_queue_state()
+    assert panel.btn_start_queue.isEnabled() is True
+
+    run.start(1)
+    panel._sync_queue_buttons()            # lo que hace ``set_queue_running``
+    assert panel.btn_start_queue.isEnabled() is False
+    run.stop()
+    panel._sync_queue_buttons()
+    assert panel.btn_start_queue.isEnabled() is True
+
+
 def test_task_card_remove_button_stops_running_render_after_confirm(
     qapp, tmp_path, monkeypatch
 ):
     """El boton de una ficha EN MARCHA para el render, previa confirmacion."""
     from PySide6.QtWidgets import QMessageBox
     import src.task_queue as tq
-    from src.ui.main_window import MainWindow
+    from src.ui.main_window import MainWindow, QueueRun
     from src.ui.tasks_panel import TasksPanel
 
     monkeypatch.setattr(tq, "_path", lambda: str(tmp_path / "queue.json"))
@@ -5536,7 +5721,8 @@ def test_task_card_remove_button_stops_running_render_after_confirm(
 
     mw = MainWindow.__new__(MainWindow)
     mw.tasks_panel = panel
-    mw._queue_active = False
+    mw._queue_run = QueueRun()
+    panel.set_queue_pass(mw._queue_run)
     mw.worker = _Worker()
     # __new__ no pasa por _setup_ui: la conexion la hace la app al arrancar.
     panel.cancel_task_requested.connect(mw._on_cancel_task)
@@ -5575,7 +5761,7 @@ def test_task_card_remove_button_drops_finished_history_entry(
     """Terminada la ficha, su boton quita la entrada del historico."""
     from PySide6.QtWidgets import QMessageBox
     import src.task_history as th
-    from src.ui.main_window import MainWindow
+    from src.ui.main_window import MainWindow, QueueRun
     from src.ui.tasks_panel import TasksPanel
 
     monkeypatch.setattr(th, "_path", lambda: str(tmp_path / "history.json"))
@@ -5646,7 +5832,7 @@ def test_task_card_cancel_marks_a_non_queue_render_aborted(qapp, tmp_path,
     """
     from PySide6.QtWidgets import QMessageBox
     import src.task_history as th
-    from src.ui.main_window import MainWindow
+    from src.ui.main_window import MainWindow, QueueRun
     from src.ui.tasks_panel import TasksPanel
 
     monkeypatch.setattr(th, "_path", lambda: str(tmp_path / "history.json"))
@@ -5663,7 +5849,8 @@ def test_task_card_cancel_marks_a_non_queue_render_aborted(qapp, tmp_path,
 
     mw = MainWindow.__new__(MainWindow)
     mw.tasks_panel = panel
-    mw._queue_active = False
+    mw._queue_run = QueueRun()
+    panel.set_queue_pass(mw._queue_run)
     mw.worker = _Worker()
     panel.cancel_task_requested.connect(mw._on_cancel_task)
     stopped = []

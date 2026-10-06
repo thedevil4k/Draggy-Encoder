@@ -20,13 +20,16 @@ import os
 from datetime import datetime
 
 from src.task_queue import TERMINAL_STATUS
+from src.ui.dialog_utils import open_folder
 
-from PySide6.QtCore import QSize, Qt, Signal
+from PySide6.QtCore import QPoint, QSize, Qt, Signal
 from PySide6.QtGui import QColor, QPainter, QTextCursor
 from PySide6.QtWidgets import (
+    QApplication,
     QFrame,
     QHBoxLayout,
     QLabel,
+    QMenu,
     QPlainTextEdit,
     QProgressBar,
     QPushButton,
@@ -48,6 +51,18 @@ _REMOVE_BTN_QSS = (
     "border: 1px solid #46597f; border-radius: 4px; font-size: 14px; }"
     "QPushButton:hover { color: #ffffff; background: #3a1d24; "
     "border: 1px solid #e74c3c; }"
+)
+
+# El menú contextual sale con los colores del sistema, que en una app oscura
+# son un rectángulo blanco disruptive. Estas reglas lo vuelven del tema sin
+# tocar ningún otro popup.
+_CONTEXT_MENU_QSS = (
+    "QMenu { background-color: #1f2c4c; color: #e8e8f0; "
+    "border: 1px solid #243049; padding: 4px; }"
+    "QMenu::item { padding: 5px 24px; border-radius: 4px; }"
+    "QMenu::item:selected { background-color: #00d2d3; color: #0f0f1a; }"
+    "QMenu::item:disabled { color: #5c6781; }"
+    "QMenu::separator { height: 1px; background: #2c3e50; margin: 4px 8px; }"
 )
 
 # Estado de fase -> (color del pill, texto corto)
@@ -458,7 +473,9 @@ class TasksPanel(QWidget):
         self._order: list[str] = []   # task ids (newest first)
         self._cards: dict[str, TaskCard] = {}
         self._queue_rows: dict[str, QueueRow] = {}
-        self._queue_running = False
+        # El estado de la pasada NO es de aqui: se guarda QUIEN lo tiene
+        # (MainWindow) y se le pregunta. Ver ``set_queue_pass``.
+        self._queue_pass = None
 
     # --- API del Log -------------------------------------------------
 
@@ -558,7 +575,7 @@ class TasksPanel(QWidget):
         # El total lo necesita la barra de la pasada; el contador de la
         # etiqueta, el aviso de vacio y los botones los pone el unico sitio
         # que sabe derivarlos de las filas.
-        self.set_queue_running(self._queue_running, total=count)
+        self.set_queue_running(self._queue_pass_active, total=count)
         self._sync_queue_state()
 
     def _queue_row(self, queue_id: str, name: str, item: dict = None) -> QueueRow:
@@ -572,6 +589,9 @@ class TasksPanel(QWidget):
         row = QueueRow(queue_id, name)
         # signal-a-signal: el aspa y el Delete de la fila avisan igual.
         row.remove_requested.connect(self.cancel_requested.emit)
+        # El clic derecho lo monta el panel: es quien sabe qué rutas tiene el
+        # item y qué significa "cancelar" según el estado en el que esté.
+        row.context_menu_requested.connect(self._show_queue_context_menu)
         if item is not None:
             row.set_details(item)
         # Auto-expand del primer item en marcha para que se vea sin click.
@@ -580,6 +600,74 @@ class TasksPanel(QWidget):
         self._queue_rows[queue_id] = row
         self._queue_layout.insertWidget(self._queue_layout.count() - 1, row)
         return row
+
+    def _show_queue_context_menu(self, queue_id: str, pos: QPoint):
+        """Clic derecho en una fila: monta su menú y lo abre en ``pos``.
+
+        ``exec`` bloquea hasta que se elige, así que la construcción vive
+        aparte en ``_build_queue_context_menu``: así se puede comprobar qué
+        hace cada acción sin abrir una ventana de verdad.
+        """
+        menu = self._build_queue_context_menu(queue_id)
+        try:
+            menu.exec(pos)
+        finally:
+            # El menú es hijo del panel: sin esto se acumula uno por clic.
+            menu.deleteLater()
+
+    def _build_queue_context_menu(self, queue_id: str) -> QMenu:
+        """Las tres acciones del clic derecho de UNA fila, ya montadas.
+
+        Las de rutas se apagan cuando el item no las tiene (un job todavía
+        sin salida, una fila sin snapshot) en lugar de dejar una opción que
+        al pulsarla no hace nada: un menú con acciones muertas enseña menos
+        que un menú con menos acciones.
+        """
+        row = self._queue_rows.get(queue_id)
+        status = row.status_name if row is not None else "queued"
+        output_path = row.output_path if row is not None else ""
+        input_path = row.input_path if row is not None else ""
+
+        menu = QMenu(self)
+        menu.setStyleSheet(_CONTEXT_MENU_QSS)
+
+        # La primera acción es el aspa de la fila, con el mismo verbo que
+        # pone ahí: parar un render, sacar uno de la cola o quitar uno ya
+        # terminado. Va por la MISMA signal que el botón.
+        cancelar = menu.addAction(remove_menu_label(status))
+        cancelar.setToolTip(remove_tooltip(status))
+        cancelar.triggered.connect(
+            lambda _checked=False, qid=queue_id: self.cancel_requested.emit(qid)
+        )
+        menu.addSeparator()
+
+        # "Carpeta de salida" es la de donde va a salir el archivo. Si el item
+        # aún no tiene salida (job en espera) la de origen es lo único que
+        # hay, y se lo dice al usuario en vez de dejar la acción apagada.
+        carpeta = os.path.dirname(output_path) if output_path else ""
+        etiqueta = "Open output folder"
+        if not carpeta and input_path:
+            carpeta = os.path.dirname(input_path)
+            etiqueta = "Open input folder"
+        abrir = menu.addAction(etiqueta)
+        abrir.setEnabled(bool(carpeta))
+        abrir.triggered.connect(
+            lambda _checked=False, target=carpeta: open_folder(
+                target, self, "Open folder", "Could not open the folder"
+            )
+        )
+
+        # Copiar ruta: la de salida si la hay —es la que el usuario quiere
+        # pegar en otro sitio—, y si no la de entrada.
+        ruta = output_path or input_path
+        copiar = menu.addAction(
+            "Copy path" if output_path else "Copy input path"
+        )
+        copiar.setEnabled(bool(ruta))
+        copiar.triggered.connect(
+            lambda _checked=False, text=ruta: QApplication.clipboard().setText(text)
+        )
+        return menu
 
     def set_queue_status(self, queue_id: str, status: str):
         row = self._queue_rows.get(queue_id)
@@ -653,7 +741,7 @@ class TasksPanel(QWidget):
         texto de la cola quieta solo se retoca cuando no hay pasada en curso.
         """
         self._queue_empty.setVisible(not self._queue_rows)
-        if not self._queue_running:
+        if not self._queue_pass_active:
             queued = sum(
                 1 for row in self._queue_rows.values()
                 if row.status_name == "queued"
@@ -671,7 +759,7 @@ class TasksPanel(QWidget):
         que en ese momento ya no le pertenece.
         """
         self.btn_start_queue.setEnabled(
-            not self._queue_running and bool(self._queue_rows)
+            not self._queue_pass_active and bool(self._queue_rows)
         )
         self.btn_remove_finished.setEnabled(
             any(
@@ -710,9 +798,27 @@ class TasksPanel(QWidget):
             self._remove_queue_row(queue_id)
         self._sync_queue_state()
 
+    def set_queue_pass(self, pass_owner) -> None:
+        """Quién tiene el estado de la pasada (MainWindow). Puede ser ``None``.
+
+        Antes el panel guardaba su propio ``_queue_running``: una segunda
+        copia del mismo booleano, que se desincronizaba en cuanto un sitio
+        se olvidaba de actualizarla. Ahora solo guarda la referencia y
+        pregunta; el dueño vive en un solo sitio.
+        """
+        self._queue_pass = pass_owner
+
+    @property
+    def _queue_pass_active(self) -> bool:
+        """¿Hay una pasada en marcha? Lo pregunta a quien la posee."""
+        return bool(getattr(self._queue_pass, "active", False))
+
     def set_queue_running(self, running: bool, total: int = 0):
-        """La pasada en marcha: su barra y su contador, no los de las filas."""
-        self._queue_running = running
+        """La pasada en marcha: su barra y su contador, no los de las filas.
+
+        No guarda nada: quien enciende y apaga la pasada es su dueño, y esto
+        solo pinta cómo se ve.
+        """
         if running:
             self._queue_progress_bar.setRange(0, max(int(total), 1))
             self._queue_progress_bar.setValue(0)
@@ -738,6 +844,25 @@ class TasksPanel(QWidget):
 # ---------------------------------------------------------------------------
 # Queue: renders programados por el usuario (cola de trabajo)
 # ---------------------------------------------------------------------------
+
+
+def remove_tooltip(status: str) -> str:
+    """Lo que el aspa va a hacer de verdad, como frase (boton y menu)."""
+    if str(status) in TERMINAL_STATUS:
+        return "Remove this finished job from the list"
+    if str(status) == "queued":
+        return "Cancel this job and remove it from the queue"
+    return "Stop this render now"
+
+
+def remove_menu_label(status: str) -> str:
+    """La misma idea, corta, para la linea del menu contextual."""
+    if str(status) in TERMINAL_STATUS:
+        return "Remove from list"
+    if str(status) == "queued":
+        return "Cancel job"
+    return "Stop render"
+
 
 _QUEUE_STATUS_META = {
     "queued":      ("QUEUED", "#7f8fa6"),
@@ -769,12 +894,17 @@ class QueueRow(QFrame):
     """
 
     remove_requested = Signal(str)
+    context_menu_requested = Signal(str, QPoint)
 
     def __init__(self, queue_id, name, parent=None):
         super().__init__(parent)
         self.queue_id = queue_id
         self.setObjectName("QueueRow")
         self._status = ""
+        self._item: dict = {}
+        # Clic derecho: el menu lo monta el panel (que sabe cancelar, y sabe
+        # qué rutas tiene), aqui solo se avisa de que la fila ha pedido uno.
+        self.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self._paint_row()
         # StrongFocus: un clic en la fila (las etiquetas no tienen foco) la
         # deja enfocada y a partir de ahi Delete quita ESE job.
@@ -882,7 +1012,22 @@ class QueueRow(QFrame):
 
     def set_details(self, item: dict):
         """Pinta el snapshot HTML del item. Llamar cuando cambia el item."""
+        self._item = dict(item or {})
         self._details.setText(_format_queue_item_details(item))
+
+    @property
+    def input_path(self) -> str:
+        return str(self._item.get("input_path") or "")
+
+    @property
+    def output_path(self) -> str:
+        return str(self._item.get("output_path") or "")
+
+    def contextMenuEvent(self, event):  # noqa: N802 - Qt callback name
+        """Clic derecho en la fila: la enfoca y pide su menu."""
+        self.setFocus()
+        self.context_menu_requested.emit(self.queue_id, event.globalPos())
+        event.accept()
 
     def _paint(self, status: str):
         self._status = str(status)
@@ -900,12 +1045,7 @@ class QueueRow(QFrame):
         # El botón acompaña al estado: siempre disponible (un item ya
         # terminado también se puede quitar de la lista), pero con el
         # texto que dice qué va a hacer DE VERDAD.
-        if status in TERMINAL_STATUS:
-            self.btn_remove.setToolTip("Remove this finished job from the list")
-        elif str(status) == "queued":
-            self.btn_remove.setToolTip("Cancel this job and remove it from the queue")
-        else:
-            self.btn_remove.setToolTip("Stop this render now")
+        self.btn_remove.setToolTip(remove_tooltip(status))
 
 
 def _format_queue_item_details(item: dict) -> str:
