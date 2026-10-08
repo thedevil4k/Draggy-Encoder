@@ -205,6 +205,39 @@ def test_probe_rejects_foreign_origin(monkeypatch, tmp_path):
     assert "DRAGGY-IMPORT-FOREIGN" in detail
 
 
+def test_probe_source_is_valid_python_and_reports_caps():
+    """La sonda se construye con f-strings: si se rompe, el subproceso no
+    arranca y TODA validación de runtime falla en silencio."""
+    compile(rm._IMPORT_PROBE_SOURCE, "<probe>", "exec")
+    assert "DRAGGY-CAPS=" in rm._IMPORT_PROBE_SOURCE
+
+
+def test_probe_reports_gpu_capability(monkeypatch, tmp_path):
+    monkeypatch.setattr(rm, "RUNTIME_MODULES_DIR", str(tmp_path))
+    monkeypatch.setattr(
+        rm, "get_embed_python_path", lambda: "C:/fake/embed-python/python.exe"
+    )
+
+    def fake_run(cmd, **kwargs):
+        return types.SimpleNamespace(
+            returncode=0,
+            stdout="DRAGGY-CAPS=cuda\nDRAGGY-IMPORT-OK\n",
+            stderr="",
+        )
+
+    monkeypatch.setattr(rm, "subprocess", _fake_subprocess_ns(fake_run))
+    ok, detail, caps = rm._store_probe_subprocess("torch")
+    assert ok is True
+    assert detail == ""
+    assert caps == ("cuda",)
+
+
+def test_parse_probe_caps_ignores_missing_or_empty_line():
+    assert rm._parse_probe_caps("DRAGGY-IMPORT-OK\n") == ()
+    assert rm._parse_probe_caps("DRAGGY-CAPS=\nDRAGGY-IMPORT-OK\n") == ()
+    assert rm._parse_probe_caps("DRAGGY-CAPS=cpu\nDRAGGY-IMPORT-OK\n") == ("cpu",)
+
+
 def test_probe_reports_timeout(monkeypatch, tmp_path):
     monkeypatch.setattr(rm, "RUNTIME_MODULES_DIR", str(tmp_path))
     monkeypatch.setattr(
@@ -247,19 +280,63 @@ def test_post_install_check_reports_subprocess_stderr_on_real_failure(monkeypatc
     monkeypatch.setattr(
         rm, "_import_error_detail", lambda name: "AttributeError: artefacto in-process"
     )
-    ok, detail = rm._post_install_import_check("torch")
+    # Módulo ligero: el import in-process es barato y sigue aportando
+    # contexto al diagnóstico.
+    ok, detail = rm._post_install_import_check("safetensors")
     assert ok is False
     assert "DLL load failed" in detail  # la causa real manda
     assert "Diagnóstico del proceso actual" in detail  # contexto al final
 
 
+def test_post_install_check_never_imports_heavy_runtime_in_process(monkeypatch):
+    """Regresión del 0xc0000005 del instalador de Windows.
+
+    El crash real (faulthandler.log del usuario) tenía esta pila:
+    ``_post_install_import_check -> _can_import -> import torch`` y moría
+    con violación de acceso en python313.dll. Un runtime PESADO nunca debe
+    importarse en el proceso de la GUI: ni para el veredicto ni para el
+    diagnóstico.
+    """
+    monkeypatch.setattr(rm, "_can_import", _import_forbidden)
+    monkeypatch.setattr(rm, "_import_error_detail", _import_forbidden)
+    monkeypatch.setattr(rm, "_can_probe_subprocess", lambda: True)
+    monkeypatch.setattr(
+        rm,
+        "_validate_store_import_subprocess",
+        lambda name, timeout=180.0: (False, "ImportError: DLL load failed"),
+    )
+    for module in sorted(rm._HEAVY_NATIVE_MODULES):
+        ok, detail = rm._post_install_import_check(module)
+        assert ok is False
+        assert "DLL load failed" in detail
+
+    # Y tampoco hay fallback in-process cuando no hay subproceso que sondear:
+    # sin embed-python el veredicto es "no se puede validar", no un import
+    # que se lleva el proceso por delante.
+    monkeypatch.setattr(rm, "_can_probe_subprocess", lambda: False)
+    ok, detail = rm._post_install_import_check("torch")
+    assert ok is False
+    assert "embed-python" in detail
+
+
+def test_post_install_check_heavy_ok_from_subprocess_only(monkeypatch):
+    """Con el store válido, el veredicto es 'instalado' sin tocar torch."""
+    monkeypatch.setattr(rm, "_can_import", _import_forbidden)
+    monkeypatch.setattr(rm, "_can_probe_subprocess", lambda: True)
+    monkeypatch.setattr(
+        rm, "_validate_store_import_subprocess", lambda name, timeout=180.0: (True, "")
+    )
+    assert rm._post_install_import_check("torch") == (True, "")
+
+
 def test_post_install_check_falls_back_in_process_without_probe(monkeypatch):
+    # Módulo ligero: sin sonda, el in-process sigue siendo el veredicto.
     monkeypatch.setattr(rm, "_can_import", lambda name: False)
     monkeypatch.setattr(rm, "_can_probe_subprocess", lambda: False)
     monkeypatch.setattr(
         rm, "_import_error_detail", lambda name: "ModuleNotFoundError: boom"
     )
-    ok, detail = rm._post_install_import_check("torch")
+    ok, detail = rm._post_install_import_check("safetensors")
     assert ok is False
     assert "ModuleNotFoundError" in detail
 
@@ -267,6 +344,14 @@ def test_post_install_check_falls_back_in_process_without_probe(monkeypatch):
 # ---------------------------------------------------------------------------
 # torch_status / onnx_status: guard anti re-descarga
 # ---------------------------------------------------------------------------
+
+
+def _import_forbidden(name):
+    """Doble que fija el contrato: este módulo NO se importa in-process."""
+    raise AssertionError(
+        f"import in-process de {name!r}: en el proceso congelado de la GUI "
+        "eso es una violación de acceso (0xc0000005) en python313.dll"
+    )
 
 
 def _make_pkg_dir(store: str, name: str, version: str) -> None:
@@ -344,6 +429,57 @@ def test_onnx_status_trusts_valid_store_and_skips_reinstall(monkeypatch, tmp_pat
 
     st = rm.onnx_status()
     assert st["installed"] is True
+
+
+def test_status_never_imports_heavy_runtime_in_process(monkeypatch, tmp_path):
+    """Arranque con el store ya poblado: pedir el estado NO puede importar
+    torch/onnxruntime dentro de la app (ese import es el crash)."""
+    store = str(tmp_path)
+    _make_pkg_dir(store, "torch", "2.13.0-fake")
+    _make_pkg_dir(store, "onnxruntime", "1.29.0-fake")
+    monkeypatch.setattr(rm, "RUNTIME_MODULES_DIR", store)
+    monkeypatch.setattr(rm, "_can_import", _import_forbidden)
+    monkeypatch.setattr(rm, "import_local_runtime", _import_forbidden)
+    monkeypatch.setattr(rm, "_can_probe_subprocess", lambda: True)
+    monkeypatch.setattr(rm, "_subprocess_import_ok", lambda name: (True, ""))
+    rm._invalidate_store_probe_cache()
+
+    torch_st = rm.torch_status()
+    onnx_st = rm.onnx_status()
+    assert torch_st["installed"] is True
+    assert onnx_st["installed"] is True
+    # Sin sonda previa no hay capacidades: nunca se inventan.
+    assert torch_st["gpu"] is False
+    assert onnx_st["gpu"] is False
+
+    # Sin Python privado no se puede validar el store sin importar torch en
+    # este proceso: el estado se reporta como no instalado (la UI pedirá
+    # reinstalar en vez de que la app muera).
+    monkeypatch.setattr(rm, "_can_probe_subprocess", lambda: False)
+    assert rm.torch_status()["installed"] is False
+    assert rm.onnx_status()["installed"] is False
+
+
+def test_gpu_flag_comes_from_probe_not_from_in_process_import(
+    monkeypatch, tmp_path
+):
+    """'GPU: sí' lo reporta la sonda del store, no un import de torch aquí."""
+    store = str(tmp_path)
+    _make_pkg_dir(store, "torch", "2.13.0-fake")
+    monkeypatch.setattr(rm, "RUNTIME_MODULES_DIR", store)
+    monkeypatch.setattr(rm, "_can_import", _import_forbidden)
+    monkeypatch.setattr(rm, "import_local_runtime", _import_forbidden)
+    monkeypatch.setattr(rm, "_can_probe_subprocess", lambda: True)
+    monkeypatch.setattr(
+        rm, "_validate_store_import_subprocess", lambda name, timeout=180.0: (True, "")
+    )
+    rm._invalidate_store_probe_cache()
+    # Lo que un subproceso limpio habría detectado con CUDA disponible.
+    rm._LAST_PROBE_CAPS["torch"] = ("cuda",)
+
+    st = rm.torch_status()
+    assert st["installed"] is True
+    assert st["gpu"] is True
 
 
 # ---------------------------------------------------------------------------

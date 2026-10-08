@@ -775,6 +775,17 @@ def test_install_cleans_foreign_leftovers_and_detects_runtime(tmp_path, monkeypa
         rm, "_validate_package_in_dir",
         lambda name, target, timeout=180.0: (True, ""),
     )
+    # La sonda del store también es un subproceso, y aquí ``subprocess`` está
+    # doblado por completo para simular pip (su ``run`` devuelve stdout vacío,
+    # sin el marcador DRAGGY-IMPORT-OK). Con el runtime PESADO, el veredicto
+    # post-instalación sale de esta sonda —el proceso de la GUI ya no importa
+    # onnxruntime/torch—, así que se dobla igual que ``_validate_package_in_dir``.
+    rm._invalidate_store_probe_cache("onnxruntime")
+    monkeypatch.setattr(
+        rm,
+        "_validate_store_import_subprocess",
+        lambda name, timeout=180.0: (True, ""),
+    )
 
     # Instalador ORIGINAL: este test ejercita el instalador con pip doblado y
     # el fixture de aislamiento lo neutraliza a propósito.

@@ -492,6 +492,9 @@ def _import_error_detail(module_name: str) -> str:
 # ---------------------------------------------------------------------------
 
 
+# Prefijo de la línea que imprime la sonda con las capacidades de GPU.
+_PROBE_CAPS_PREFIX = "DRAGGY-CAPS="
+
 # Sonda que ejecuta el subproceso: importa el módulo con el store como
 # primer ``sys.path`` y VERIFICA que el paquete cargado vive dentro del
 # store (misma regla "caracol" que ``_can_import``: un torch del venv o del
@@ -508,6 +511,22 @@ _IMPORT_PROBE_SOURCE = (
     "origin = os.path.abspath(getattr(module, '__file__', '') or '')\n"
     "store = os.path.abspath(sys.argv[1])\n"
     "ok = os.path.normcase(origin).startswith(os.path.normcase(store) + os.sep)\n"
+    # Capacidades de GPU (cuda/cpu): se calculan AQUÍ, en el subproceso
+    # desechable que ya importó el módulo. Así la app puede mostrar
+    # "GPU: sí/no" en el panel de dependencias SIN importar torch u
+    # onnxruntime dentro del proceso de la GUI. En Windows, cargar las DLL
+    # de torch (torch_cpu.dll ~300 MB + torch_cuda.dll) dentro del proceso
+    # congelado lo tumba con una violación de acceso (0xc0000005) en
+    # python313.dll — el "no arranca" del instalador.
+    "caps = []\n"
+    "try:\n"
+    "    if sys.argv[2] == 'torch':\n"
+    "        caps.append('cuda' if module.cuda.is_available() else 'cpu')\n"
+    "    elif sys.argv[2] == 'onnxruntime':\n"
+    "        caps.append('cuda' if 'CUDAExecutionProvider' in module.get_available_providers() else 'cpu')\n"
+    "except BaseException:\n"
+    "    pass\n"
+    f"print('{_PROBE_CAPS_PREFIX}' + ','.join(caps))\n"
     "print('DRAGGY-IMPORT-OK' if ok else 'DRAGGY-IMPORT-FOREIGN')\n"
     "sys.exit(0 if ok else 4)\n"
 )
@@ -525,6 +544,17 @@ def _can_probe_subprocess() -> bool:
     return get_embed_python_path() is not None
 
 
+# Módulos cuyo import in-process puede matar el proceso congelado de la GUI.
+# No son "dependencias pesadas" en abstracto: son extensiones nativas de
+# cientos de MB (torch_cpu.dll, torch_cuda.dll, onnxruntime CUDA providers)
+# que, cargadas DENTRO de DraggyEncoder.exe (PyInstaller + PySide6), provocan
+# violaciones de acceso en python313.dll. Todo lo que sea "¿está instalado?"
+# o "¿importa bien?" para estos módulos se decide en un subproceso limpio.
+_HEAVY_NATIVE_MODULES = frozenset(
+    {"torch", "torchvision", "torchaudio", "onnxruntime"}
+)
+
+
 def _validate_store_import_subprocess(
     module_name: str, timeout: float = 180.0
 ) -> tuple[bool, str]:
@@ -537,6 +567,23 @@ def _validate_store_import_subprocess(
 
     Devuelve ``(ok, detalle)``; ``detalle`` es el stderr/stdout del
     subproceso (causa legible) o la explicación de por qué no se sondeó.
+    Las capacidades que reportó la sonda (``cuda``/``cpu``) quedan en
+    ``_LAST_PROBE_CAPS`` para que el estado de la UI informe de la GPU sin
+    importar el runtime en este proceso.
+    """
+    ok, detail, caps = _store_probe_subprocess(module_name, timeout)
+    _LAST_PROBE_CAPS[module_name] = caps
+    return ok, detail
+
+
+def _store_probe_subprocess(
+    module_name: str, timeout: float = 180.0
+) -> tuple[bool, str, tuple[str, ...]]:
+    """Sonda real: ``(ok, detalle, capacidades)``.
+
+    Es el cuerpo compartido por ``_validate_store_import_subprocess`` (dos
+    valores, contrato público) y por los llamadores que además quieren las
+    capacidades de GPU.
     """
     python = get_embed_python_path()
     if python is None:
@@ -545,7 +592,7 @@ def _validate_store_import_subprocess(
                 "No se encontró el Python privado (embed-python) junto al "
                 "ejecutable: no se puede validar el runtime en un subproceso. "
                 "Reinstala la aplicación."
-            )
+            ), ()
         python = sys.executable
     try:
         proc = subprocess.run(
@@ -558,17 +605,33 @@ def _validate_store_import_subprocess(
             f"La sonda de import de '{module_name}' agotó {int(timeout)}s "
             "(el import se colgó; posible antivirus examinando las DLL "
             "recién extraídas o disco muy lento)."
-        )
+        ), ()
     except OSError as exc:
-        return False, f"No se pudo ejecutar la sonda de import ({python}): {exc}"
+        return False, f"No se pudo ejecutar la sonda de import ({python}): {exc}", ()
     if proc.returncode == 0 and "DRAGGY-IMPORT-OK" in (proc.stdout or ""):
-        return True, ""
+        return True, "", _parse_probe_caps(proc.stdout)
     output = ((proc.stdout or "") + (proc.stderr or "")).strip()
     detail = output or f"(sin salida; exit code {proc.returncode})"
-    return False, detail
+    return False, detail, _parse_probe_caps(proc.stdout)
 
 
-_SUBPROBE_CACHE: dict[str, tuple[tuple, bool, str]] = {}
+def _parse_probe_caps(stdout: str) -> tuple[str, ...]:
+    """Lee la línea ``DRAGGY-CAPS=`` que imprime la sonda (vacío si no está)."""
+    for line in reversed((stdout or "").splitlines()):
+        line = line.strip()
+        if line.startswith(_PROBE_CAPS_PREFIX):
+            raw = line[len(_PROBE_CAPS_PREFIX):]
+            return tuple(
+                part.strip().lower() for part in raw.split(",") if part.strip()
+            )
+    return ()
+
+
+_SUBPROBE_CACHE: dict[str, tuple[tuple, bool, str, tuple[str, ...]]] = {}
+# Últimas capacidades que reportó la sonda real, por módulo. Vive aparte de
+# la caché porque ``_validate_store_import_subprocess`` conserva su contrato
+# de dos valores (lo usan las instalaciones y los tests).
+_LAST_PROBE_CAPS: dict[str, tuple[str, ...]] = {}
 
 
 def _store_probe_signature(module_name: str) -> tuple:
@@ -585,8 +648,10 @@ def _invalidate_store_probe_cache(module_name: str | None = None) -> None:
     """Invalida la caché de la sonda (tras (re)instalar o borrar el store)."""
     if module_name is None:
         _SUBPROBE_CACHE.clear()
+        _LAST_PROBE_CAPS.clear()
     else:
         _SUBPROBE_CACHE.pop(module_name, None)
+        _LAST_PROBE_CAPS.pop(module_name, None)
 
 
 def _subprocess_import_ok(module_name: str) -> tuple[bool, str]:
@@ -596,40 +661,72 @@ def _subprocess_import_ok(module_name: str) -> tuple[bool, str]:
     (mtime, tamaño) del ``__init__.py`` evita repetirla en cada refresco
     de estado mientras el paquete no cambie.
     """
-    signature = _store_probe_signature(module_name)
-    cached = _SUBPROBE_CACHE.get(module_name)
-    if cached is not None and cached[0] == signature:
-        return cached[1], cached[2]
-    ok, detail = _validate_store_import_subprocess(module_name)
-    _SUBPROBE_CACHE[module_name] = (signature, ok, detail)
+    ok, detail, _caps = _subprocess_probe(module_name)
     return ok, detail
 
 
-def _post_install_import_check(module_name: str) -> tuple[bool, str]:
-    """Veredicto tras instalar: el subproceso manda, el in-process da contexto.
+def _subprocess_probe(module_name: str) -> tuple[bool, str, tuple[str, ...]]:
+    """Sonda cacheada: ``(ok, detalle, capacidades)``."""
+    signature = _store_probe_signature(module_name)
+    cached = _SUBPROBE_CACHE.get(module_name)
+    if cached is not None and cached[0] == signature:
+        return cached[1], cached[2], cached[3]
+    result = _validate_store_import_subprocess(module_name)
+    ok, detail = result[0], result[1]
+    # Un doble de test puede devolver solo dos valores: sin capacidades.
+    caps = tuple(result[2]) if len(result) > 2 else ()
+    if not caps:
+        caps = _LAST_PROBE_CAPS.get(module_name, ())
+    _SUBPROBE_CACHE[module_name] = (signature, ok, detail, caps)
+    return ok, detail, caps
 
-    - Subproceso OK  -> el store es válido: instalado (aunque el proceso
-      actual tarde más en importarlo; ``_can_import`` ya purga y reintenta).
+
+def _subprocess_caps(module_name: str) -> tuple[str, ...]:
+    """Capacidades (``cuda``/``cpu``) que reportó la sonda para el módulo."""
+    cached = _SUBPROBE_CACHE.get(module_name)
+    if cached is not None:
+        return cached[3]
+    return _LAST_PROBE_CAPS.get(module_name, ())
+
+
+def _post_install_import_check(module_name: str) -> tuple[bool, str]:
+    """Veredicto tras instalar: el subproceso manda.
+
+    - Subproceso OK  -> el store es válido: instalado.
     - Subproceso KO  -> el store no importa de verdad: el detalle es el
       stderr real del paquete, no un artefacto de re-import.
+    - Módulos PESADOS (torch/onnxruntime y sus satélites) -> NUNCA se
+      re-importan en este proceso, ni para el veredicto ni para el
+      diagnóstico: cargar sus DLLs dentro del proceso congelado de la GUI
+      lo tumba con 0xc0000005 (era el fallo exacto del arranque del
+      instalador, con ``_can_import('torch')`` en la pila del crash).
+    - Módulos ligeros -> el import in-process es barato y sigue dando
+      contexto adicional al mensaje de error.
     - Sin subproceso -> fallback in-process con el detalle de siempre.
     """
-    if _can_import(module_name):
+    heavy = module_name in _HEAVY_NATIVE_MODULES
+    if not heavy and _can_import(module_name):
         return True, ""
     if _can_probe_subprocess():
         ok, detail = _validate_store_import_subprocess(module_name)
         if ok:
-            if not _can_import(module_name):
-                logger.warning(
-                    "%s importa en subproceso pero no in-process: store "
-                    "válido, no se reinstala", module_name
-                )
             return True, ""
+        if heavy:
+            return False, detail
         in_process = _import_error_detail(module_name)
         return False, (
             f"{detail}\n\n"
             f"--- Diagnóstico del proceso actual (contexto) ---\n{in_process}"
         )
+    if heavy:
+        # Sin subproceso no hay veredicto posible para un runtime nativo
+        # pesado: importarlo aquí es justo lo que tumba la app congelada.
+        return False, (
+            f"No se puede validar '{module_name}' sin el Python privado "
+            "(embed-python): reinstala la aplicación para restaurarlo."
+        )
+    if _can_import(module_name):
+        return True, ""
     return False, _import_error_detail(module_name)
 
 
@@ -3254,36 +3351,55 @@ def _import_dir(module_name: str) -> str:
     return RUNTIME_MODULES_DIR
 
 
+def _runtime_is_installed(module_name: str) -> bool:
+    """¿Está el runtime en el store privado y es usable?
+
+    El veredicto lo da SIEMPRE un subproceso limpio que importa el paquete
+    de verdad y comprueba su origen; este proceso no importa nada. Es la
+    diferencia entre "la app arranca" y "la app muere al arrancar": con el
+    store ya poblado (torch CUDA ~2 GB), ``_can_import`` cargaba
+    torch_cpu.dll/torch_cuda.dll DENTRO de DraggyEncoder.exe y Windows
+    registraba una violación de acceso en python313.dll. La sonda además
+    evita el bucle de re-descargas: si el store es válido, no se reinstala.
+    """
+    if not _store_has_package_dir(module_name):
+        # Store vacío: el fallo es de ausencia, no de entorno. No se sondea
+        # (y no se toca ``_can_import``: un torch del sistema no cuenta).
+        return False
+    if _can_probe_subprocess():
+        try:
+            ok, _detail = _subprocess_import_ok(module_name)
+        except Exception as exc:  # pragma: no cover - defensivo
+            logger.warning("sonda de '%s' falló: %s", module_name, exc)
+            ok = False
+        return ok
+    # Sin intérprete que sondear (instalación incompleta sin embed-python):
+    # para un runtime PESADO no se cae al in-process — importar torch aquí
+    # es el crash que se está arreglando —, así que se reporta no instalado
+    # y el panel de dependencias pide reinstalar (con esa carencia, la app
+    # tampoco podría instalar el runtime después).
+    if module_name in _HEAVY_NATIVE_MODULES:
+        logger.warning(
+            "sin Python privado no se puede validar '%s' sin importarlo en "
+            "este proceso; se reporta como no instalado",
+            module_name,
+        )
+        return False
+    try:
+        return _can_import(module_name)
+    except Exception:  # pragma: no cover - defensivo
+        return False
+
+
 def torch_status() -> dict:
     # Status is also a public boundary (la UI puede llamarlo sin pasar por
     # main.py): asegura que solo el store privado participa en la resolución.
     inject_runtime_paths()
     ensure_runtime_dlls_on_path()
-    installed = _can_import("torch")
-    if not installed and _store_has_package_dir("torch") and _can_probe_subprocess():
-        # El store contiene torch pero este proceso no consigue importarlo
-        # (import fallido previo que dejó submódulos huérfanos, antivirus,
-        # etc.). El veredicto lo da un subproceso limpio: si allí importa,
-        # el store es válido y NO debe re-descargarse ~3 GB en cada arranque
-        # (antes el runtime quedaba "not ready" eterno con reinstalaciones
-        # en bucle a pesar de tener el paquete bien instalado).
-        try:
-            ok, _probe_detail = _subprocess_import_ok("torch")
-        except Exception:
-            ok = False
-        if ok:
-            logger.warning(
-                "torch no importa in-process pero sí en subproceso: store "
-                "válido, no se reinstala"
-            )
-            installed = True
-    gpu = False
-    if installed:
-        try:
-            _torch = import_local_runtime("torch")
-            gpu = _torch.cuda.is_available()
-        except Exception:
-            pass
+    installed = _runtime_is_installed("torch")
+    # GPU: la responde la sonda del store (subproceso desechable), no un
+    # import de torch en este proceso.
+    gpu = "cuda" in _subprocess_caps("torch")
     return {
         "id": "torch",
         "display_name": "PyTorch runtime",
@@ -3301,26 +3417,9 @@ def torch_status() -> dict:
 def onnx_status() -> dict:
     inject_runtime_paths()
     ensure_runtime_dlls_on_path()
-    installed = _can_import("onnxruntime")
-    if not installed and _store_has_package_dir("onnxruntime") and _can_probe_subprocess():
-        # Mismo guard que torch: el store manda sobre el proceso actual.
-        try:
-            ok, _probe_detail = _subprocess_import_ok("onnxruntime")
-        except Exception:
-            ok = False
-        if ok:
-            logger.warning(
-                "onnxruntime no importa in-process pero sí en subproceso: "
-                "store válido, no se reinstala"
-            )
-            installed = True
-    gpu = False
-    if installed:
-        try:
-            _ort = import_local_runtime("onnxruntime")
-            gpu = "CUDAExecutionProvider" in _ort.get_available_providers()
-        except Exception:
-            pass
+    installed = _runtime_is_installed("onnxruntime")
+    # Mismo guard que torch: el store manda y la GPU la responde la sonda.
+    gpu = "cuda" in _subprocess_caps("onnxruntime")
     return {
         "id": "onnxruntime",
         "display_name": "ONNX Runtime (CPU/GPU)",
