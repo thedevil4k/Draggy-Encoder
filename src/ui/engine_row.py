@@ -44,7 +44,11 @@ from PySide6.QtWidgets import (
 )
 
 from src.ai.fetcher import is_hf_hub_available as _is_hf_hub_available
-from src.ai.architectures import (
+# Importar ``src.ai.architectures`` aquí cargaría torch en el proceso de la
+# GUI (arrastra torch_cpu.dll/torch_cuda.dll) y tumbaba el arranque del
+# instalado con 0xc0000005. La lista de arquitecturas convertibles es pura
+# especificación: vive en ``arch_specs``, que no importa torch.
+from src.ai.arch_specs import (
     ONNX_CONVERTIBLE_ARCHS as _ONNX_CONVERTIBLE_ARCHS,
 )
 

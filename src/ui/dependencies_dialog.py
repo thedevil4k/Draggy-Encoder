@@ -63,7 +63,9 @@ logger = logging.getLogger(__name__)
 # modelo (el usuario final no debe ver inglés técnico del worker).
 _CONVERT_STATUS_MAP = {
     "Locating model weights...": "Buscando los pesos del modelo...",
-    "Converting to ONNX with torch.onnx.export...": "Convirtiendo a ONNX (torch.onnx.export)...",
+    "Converting to ONNX in the AI host (torch.onnx.export)...": (
+        "Convirtiendo a ONNX en el host de IA (torch.onnx.export)..."
+    ),
     "export complete": "Conversión completada.",
 }
 
@@ -179,7 +181,9 @@ class _BenchmarkWorker(QThread):
 
     def run(self):
         try:
-            from src.ai.benchmark import benchmark_backend, benchmark_quality
+            # Las medidas las toma el HOST de IA (carga modelos y corre
+            # inferencia): hacerlo aquí metía torch en el proceso de la GUI.
+            from src.ai.weight_tools import benchmark as _benchmark_via_host
             # El baremo de calidad sólo tiene sentido para upscalers (el juego
             # de referencia compara contra una imagen degradada a propósito).
             try:
@@ -191,8 +195,9 @@ class _BenchmarkWorker(QThread):
             for backend in ("onnx", "torch"):
                 measured = None
                 try:
-                    measured = benchmark_backend(
-                        self.engine_id, backend,
+                    measured = _benchmark_via_host(
+                        "benchmark_backend",
+                        engine_id=self.engine_id, backend=backend,
                         target_dir=self.target_dir,
                         use_cache=True,
                     )
@@ -200,8 +205,9 @@ class _BenchmarkWorker(QThread):
                     pass
                 if measured and is_upscale:
                     try:
-                        benchmark_quality(
-                            self.engine_id, backend,
+                        _benchmark_via_host(
+                            "benchmark_quality",
+                            engine_id=self.engine_id, backend=backend,
                             target_dir=self.target_dir,
                             use_cache=True,
                         )
@@ -1168,7 +1174,8 @@ class DependenciesDialog(QDialog):
         try:
             import os
             from src.ai.user_models import get_model, register
-            from src.ai.architectures import detect_arch_and_scale, detect_model_file_scale
+            # Lectura del peso (torch.load / grafo ONNX) EN EL HOST de IA.
+            from src.ai.weight_tools import arch_and_scale, model_file_scale
         except Exception as exc:
             logger.warning("user-model refresh helpers unavailable: %s", exc)
             return
@@ -1194,11 +1201,11 @@ class DependenciesDialog(QDialog):
 
         arch, scale = (None, None)
         if weight_path and os.path.isfile(weight_path):
-            arch, scale = detect_arch_and_scale(weight_path)
+            arch, scale = arch_and_scale(weight_path)
             if not scale:
                 # Un .onnx no se puede leer con torch, pero su escala sí se
-                # puede demostrar leyendo el grafo (src.ai.architectures).
-                scale = detect_model_file_scale(weight_path)
+                # puede demostrar leyendo el grafo (lo hace el host).
+                scale = model_file_scale(weight_path)
 
         fields = {}
         if weight_file:

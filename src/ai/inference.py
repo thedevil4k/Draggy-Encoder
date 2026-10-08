@@ -1188,7 +1188,33 @@ class PyTorchInferenceEngine(AIInferenceEngine):
 # Factory
 # ---------------------------------------------------------------------------
 
-def create_inference_engine(
+def _engine_host_mode() -> str:
+    """Dónde debe ejecutarse la inferencia: ``host``, ``local`` o ``unavailable``.
+
+    - host disponible -> ``"host"``: torch/onnxruntime cargan en el proceso
+      del host (``src.ai.host``), nunca en el de la GUI. Importarlos aquí
+      mataba DraggyEncoder.exe instalado (0xc0000005 en python313.dll).
+    - congelado y sin host -> ``"unavailable"``: NO se cae al camino local.
+      Importar torch dentro del EXE de la GUI es exactamente el crash que se
+      está evitando; se lanza un error accionable y la app sigue viva.
+    - ``DRAGGY_AI_HOST=off`` (escape hatch de soporte) o fuentes sin host ->
+      ``"local"``.
+    """
+    # Dentro del propio host no hay recursión posible: el host ES el proceso
+    # que puede cargar los runtimes, así que ejecuta los motores locales.
+    if "src.ai.host" in sys.modules:
+        return "local"
+
+    from src.ai import host_client
+
+    if host_client.host_disabled():
+        return "local"
+    if host_client.host_available():
+        return "host"
+    return "unavailable" if getattr(sys, "frozen", False) else "local"
+
+
+def _create_inference_engine_local(
     engine_id: str,
     model_path: str,
 ) -> AIInferenceEngine:
@@ -1289,6 +1315,39 @@ def create_inference_engine(
         )
 
 
+def create_inference_engine(
+    engine_id: str,
+    model_path: str,
+) -> AIInferenceEngine:
+    """Crea el motor de inferencia apropiado según el engine_id.
+
+    La fábrica del motor vive en el HOST de IA cuando está disponible (ver
+    ``_engine_host_mode``): la auto-conversión de ``.pth`` a ONNX, la elección
+    de backend y el fallback a PyTorch son idénticos a los de siempre, pero
+    ocurren en un proceso aparte. Así la GUI nunca carga torch/onnxruntime
+    (el crash que impedía arrancar al instalado).
+
+    Raises:
+        RuntimeError: si ningún motor pudo cargarse, o si la aplicación
+            empaquetada no puede usar el host (nunca se degrada a cargar los
+            runtimes nativos dentro del proceso de la GUI).
+    """
+    mode = _engine_host_mode()
+    if mode == "host":
+        from src.ai.remote_engine import RemoteInferenceEngine
+
+        engine = RemoteInferenceEngine(engine_id, model_path)
+        engine.load()
+        return engine
+    if mode == "unavailable":
+        raise RuntimeError(
+            "El host de IA no está disponible y la aplicación no puede cargar "
+            "torch/onnxruntime en su propio proceso (lo tumbaba al arrancar). "
+            "Reinstala la aplicación; si persiste, revisa bin/logs/ai_host.log."
+        )
+    return _create_inference_engine_local(engine_id, model_path)
+
+
 def find_onnx_model(model_dir: str) -> Optional[str]:
     """Busca un archivo .onnx en el directorio del modelo.
 
@@ -1376,7 +1435,7 @@ def _write_export_marker(onnx_path: str) -> None:
         logger.debug("could not write the ONNX export marker: %s", exc)
 
 
-def convert_pth_to_onnx_ex(pth_path: str) -> tuple[Optional[str], str]:
+def convert_pth_to_onnx_ex(pth_path: str, progress_callback=None) -> tuple[Optional[str], str]:
     """Like :func:`convert_pth_to_onnx` but reports the failure reason.
 
     Returns ``(onnx_path, "")`` on success or ``(None, reason)`` where
@@ -1386,6 +1445,13 @@ def convert_pth_to_onnx_ex(pth_path: str) -> tuple[Optional[str], str]:
     """
     if not os.path.exists(pth_path):
         return None, f"Model weight file not found:\n{pth_path}"
+    
+    def _emit_progress(percent, message=""):
+        if progress_callback is not None:
+            try:
+                progress_callback(int(percent), str(message))
+            except Exception:
+                pass
 
     onnx_path = os.path.splitext(pth_path)[0] + ".onnx"
     stale_backup = None
@@ -1456,6 +1522,7 @@ def convert_pth_to_onnx_ex(pth_path: str) -> tuple[Optional[str], str]:
         model = None
         try:
             logger.info("Converting %s to ONNX...", pth_path)
+            _emit_progress(20, "Loading checkpoint...")
             if pth_path.lower().endswith(".safetensors"):
                 from safetensors.torch import load_file
                 state_dict = load_file(pth_path, device="cpu")
@@ -1483,6 +1550,7 @@ def convert_pth_to_onnx_ex(pth_path: str) -> tuple[Optional[str], str]:
                     )
                 else:
                     try:
+                        _emit_progress(40, "Building model...")
                         model = build_model_from_state_dict(state_dict)
                         model.eval()
                         error_msg = ""
@@ -1522,6 +1590,7 @@ def convert_pth_to_onnx_ex(pth_path: str) -> tuple[Optional[str], str]:
                                 "PyTorch from 'Runtimes & Binaries' (it now "
                                 "installs onnx automatically) and try again."
                             )
+                        _emit_progress(60, "Exporting to ONNX...")
                         torch.onnx.export(
                             model, dummy, onnx_path,
                             opset_version=18,
@@ -1531,6 +1600,7 @@ def convert_pth_to_onnx_ex(pth_path: str) -> tuple[Optional[str], str]:
                                           "output": {0: "batch", 2: "height", 3: "width"}},
                             dynamo=False,
                         )
+                        _emit_progress(90, "Export complete, validating...")
                     except Exception as exc:
                         # Si el export con ejes dinámicos falla por el operador
                         # (p.ej. F.interpolate en algunos RRDBNet), reintentar
@@ -1538,6 +1608,7 @@ def convert_pth_to_onnx_ex(pth_path: str) -> tuple[Optional[str], str]:
                         # cualquier build de torch/onnx.
                         retry = None
                         try:
+                            _emit_progress(70, "Retrying export with fixed size...")
                             torch.onnx.export(
                                 model, dummy, onnx_path,
                                 opset_version=18,
@@ -1545,6 +1616,7 @@ def convert_pth_to_onnx_ex(pth_path: str) -> tuple[Optional[str], str]:
                                 output_names=["output"],
                                 dynamo=False,
                             )
+                            _emit_progress(90, "Export complete, validating...")
                             retry = True
                         except Exception as retry_exc:
                             retry = f"{retry_exc}"

@@ -51,17 +51,36 @@ def _detect_file_scale(model_path: str):
     así que cuando la escala no se puede PROBAR se devuelve la pista del
     nombre marcada como no probada y la UI no la ofrece.
     """
-    from src.ai.architectures import get_model_file_scale, parse_scale_from_name
-    proven = get_model_file_scale(model_path)
-    if proven > 1:
-        hint = parse_scale_from_name(os.path.basename(model_path))
-        if hint > 1 and hint != proven:
-            logger.info(
-                "%s really upscales x%d (its name says x%d)",
-                os.path.basename(model_path), proven, hint,
+    from src.ai.arch_specs import parse_scale_from_name
+    from src.ai import host_client
+
+    # El trabajo pesado (abrir el grafo ONNX o el state_dict, que necesita
+    # torch) se pide al host de IA: se ejecuta en SU proceso. Importar
+    # ``src.ai.architectures`` aquí cargaba torch dentro de la GUI y Windows
+    # mataba la app (0xc0000005 en python313.dll) al listar los modelos.
+    if model_path and host_client.host_available():
+        try:
+            data = host_client.get_host().call_op("model_scale", path=model_path)
+        except host_client.HostError as exc:
+            logger.warning(
+                "no se pudo medir la escala de %s en el host de IA (%s); "
+                "se usa la pista del nombre", model_path, exc,
             )
-        return proven, True
-    return parse_scale_from_name(os.path.basename(model_path)), False
+        else:
+            proven = int(data.get("scale") or 1)
+            hint = int(data.get("hint") or 1)
+            if proven > 1:
+                if hint > 1 and hint != proven:
+                    logger.info(
+                        "%s really upscales x%d (its name says x%d)",
+                        os.path.basename(model_path), proven, hint,
+                    )
+                return proven, True
+            return (hint if hint > 1 else 1), False
+
+    # Sin host (o desactivado): solo la pista del nombre, SIN probar. Es la
+    # misma degradación honesta que cuando el runtime no está instalado.
+    return parse_scale_from_name(os.path.basename(model_path or "")), False
 
 
 # -----------------------------------------------------------------------
@@ -712,8 +731,12 @@ class AIWorkflowStep(QFrame):
                 _skip = False
                 if fname.lower().endswith((".pth", ".pt", ".safetensors")):
                     try:
-                        from src.ai.inference import _pth_channel_count
-                        _ch = _pth_channel_count(mp)
+                        # Los canales se leen EN EL HOST de IA: importar
+                        # ``src.ai.inference`` aquí cargaba torch dentro de la
+                        # GUI (crash 0xc0000005) al listar los modelos.
+                        from src.ai.weight_tools import weight_input_channels
+
+                        _ch = weight_input_channels(mp)
                         if _ch is not None and _ch != 3:
                             logger.debug(
                                 "Skipping incompatible model %s (%d channels)",

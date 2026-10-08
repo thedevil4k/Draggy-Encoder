@@ -71,11 +71,18 @@ stdlib_hiddenimports = sorted(
     and importlib.util.find_spec(name) is not None
 )
 
+# ``datas`` incluye una copia de ``src/`` en ``ai_src/src``: el host de IA
+# (src/ai/host.py) corre en el Python PRIVADO del instalador (embed-python),
+# que no puede importar el código embebido dentro del EXE. Esa copia de
+# fuentes puras es lo que le permite ejecutar los motores (torch/onnxruntime)
+# sin cargarlos en el proceso de la GUI — importarlos ahí mataba la app con
+# 0xc0000005 en python313.dll. Si esta entrada desaparece, el selftest del
+# bundle falla al arrancar el host y el build se para.
 a = Analysis(
     ["main.py"],
     pathex=[],
     binaries=[],
-    datas=[("assets", "assets")],
+    datas=[("assets", "assets"), ("src", "ai_src/src")],
     hiddenimports=stdlib_hiddenimports,
     hookspath=[],
     runtime_hooks=[],

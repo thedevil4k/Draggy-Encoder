@@ -95,10 +95,20 @@ jobs:
           # Las tres pantallas principales deben construirse en offscreen:
           # QApplication, MainWindow y DependenciesDialog. Si falta alguna,
           # la UI está rota y no merece la pena construir el bundle.
+          #
+          # Las dos líneas del guard de runtimes pesados son la red que atrapa
+          # la regresión del "instalado no arranca": validar torch/onnxruntime
+          # importándolos dentro de la GUI (0xc0000005 en python313.dll). El
+          # store de prueba del guard hace que se compruebe aunque el runner
+          # no tenga torch instalado.
           for line in \
             "OK   QApplication offscreen" \
             "OK   MainWindow offscreen" \
-            "OK   DependenciesDialog offscreen"; do
+            "OK   DependenciesDialog offscreen" \
+            "OK   guard torch (store de prueba): sin import in-process" \
+            "OK   guard onnxruntime (store de prueba): sin import in-process" \
+            "OK   host de IA arranca" \
+            "OK   host de IA: frames ida y vuelta"; do
             grep -Fq "$line" bin/logs/selftest.log \
               || { echo "Falta en selftest.log: $line" >&2; exit 1; }
           done
@@ -276,11 +286,18 @@ jobs:
           ./dist/DraggyEncoder/DraggyEncoder --selftest
           cat dist/DraggyEncoder/bin/logs/selftest.log
           # Las tres pantallas principales deben construirse en offscreen:
-          # QApplication, MainWindow y DependenciesDialog.
+          # QApplication, MainWindow y DependenciesDialog, y el guard de
+          # runtimes pesados debe haber validado su store de prueba sin
+          # importar torch/onnxruntime dentro del bundle (la regresión del
+          # "instalado no arranca").
           for line in \
             "OK   QApplication offscreen" \
             "OK   MainWindow offscreen" \
-            "OK   DependenciesDialog offscreen"; do
+            "OK   DependenciesDialog offscreen" \
+            "OK   guard torch (store de prueba): sin import in-process" \
+            "OK   guard onnxruntime (store de prueba): sin import in-process" \
+            "OK   host de IA arranca" \
+            "OK   host de IA: frames ida y vuelta"; do
             grep -Fq "$line" dist/DraggyEncoder/bin/logs/selftest.log \
               || { echo "Falta en selftest.log: $line" >&2; exit 1; }
           done

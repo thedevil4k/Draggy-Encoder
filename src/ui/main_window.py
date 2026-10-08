@@ -67,6 +67,12 @@ from src.ui.preferences_dialog import (
     _format_duration as _fmt_dur,
 )
 from src.ui.workflow_widget import WorkflowWidget, video_paths_from_mime
+# Conversión de pesos y lectura de canales: lo hacen en el host de IA (torch
+# dentro del proceso de la GUI mata la app instalada).
+from src.ai.weight_tools import (
+    convert_weight_to_onnx as _convert_weight_to_onnx,
+    weight_input_channels as _weight_input_channels,
+)
 from src.utils.helpers import is_windows_elevated, detect_linux_container, parse_time_to_seconds
 
 logger = logging.getLogger(__name__)
@@ -383,10 +389,19 @@ class CompressionWorker(QThread):
             AIInferenceEngine,
             create_inference_engine,
             get_model_path,
-            convert_pth_to_onnx_ex,
-            PyTorchInferenceEngine,
         )
-        from src.ai.architectures import is_torch_available
+
+        def is_torch_available() -> bool:
+            """¿Hay torch utilizable? Se pregunta al STORE (sonda en subproceso).
+
+            ``from src.ai.architectures import is_torch_available`` importaba
+            torch dentro de la GUI: cargar sus DLL nativas ahí es lo que mataba
+            DraggyEncoder.exe instalado (0xc0000005 en python313.dll).
+            """
+            try:
+                return bool(_torch_status().get("installed"))
+            except Exception:
+                return False
 
         engines = []        # loaded AIInferenceEngine, in chain order
         labels = []         # ["Upscale (Real-ESRGAN x4)", ...]
@@ -469,8 +484,11 @@ class CompressionWorker(QThread):
                             )
                             if prefer_torch_over_cpu_onnx:
                                 try:
-                                    torch_engine = PyTorchInferenceEngine(pth_path, eid)
-                                    if torch_engine.load():
+                                    # Por la FÁBRICA (no la clase local): con el
+                                    # host disponible el motor se construye y
+                                    # carga en SU proceso, no en la GUI.
+                                    torch_engine = create_inference_engine("torch", pth_path)
+                                    if getattr(torch_engine, "is_loaded", False):
                                         inference_engine = torch_engine
                                     else:
                                         node_errors.append(
@@ -486,7 +504,7 @@ class CompressionWorker(QThread):
                     # 2) Convert .pth -> .onnx (needs torch)
                     if inference_engine is None or not getattr(inference_engine, "is_loaded", False):
                         if pth_path and is_torch_available():
-                            onnx_converted, conv_error = convert_pth_to_onnx_ex(pth_path)
+                            onnx_converted, conv_error = _convert_weight_to_onnx(pth_path)
                             if onnx_converted:
                                 try:
                                     inference_engine = create_inference_engine("onnxruntime", onnx_converted)
@@ -533,13 +551,13 @@ class CompressionWorker(QThread):
                 # and try each one until one loads successfully.
                 if inference_engine is None or not getattr(inference_engine, "is_loaded", False):
                     if pth_path and is_torch_available():
-                        from src.ai.inference import list_weight_files, _pth_channel_count
+                        from src.ai.inference import list_weight_files
                         engine_dir = os.path.dirname(pth_path)
                         for alt_path in list_weight_files(engine_dir, recursive=False):
                             if alt_path == pth_path:
                                 continue
                             # Skip files with wrong channel count
-                            _ch = _pth_channel_count(alt_path)
+                            _ch = _weight_input_channels(alt_path)
                             if _ch is not None and _ch != 3:
                                 logger.debug(
                                     "Fallback: skipping %s (%d channels)",

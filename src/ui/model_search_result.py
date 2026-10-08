@@ -28,7 +28,10 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from src.ai.architectures import (
+# Sin torch: ``architectures`` lo importa al cargarse y eso metía las DLL
+# nativas de PyTorch en el proceso de la GUI al arrancar (0xc0000005 en
+# python313.dll). La lista de convertibles vive en ``arch_specs``.
+from src.ai.arch_specs import (
     ONNX_CONVERTIBLE_ARCHS as _ONNX_CONVERTIBLE_ARCHS,
 )
 

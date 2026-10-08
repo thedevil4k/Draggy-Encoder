@@ -891,20 +891,14 @@ def _build_cugan(sd: dict):
 # Public API
 # ---------------------------------------------------------------------------
 
-# Arquitecturas que ``build_model_from_state_dict`` puede construir y, por
-# tanto, las únicas que el conversor ONNX soporta. La UI la consulta para
-# deshabilitar "Convert to ONNX" en motores no convertibles.
-ONNX_CONVERTIBLE_ARCHS = frozenset({"omnisr", "rrdb", "srvgg", "cugan"})
-
-
-def onnx_convertible_archs() -> frozenset:
-    """Arquitecturas soportadas por el conversor ONNX (set inmutable)."""
-    return ONNX_CONVERTIBLE_ARCHS
-
-
-def arch_is_onnx_convertible(arch: str) -> bool:
-    """True si ``arch`` puede convertirse a ONNX con el conversor propio."""
-    return bool(arch) and arch in ONNX_CONVERTIBLE_ARCHS
+# Estas tres viven en ``arch_specs`` (sin torch) porque la UI las necesita a
+# nivel de módulo y este módulo SÍ importa torch: se re-exportan aquí para
+# mantener la API histórica (tests y llamadores existentes).
+from src.ai.arch_specs import (  # noqa: E402  (re-export deliberado)
+    ONNX_CONVERTIBLE_ARCHS,
+    arch_is_onnx_convertible,
+    onnx_convertible_archs,
+)
 
 
 def detect_model_arch_and_scale(state_dict: dict):
@@ -1013,39 +1007,11 @@ def detect_arch_and_scale(weight_path: str):
 # ficheros (OmniSR_X3/X4, RealESRGAN_x2plus/x4plus...), y cada uno con
 # la suya. Estas funciones leen la escala del fichero de verdad.
 
-#: Nombres de fichero que se parecen a una escala pero no lo son.
-_SCALE_NAME_RE = None
-
-
-def parse_scale_from_name(fname: str) -> int:
-    """Factor de upscale (2, 3, 4, 8...) que sugiere el NOMBRE del fichero.
-
-    Cubre las convenciones del ecosistema Real-ESRGAN / Real-CUGAN /
-    OmniSR en ambos órdenes ("x4plus", "x4v3", "4x-UltraSharp"). Es sólo
-    una **pista**: el nombre miente (``OmniSR_X2_DIV2K.onnx`` es un x8 y
-    los "x2plus" de AI-Forever son x4), así que sólo se usa cuando el
-    fichero no se puede inspeccionar.
-    """
-    global _SCALE_NAME_RE
-    if _SCALE_NAME_RE is None:
-        import re
-        _SCALE_NAME_RE = [
-            # x2, x4, x8... seguidos de plus/vN o del final del nombre
-            re.compile(r"[xX](\d+)(?=(?:plus|v\d+)?(?:$|[\s_.-]))"),
-            # 2x, 4x ... por delante del nombre
-            re.compile(r"(?:^|[\s_.-])(\d+)[xX](?=(?:plus|v\d+)?(?:$|[\s_.-]))"),
-        ]
-    best = 1
-    for rx in _SCALE_NAME_RE:
-        for m in rx.finditer(fname or ""):
-            try:
-                value = int(m.group(1))
-            except (TypeError, ValueError):
-                continue
-            # Ignorar números absurdos que parecen versión o resolución.
-            if 1 < value <= 64:
-                best = max(best, value)
-    return best
+# ``parse_scale_from_name`` vive en ``arch_specs`` (sin torch): la UI la
+# necesita para listar modelos y este módulo importa torch al cargarse.
+from src.ai.arch_specs import (  # noqa: E402  (re-export deliberado)
+    parse_scale_from_name,
+)
 
 
 def _onnx_dim(value) -> int:

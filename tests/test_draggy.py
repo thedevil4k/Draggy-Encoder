@@ -325,9 +325,16 @@ def test_get_state_heals_legacy_lowercase_install_path(isolated_engines_state):
 
 def test_create_inference_engine_catalog_id_falls_back_to_pytorch(tmp_path, monkeypatch):
     """A catalog engine id + .pth must never raise 'Unknown inference
-    engine': it tries the PyTorch engine as the last resort."""
+    engine': it tries the PyTorch engine as the last resort.
+
+    Se fuerza el camino LOCAL (``DRAGGY_AI_HOST=off``): por defecto la
+    fábrica delega en el host de IA, que corre en OTRO proceso y por eso no
+    ve este doble. La ruta del host tiene sus propias pruebas en
+    tests/test_ai_host.py (routing, fidelidad y degradación).
+    """
     import src.ai.inference as inf
 
+    monkeypatch.setenv("DRAGGY_AI_HOST", "off")
     pth = tmp_path / "model.pth"
     pth.write_bytes(b"fake")
 
@@ -6747,9 +6754,10 @@ def test_friendly_convert_status_translates_worker_phases():
     from src.ui.dependencies_dialog import _friendly_convert_status
 
     assert _friendly_convert_status("Locating model weights...") == "Buscando los pesos del modelo..."
+    # La conversión corre en el host de IA (torch ya no se carga en la GUI).
     assert _friendly_convert_status(
-        "Converting to ONNX with torch.onnx.export..."
-    ) == "Convirtiendo a ONNX (torch.onnx.export)..."
+        "Converting to ONNX in the AI host (torch.onnx.export)..."
+    ) == "Convirtiendo a ONNX en el host de IA (torch.onnx.export)..."
     assert _friendly_convert_status("export complete") == "Conversión completada."
     assert _friendly_convert_status("anything else") == "anything else"
     assert _friendly_convert_status("") == ""
@@ -7166,6 +7174,157 @@ def test_selftest_passes_with_working_qt(tmp_path, monkeypatch):
     assert "OK   MainWindow offscreen" in log
     assert "OK   DependenciesDialog offscreen" in log
     assert "SELFTEST PASS" in log
+
+
+def _heavy_runtime_keys():
+    """Claves de ``sys.modules`` de los runtimes pesados (torch/onnxruntime)."""
+    return {
+        key for key in sys.modules
+        if key == "torch" or key.startswith("torch.")
+        or key == "onnxruntime" or key.startswith("onnxruntime.")
+    }
+
+
+def test_selftest_heavy_guard_validates_store_without_inprocess_import(main_module):
+    """El guard del selftest recorre la detección con un store POBLADO y sin
+    importar el runtime en este proceso: es la regresión que tumbaba el EXE
+    instalado (0xc0000005 en python313.dll al validar torch dentro de la GUI).
+    """
+    before = set(sys.modules)
+    lines = []
+
+    ok = main_module._selftest_heavy_runtime_guard(lines.append, check_real_store=False)
+
+    log = "\n".join(lines)
+    assert ok is True, log
+    assert "OK   guard torch (store de prueba): sin import in-process" in log
+    assert "OK   guard onnxruntime (store de prueba): sin import in-process" in log
+    added = _heavy_runtime_keys() - {
+        key for key in before
+        if key == "torch" or key.startswith("torch.")
+        or key == "onnxruntime" or key.startswith("onnxruntime.")
+    }
+    assert added == set(), f"el guard importó runtimes en este proceso: {added}"
+    # El store de prueba no se queda pegado en sys.path.
+    assert not [p for p in sys.path if "draggy-guard-" in p]
+
+
+def test_selftest_heavy_guard_fails_when_runtime_is_imported_in_process(
+    main_module, monkeypatch
+):
+    """Si la detección vuelve a importar el runtime DENTRO de la app (el bug
+    original), el guard lo denuncia y el selftest falla: el CI no puede
+    empaquetar esa regresión."""
+    import src.runtimes.manager as rm
+
+    def _import_in_process(module_name):
+        import importlib
+
+        # Exactamente lo que hacía ``_can_import``: traer el runtime al
+        # proceso (y con él sus DLL nativas) en lugar de sondear en limpio.
+        importlib.import_module(module_name)
+        return True, ""
+
+    monkeypatch.setattr(rm, "_subprocess_import_ok", _import_in_process)
+    monkeypatch.setattr(rm, "_subprocess_caps", lambda name: ("cuda",))
+
+    saved = {key: sys.modules[key] for key in _heavy_runtime_keys()}
+    for key in list(saved):
+        del sys.modules[key]
+    lines = []
+    try:
+        ok = main_module._selftest_heavy_runtime_guard(
+            lines.append, check_real_store=False
+        )
+    finally:
+        for key in _heavy_runtime_keys():
+            del sys.modules[key]
+        sys.modules.update(saved)
+
+    log = "\n".join(lines)
+    assert ok is False
+    assert "FAIL guard torch (store de prueba): se importó en ESTE proceso" in log
+
+
+def test_selftest_heavy_guard_checks_real_store_only_in_the_bundle(main_module, monkeypatch):
+    """La comprobación contra el store real es la del EXE congelado (el
+    escenario del fallo); en modo fuente solo corre el store de prueba."""
+    import src.runtimes.manager as rm
+
+    labels = []
+    monkeypatch.setattr(rm, "_can_probe_subprocess", lambda: True)
+    monkeypatch.setattr(
+        main_module,
+        "_heavy_guard_check",
+        lambda report, manager, name, label, optional=False: labels.append(label) or True,
+    )
+
+    assert main_module._selftest_heavy_runtime_guard(lambda line: None) is True
+    assert set(labels) == {"store de prueba"}
+
+
+def test_selftest_heavy_guard_skips_real_store_without_runtime(
+    main_module, monkeypatch, tmp_path
+):
+    """En el EXE, un store real sin el runtime no es un fallo del selftest:
+    se reporta SKIP y la app ofrecerá instalarlo."""
+    import src.runtimes.manager as rm
+
+    real_store = tmp_path / "ai_modules"
+    real_store.mkdir()
+    monkeypatch.setattr(rm, "RUNTIME_MODULES_DIR", str(real_store))
+
+    lines = []
+    ok = main_module._selftest_heavy_runtime_guard(lines.append, check_real_store=True)
+
+    log = "\n".join(lines)
+    assert ok is True, log
+    assert "SKIP guard torch (store real): runtime no instalado" in log
+    assert "SKIP guard onnxruntime (store real): runtime no instalado" in log
+
+
+def test_selftest_heavy_guard_warns_about_broken_real_store(
+    main_module, monkeypatch, tmp_path
+):
+    """Un store real con el paquete pero que no importa se avisa (WARN) sin
+    tumbar el selftest: la app lo mostrará como no instalado y ofrecerá
+    reinstalarlo. Lo que NUNCA puede pasar es que se importe aquí."""
+    import src.runtimes.manager as rm
+
+    real_store = tmp_path / "ai_modules"
+    (real_store / "torch").mkdir(parents=True)
+    (real_store / "torch" / "__init__.py").write_text(
+        "raise RuntimeError('store corrupto en el test')\n", encoding="utf-8"
+    )
+    monkeypatch.setattr(rm, "RUNTIME_MODULES_DIR", str(real_store))
+
+    before = _heavy_runtime_keys()
+    lines = []
+    ok = main_module._selftest_heavy_runtime_guard(lines.append, check_real_store=True)
+
+    log = "\n".join(lines)
+    assert ok is True, log
+    assert "WARN guard torch (store real): el store no valida el paquete" in log
+    added = _heavy_runtime_keys() - before
+    assert added == set(), f"el guard importó runtimes en este proceso: {added}"
+
+
+def test_selftest_fails_when_heavy_runtime_guard_fails(main_module, monkeypatch, tmp_path):
+    """El guard es un gate real: si la detección importa un runtime pesado en
+    el proceso, el selftest devuelve 1 y el CI no empaqueta el instalador."""
+    monkeypatch.setattr("src.config.ensure_runtime_dirs", lambda: None)
+    monkeypatch.setattr("src.config.get_logs_dir", lambda: str(tmp_path))
+    monkeypatch.setattr(
+        main_module,
+        "_selftest_heavy_runtime_guard",
+        lambda report, check_real_store=None: False,
+    )
+
+    rc = main_module.run_selftest()
+
+    assert rc == 1
+    log = (tmp_path / "selftest.log").read_text(encoding="utf-8")
+    assert "SELFTEST FAIL" in log
 
 
 def test_main_window_offscreen_reports_failure(qapp, monkeypatch):

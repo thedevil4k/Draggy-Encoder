@@ -164,6 +164,201 @@ try:
 except Exception:
     pass
 
+# ---------------------------------------------------------------------------
+# Guard de runtimes pesados (la regresión del "instalado no arranca")
+# ---------------------------------------------------------------------------
+#
+# Importar torch/onnxruntime DENTRO del proceso congelado (PyInstaller +
+# PySide6) tumbaba DraggyEncoder.exe con una violación de acceso (0xc0000005
+# en python313.dll): ocurría al VALIDAR el runtime recién descargado, con
+# ``_can_import('torch')`` en la pila del crash. El guard monta un store de
+# PRUEBA con paquetes falsos y recorre las mismas funciones que usa la app
+# (``torch_status``, ``onnx_status``, ``_post_install_import_check``): si algún
+# runtime pesado acaba en ``sys.modules`` de este proceso, el selftest falla y
+# el CI no empaqueta el instalador. El store de prueba vive en un directorio
+# temporal y ``RUNTIME_MODULES_DIR`` se restaura siempre: nunca entra en el
+# instalador ni toca el store real.
+_HEAVY_GUARD_INIT = {
+    "torch": (
+        '__version__ = "0.0.0-guard"\n'
+        "class _GuardCuda:\n"
+        "    @staticmethod\n"
+        "    def is_available():\n"
+        "        return True\n"
+        "cuda = _GuardCuda()\n"
+    ),
+    "onnxruntime": (
+        '__version__ = "0.0.0-guard"\n'
+        "def get_available_providers():\n"
+        '    return ["CUDAExecutionProvider", "CPUExecutionProvider"]\n'
+    ),
+}
+
+
+def _heavy_guard_loaded(module_name: str) -> set:
+    """Claves de ``sys.modules`` del runtime (``torch`` y ``torch.*``)."""
+    prefix = module_name + "."
+    return {
+        key for key in sys.modules
+        if key == module_name or key.startswith(prefix)
+    }
+
+
+def _heavy_guard_check(report, manager, module_name: str, label: str,
+                       optional: bool = False) -> bool:
+    """Comprueba UN runtime pesado: estado y post-install, sin importarlo aquí."""
+    if optional and not manager._store_has_package_dir(module_name):
+        report(f"  SKIP guard {module_name} ({label}): runtime no instalado")
+        return True
+    before = _heavy_guard_loaded(module_name)
+    try:
+        status = (
+            manager.torch_status() if module_name == "torch"
+            else manager.onnx_status()
+        )
+        post_ok, detail = manager._post_install_import_check(module_name)
+    except Exception as exc:
+        report(f"  FAIL guard {module_name} ({label}): {type(exc).__name__}: {exc}")
+        return False
+    added = _heavy_guard_loaded(module_name) - before
+    if added:
+        report(
+            f"  FAIL guard {module_name} ({label}): se importó en ESTE proceso "
+            f"(sys.modules += {sorted(added)[:4]})"
+        )
+        return False
+    if before and getattr(sys, "frozen", False):
+        report(
+            f"  FAIL guard {module_name} ({label}): ya estaba cargado antes de "
+            f"sondear ({sorted(before)[:4]})"
+        )
+        return False
+    if not status.get("installed"):
+        if optional:
+            report(
+                f"  WARN guard {module_name} ({label}): el store no valida el "
+                "paquete (la app ofrecerá reinstalarlo)"
+            )
+            return True
+        report(
+            f"  FAIL guard {module_name} ({label}): la sonda no vio el store de "
+            "prueba (¿el Python privado no puede importar?)"
+        )
+        return False
+    if not status.get("gpu"):
+        report(
+            f"  FAIL guard {module_name} ({label}): la sonda no reportó "
+            "capacidades (cuda) desde el subproceso"
+        )
+        return False
+    if not post_ok:
+        report(f"  FAIL guard {module_name} ({label}): post-install: {detail}")
+        return False
+    report(f"  OK   guard {module_name} ({label}): sin import in-process")
+    return True
+
+
+def _selftest_heavy_runtime_guard(report, check_real_store: bool | None = None) -> bool:
+    """¿La detección de runtimes pesados ocurre SIEMPRE fuera de este proceso?
+
+    Ver ``_HEAVY_GUARD_INIT``. ``check_real_store`` (por defecto: solo en el
+    EXE congelado) repite la comprobación contra el store real instalado, que
+    es el escenario exacto del fallo reportado en el equipo del usuario.
+    """
+    import shutil
+    import tempfile
+
+    from src.runtimes import manager
+
+    if check_real_store is None:
+        check_real_store = bool(getattr(sys, "frozen", False))
+
+    ok = True
+    store = tempfile.mkdtemp(prefix="draggy-guard-")
+    original_store = manager.RUNTIME_MODULES_DIR
+    original_path = list(sys.path)
+    try:
+        for module_name, source in _HEAVY_GUARD_INIT.items():
+            package = os.path.join(store, module_name)
+            os.makedirs(package, exist_ok=True)
+            with open(os.path.join(package, "__init__.py"), "w", encoding="utf-8") as fh:
+                fh.write(source)
+        manager.RUNTIME_MODULES_DIR = store
+        manager._invalidate_store_probe_cache()
+        if not manager._can_probe_subprocess():
+            report(
+                "  FAIL guard (store de prueba): no hay intérprete privado para "
+                "sondear (ver 'private runtime python')"
+            )
+            ok = False
+        else:
+            for module_name in _HEAVY_GUARD_INIT:
+                if not _heavy_guard_check(report, manager, module_name, "store de prueba"):
+                    ok = False
+    finally:
+        manager.RUNTIME_MODULES_DIR = original_store
+        manager._invalidate_store_probe_cache()
+        sys.path[:] = original_path
+        shutil.rmtree(store, ignore_errors=True)
+
+    if check_real_store:
+        for module_name in _HEAVY_GUARD_INIT:
+            if not _heavy_guard_check(report, manager, module_name, "store real",
+                                      optional=True):
+                ok = False
+    return ok
+
+
+def _selftest_ai_host(report) -> bool:
+    """¿Arranca el host de IA y mueve frames? (el proceso que carga torch).
+
+    La GUI ya no importa runtimes nativos: se lo pide a este proceso, que
+    corre con el Python privado del instalador. Si el bundle no puede
+    arrancarlo (falta el Python privado, falta la copia de fuentes
+    ``ai_src`` que copia el spec, protocolo desfasado), la app no podrá hacer
+    IA: es un fallo de empaquetado y debe verse en el build, no en el equipo
+    del usuario. El motor ``mock`` comprueba el cableado completo (arranque,
+    framing, registro de motores, ida y vuelta de blobs) sin necesitar torch.
+    """
+    from src.ai import host_client
+
+    if not host_client.host_available():
+        if os.environ.get("DRAGGY_AI_HOST", "").strip().lower() in ("off", "0", "false"):
+            report("  SKIP host de IA (DRAGGY_AI_HOST=off)")
+            return True
+        report(
+            "  FAIL host de IA: no disponible ("
+            f"python={host_client.host_python() or 'no encontrado'}, "
+            f"fuentes={host_client.host_source_root() or 'no encontradas'})"
+        )
+        return False
+
+    try:
+        import numpy as np
+
+        host = host_client.get_host()
+        info = host.ping()
+        frame = np.zeros((16, 24, 3), dtype=np.uint8)
+        frame[4:8, 4:8] = 255
+        handle = host.engine_create("mock", "")
+        if not host.engine_load(handle):
+            raise RuntimeError("el motor de prueba no cargó")
+        out = host.engine_process(handle, [frame])
+        host.engine_unload(handle)
+        if not out or tuple(out[0].shape) != frame.shape or not bool((out[0] == frame).all()):
+            raise RuntimeError("los frames no volvieron intactos del host")
+    except Exception as exc:
+        report(f"  FAIL host de IA: {type(exc).__name__}: {exc}")
+        return False
+
+    report(
+        "  OK   host de IA arranca "
+        f"(python {info.get('python')}, pid {info.get('pid')}, store {info.get('store')})"
+    )
+    report("  OK   host de IA: frames ida y vuelta")
+    return True
+
+
 def run_selftest() -> int:
     """Verificación rápida de salud sin abrir la GUI (flag ``--selftest``).
 
@@ -273,6 +468,20 @@ def run_selftest() -> int:
         except Exception:
             ok = False
             report("  FAIL embedded python:\n  " + traceback.format_exc().strip())
+
+    # Regresión del arranque del instalador: validar un runtime pesado
+    # importándolo DENTRO del proceso de la GUI (0xc0000005 en python313.dll).
+    # El guard usa un store de prueba, así que también falla en CI, donde el
+    # runner no tiene torch instalado y por eso el bug nunca se detectaba.
+    if not _selftest_heavy_runtime_guard(report):
+        ok = False
+
+    # El host de IA es el proceso que carga torch/onnxruntime: si el bundle no
+    # puede arrancarlo, la app instalada no puede hacer IA (y el crash de las
+    # DLL nativas volvería al proceso de la GUI). Se comprueba aquí, con el
+    # Python privado, en CADA build.
+    if not _selftest_ai_host(report):
+        ok = False
 
     try:
         from src.ffmpeg.manager import get_local_ffmpeg_path

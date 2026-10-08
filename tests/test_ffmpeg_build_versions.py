@@ -1679,9 +1679,11 @@ def test_the_post_install_bookkeeping_failures_do_not_break_the_install_flow(
             # 3) Y el guardia de imports de _refresh_user_model_record falla.
             #    Ese guardia solo se alcanza si el motor es de usuario, asi que
             #    hay que declararlo tal cual: si no, 1443 ni lo intentaria.
+            #    Lo que se rompe es la lectura del peso, que ahora vive en
+            #    ``src.ai.weight_tools`` (la hace el host de IA, no la GUI).
             import src.ai.user_models as _um
             with mock.patch.object(_um, "is_user_engine", lambda _e: True), \
-                    mock.patch.dict(sys.modules, {"src.ai.architectures": None}):
+                    mock.patch.dict(sys.modules, {"src.ai.weight_tools": None}):
                 instalar()
             assert any("user-model refresh helpers unavailable" in r.message
                        for r in caplog.records), "no se registro el guardia"

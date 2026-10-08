@@ -525,18 +525,17 @@ class OnnxConvertWorker(QThread):
             self.failed.emit("cancelled by user")
             return
 
-        self.status.emit("Converting to ONNX with torch.onnx.export...")
+        self.status.emit("Converting to ONNX in the AI host (torch.onnx.export)...")
         self.progress.emit(15)
 
         try:
-            # Import locally so the worker can fail with a clear message
-            # instead of crashing the whole dialog if torch is missing.
-            from src.ai.inference import convert_pth_to_onnx_ex
+            # La conversión la hace el HOST de IA: importar torch en este
+            # proceso (la GUI) lo mata con 0xc0000005 en python313.dll.
+            from src.ai.weight_tools import convert_weight_to_onnx
         except ImportError as exc:
             self.failed.emit(
                 f"Could not import the ONNX converter: {exc}\n\n"
-                "Ensure PyTorch is installed:\n"
-                "  pip install torch torchvision"
+                "The AI host ships with the application; reinstall Draggy Encoder."
             )
             return
 
@@ -544,7 +543,15 @@ class OnnxConvertWorker(QThread):
             self.failed.emit("cancelled by user")
             return
 
-        onnx_path, error_msg = convert_pth_to_onnx_ex(weight_path)
+        def _on_progress(pct, msg=""):
+            try:
+                self.progress.emit(int(pct))
+                if msg:
+                    self.status.emit(msg)
+            except Exception:
+                pass
+
+        onnx_path, error_msg = convert_weight_to_onnx(weight_path, progress_callback=_on_progress)
 
         # Cancelación pedida DURANTE la exportación: torch.onnx.export no se
         # puede abortar a mitad (haría falta matar el thread), así que la

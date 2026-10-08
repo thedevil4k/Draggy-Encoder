@@ -207,7 +207,24 @@ jobs:
           # Las tres pantallas principales deben construirse en offscreen:
           # QApplication, MainWindow y DependenciesDialog. Si falta alguna,
           # el bundle está roto aunque el import de módulos haya pasado.
-          foreach ($line in @("OK   QApplication offscreen", "OK   MainWindow offscreen", "OK   DependenciesDialog offscreen")) {
+          #
+          # Las dos líneas del guard de runtimes pesados son la red que atrapa
+          # la regresión del "instalado no arranca": validar torch/onnxruntime
+          # importándolos dentro de la GUI (0xc0000005 en python313.dll). El
+          # store de prueba del guard hace que se compruebe aunque el runner
+          # no tenga torch instalado.
+          foreach ($line in @(
+            "OK   QApplication offscreen",
+            "OK   MainWindow offscreen",
+            "OK   DependenciesDialog offscreen",
+            "OK   guard torch (store de prueba): sin import in-process",
+            "OK   guard onnxruntime (store de prueba): sin import in-process",
+            # El host de IA (proceso aparte con el Python privado) debe arrancar
+            # en el bundle y mover frames: es quien carga torch sin meterlo en
+            # la GUI. Sin esto, el instalador no puede hacer IA.
+            "OK   host de IA arranca",
+            "OK   host de IA: frames ida y vuelta"
+          )) {
             if (-not (Select-String -Path $log -SimpleMatch -Quiet $line)) {
               Write-Error "Falta en selftest.log: $line"; exit 1
             }
