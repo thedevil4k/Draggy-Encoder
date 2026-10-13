@@ -69,8 +69,14 @@ def test_can_import_purges_and_retries_after_transient_failure(monkeypatch, tmp_
     monkeypatch.setattr(
         importlib.util, "find_spec", lambda name: _fake_spec_inside(store, name)
     )
-    monkeypatch.setitem(sys.modules, "torch", object())
-    monkeypatch.setitem(sys.modules, "torch.autograd", object())
+    # Nombre SINTÉTICO a propósito: la lógica de _can_import es agnóstica al
+    # nombre, y purgar "torch" de verdad en este proceso deja su librería
+    # nativa cargada pero fuera de sys.modules, de modo que el siguiente
+    # import carga una SEGUNDA copia (medido: los tests de arquitectura que
+    # comparan con torch empezaban a fallar y pytest moría con violación de
+    # acceso al formatear el fallo).
+    monkeypatch.setitem(sys.modules, "fakepkg_retry", object())
+    monkeypatch.setitem(sys.modules, "fakepkg_retry.sub", object())
 
     attempts: list[str] = []
 
@@ -82,12 +88,12 @@ def test_can_import_purges_and_retries_after_transient_failure(monkeypatch, tmp_
 
     monkeypatch.setattr(importlib, "import_module", fake_import)
 
-    assert rm._can_import("torch") is True
-    assert attempts == ["torch", "torch"]  # exactamente UN reintento
+    assert rm._can_import("fakepkg_retry") is True
+    assert attempts == ["fakepkg_retry", "fakepkg_retry"]  # UN reintento
     # Los huérfanos fueron purgados antes del reintento (el import falso no
     # vuelve a añadirlos).
-    assert "torch" not in sys.modules
-    assert "torch.autograd" not in sys.modules
+    assert "fakepkg_retry" not in sys.modules
+    assert "fakepkg_retry.sub" not in sys.modules
 
 
 def test_can_import_purges_again_when_retry_also_fails(monkeypatch, tmp_path):
@@ -99,8 +105,8 @@ def test_can_import_purges_again_when_retry_also_fails(monkeypatch, tmp_path):
     monkeypatch.setattr(
         importlib.util, "find_spec", lambda name: _fake_spec_inside(store, name)
     )
-    monkeypatch.setitem(sys.modules, "onnxruntime", object())
-    monkeypatch.setitem(sys.modules, "onnxruntime.capi", object())
+    monkeypatch.setitem(sys.modules, "fakepkg_retry2", object())
+    monkeypatch.setitem(sys.modules, "fakepkg_retry2.capi", object())
 
     calls = {"n": 0}
 
@@ -110,11 +116,11 @@ def test_can_import_purges_again_when_retry_also_fails(monkeypatch, tmp_path):
 
     monkeypatch.setattr(importlib, "import_module", always_fails)
 
-    assert rm._can_import("onnxruntime") is False
+    assert rm._can_import("fakepkg_retry2") is False
     assert calls["n"] == 2  # intento + UN reintento, nada más
     # Purga final: el proceso queda limpio pese al doble fallo.
-    assert "onnxruntime" not in sys.modules
-    assert "onnxruntime.capi" not in sys.modules
+    assert "fakepkg_retry2" not in sys.modules
+    assert "fakepkg_retry2.capi" not in sys.modules
 
 
 def test_can_import_does_not_purge_on_success(monkeypatch, tmp_path):
@@ -666,6 +672,12 @@ def _real_resolver(*args, **kwargs):
     la suite no haga red; estos tests existen precisamente para ejercitar la
     resolución, así que usan la función original que el propio fixture deja en
     ``conftest._ORIGINALS`` y le pasan índices doblados.
+
+    Cada test que lo usa pide TAMBIÉN el fixture ``isolated_runtime``: es
+    quien guarda la función original en ``_ORIGINALS`` y quien deja el store y
+    la red anclados. Sin pedirlo, el test solo pasaba si otro test de la
+    sesión lo había instanciado antes (``KeyError: resolve_pytorch_plan`` al
+    ejecutarlo en solitario).
     """
     return _conftest._ORIGINALS["resolve_pytorch_plan"](*args, **kwargs)
 
@@ -737,7 +749,7 @@ def _fake_index(monkeypatch, *, python_floor=None, indices=None):
     monkeypatch.setattr(rm, "_platform_compatible_index", lambda: True)
 
 
-def test_resolver_skips_index_without_wheels_for_this_python(monkeypatch):
+def test_resolver_skips_index_without_wheels_for_this_python(monkeypatch, isolated_runtime):
     """El bug original: con GPU NVIDIA y Python 3.9-3.12, la app elegía cu121 y
     pedía un torch que cu121 no publica para ese CPython.
 
@@ -767,7 +779,7 @@ def test_resolver_skips_index_without_wheels_for_this_python(monkeypatch):
     assert "Python" in rejections["cuda121"]
 
 
-def test_resolver_uses_pypi_when_index_lacks_a_package(monkeypatch):
+def test_resolver_uses_pypi_when_index_lacks_a_package(monkeypatch, isolated_runtime):
     """torchaudio CUDA no siempre está en el índice de PyTorch; hay que
     buscarlo en PyPI por la torch que declara necesitar, no por número de
     versión (torchaudio 2.11.0 acompaña a torch 2.14.0)."""
@@ -802,7 +814,7 @@ def test_resolver_uses_pypi_when_index_lacks_a_package(monkeypatch):
     assert "torchaudio desde PyPI" in plan["note"]
 
 
-def test_resolver_reports_actionable_error_when_nothing_fits(monkeypatch):
+def test_resolver_reports_actionable_error_when_nothing_fits(monkeypatch, isolated_runtime):
     """Si ningún canal sirve, el error debe decir QUÉ se probó y por qué, no
     el escueto "pip exited with code 1"."""
     # Índices vacíos SIN mutar la tabla compartida (mutarla contaminaba los
@@ -821,7 +833,7 @@ def test_resolver_reports_actionable_error_when_nothing_fits(monkeypatch):
     assert excinfo.value.attempts  # lista de intentos para la UI
 
 
-def test_resolver_rejects_python_below_pytorch_floor(monkeypatch):
+def test_resolver_rejects_python_below_pytorch_floor(monkeypatch, isolated_runtime):
     """Por debajo del mínimo de PyTorch ni se consulta: error claro y directo.
 
     Se dobla ``_python_short`` (lo que usa el mensaje) y ``version_info`` en el
@@ -850,7 +862,7 @@ class _FakeVersionInfo(tuple):
         return self[1]
 
 
-def test_resolver_prefers_newest_when_python_allows(monkeypatch):
+def test_resolver_prefers_newest_when_python_allows(monkeypatch, isolated_runtime):
     """En un Python moderno se instala lo más nuevo disponible, no un pin
     congelado: el resolver consulta el índice."""
     # Sin suelo de Python: todas las versiones del índice son usables.
@@ -868,7 +880,7 @@ def test_resolver_prefers_newest_when_python_allows(monkeypatch):
     ]
 
 
-def test_resolver_falls_back_to_offline_set_when_network_is_down(monkeypatch):
+def test_resolver_falls_back_to_offline_set_when_network_is_down(monkeypatch, isolated_runtime):
     """Sin red no se puede resolver, pero la app no debe quedarse sin intento:
     se usa el set conocido bueno y pip dará el error real si tampoco sirve."""
     _fake_index(monkeypatch, python_floor=None, indices={url: {} for url in _FAKE_INDICES})

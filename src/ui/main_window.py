@@ -2946,7 +2946,19 @@ class MainWindow(QMainWindow):
             import src.task_queue as task_queue
             recovered = task_queue.recover_interrupted()
             from src.processing.pipeline import cleanup_stale_staging
-            stale = cleanup_stale_staging()
+            # El staging vive junto al vídeo de salida, así que la limpieza
+            # necesita saber qué carpetas barrer (la actual y las de los
+            # renders en cola): mirar solo %TEMP% no limpiaba nunca los
+            # restos que el usuario ve junto a sus vídeos.
+            cleanup_dirs = [getattr(self, "output_dir", None)]
+            try:
+                cleanup_dirs.extend(
+                    os.path.dirname(str(item.get("output_path") or ""))
+                    for item in task_queue.list_items()
+                )
+            except Exception:
+                pass
+            stale = cleanup_stale_staging(directories=cleanup_dirs)
             if stale:
                 self._on_status_message(
                     f"Cleaned up {stale} abandoned temporary file(s) from a "

@@ -143,6 +143,10 @@ class RuntimeHost:
         self._log_handle = None
         self._crashed_reason = ""
         self.ping_info: dict = {}
+        #: Última foto que el host mandó de cada motor (telemetría + post GPU).
+        #: Viaja DENTRO de la respuesta de procesado: pedirla aparte costaría
+        #: dos peticiones más por frame, y en frames grandes eso es fps.
+        self._engine_state: dict[str, dict] = {}
 
     # ------------------------------------------------------------- proceso
     def start(self, timeout: float = START_TIMEOUT) -> bool:
@@ -369,6 +373,9 @@ class RuntimeHost:
             blob_meta=metas,
             timeout=PROCESS_TIMEOUT,
         )
+        state = data.get("info")
+        if isinstance(state, dict):
+            self._engine_state[handle] = state
         out = [
             proto.decode_array(meta, raw)
             for meta, raw in zip(data.get("outputs") or [], out_blobs)
@@ -379,15 +386,26 @@ class RuntimeHost:
         data, _ = self.request("engine.info", {"handle": handle})
         return data
 
+    def engine_last_state(self, handle: str) -> dict | None:
+        """Última foto del motor que mandó el host (gratis: vino con el frame)."""
+        state = self._engine_state.get(handle)
+        return dict(state) if state else None
+
     def engine_gpu_post(self, handle: str, **kwargs) -> dict:
-        data, _ = self.request("engine.gpu_post", {"handle": handle, **kwargs})
+        """Pide al host activar el post-proceso en GPU de ESE motor (P1)."""
+        data, _ = self.request(
+            "engine.gpu_post", {"handle": handle, **kwargs}, timeout=LOAD_TIMEOUT
+        )
+        state = data.get("info")
+        if isinstance(state, dict):
+            self._engine_state[handle] = state
         return data
 
     def engine_unload(self, handle: str) -> None:
         try:
             self.request("engine.unload", {"handle": handle}, timeout=60.0)
-        except HostError as exc:
-            logger.warning("no se pudo soltar el motor %s: %s", handle, exc)
+        finally:
+            self._engine_state.pop(handle, None)
 
 
 _HOST: RuntimeHost | None = None

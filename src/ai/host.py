@@ -145,6 +145,8 @@ class _MockEngine:
         self.model_path = model_path
         self.engine_id = "mock"
         self.is_loaded = False
+        self._gpu_post = None
+        self._gpu_post_failure = None
 
     def load(self) -> bool:
         self.is_loaded = True
@@ -155,6 +157,36 @@ class _MockEngine:
 
     def describe_execution(self) -> str:
         return "mock (loopback sin runtime nativo)"
+
+    def configure_gpu_post(self, width=None, height=None, resize_fn=None,
+                           input_size=None, in_scale=None) -> dict:
+        """P1 de mentira: activo siempre, para probar el cableado en el CI.
+
+        No construye ningún grafo (aquí no hay onnxruntime); solo declara que
+        el camino GPU está activo con el tamaño de salida y el detalle
+        pedidos, que es lo que el proxy del cliente tiene que propagar sin
+        inventarse nada.
+        """
+        self._gpu_post = {"active": True,
+                          "out_size": (width, height) if width and height else None}
+        self._gpu_post_failure = None
+        self._gpu_post["detail"] = (float(in_scale) if in_scale is not None
+                                    else 1.0)
+        return {"active": True, "reason": "ok",
+                "out_size": self._gpu_post["out_size"],
+                "detail": self._gpu_post["detail"], "precision": "mock"}
+
+    def gpu_post_active(self) -> bool:
+        return bool(self._gpu_post)
+
+    def disable_gpu_post(self) -> None:
+        self._gpu_post = None
+
+    def get_cumulative_timing(self) -> dict:
+        return {"frames": 0, "pre_ms": 0.0, "infer_ms": 0.0, "post_ms": 0.0}
+
+    def get_scale_factor(self) -> int:
+        return 1
 
 
 def _job_engine_create(data: dict) -> dict:
@@ -210,7 +242,7 @@ def _job_engine_process(data: dict, blobs: list) -> tuple[dict, list]:
     metas = [dict(m) for m in (data.get("blob_meta") or [])]
     if isinstance(engine, _MockEngine):
         # Sin numpy: solo se comprueba el cableado (blobs intactos).
-        return {"outputs": metas}, list(blobs)
+        return {"outputs": metas, "info": _engine_state(engine)}, list(blobs)
 
     resize = data.get("resize")
     out_meta, out_blobs = [], []
@@ -222,24 +254,96 @@ def _job_engine_process(data: dict, blobs: list) -> tuple[dict, list]:
         encoded_meta, encoded_blob = proto.encode_array(out)
         out_meta.append(encoded_meta)
         out_blobs.append(encoded_blob)
-    return {"outputs": out_meta}, out_blobs
+    return {"outputs": out_meta, "info": _engine_state(engine)}, out_blobs
 
 
-def _job_engine_info(data: dict) -> dict:
-    engine = _ENGINES.get(str(data.get("handle")))
-    if engine is None:
-        raise KeyError(f"motor desconocido en el host: {data.get('handle')}")
-    info: dict = {"engine_id": getattr(engine, "engine_id", "?")}
+def _gpu_post_state(engine) -> dict:
+    """Estado real del post-proceso GPU de un motor de este proceso.
+
+    El pipeline lo lee dos veces por frame (antes y después de la llamada),
+    así que viaja DENTRO de la respuesta de ``engine.process``: si hubiera que
+    pedirlo aparte serían dos peticiones extra por frame (y con 20 ms de
+    round-trip en frames grandes, eso se nota en el fps).
+    """
+    state: dict = {}
+    active = getattr(engine, "gpu_post_active", None)
+    try:
+        state["gpu_post_active"] = bool(active()) if callable(active) else bool(active)
+    except Exception:
+        state["gpu_post_active"] = False
+    failure = getattr(engine, "_gpu_post_failure", None)
+    if failure:
+        state["gpu_post_failure"] = str(failure)
+    return state
+
+
+def _engine_state(engine) -> dict:
+    """Foto del motor (identidad, escala, telemetría, post GPU) para el cliente."""
+    state: dict = {"engine_id": getattr(engine, "engine_id", "?")}
     for attr, key in (("get_scale_factor", "scale_factor"),
                       ("describe_execution", "execution"),
                       ("get_cumulative_timing", "timing")):
         fn = getattr(engine, attr, None)
         if callable(fn):
             try:
-                info[key] = fn()
+                state[key] = fn()
             except Exception as exc:  # la info es best-effort, no crítica
-                info[key] = f"({type(exc).__name__}: {exc})"
-    return info
+                state[key] = f"({type(exc).__name__}: {exc})"
+    state.update(_gpu_post_state(engine))
+    return state
+
+
+def _host_resize_frame(im, dst_w, dst_h):
+    """Reescalado de frames con el MISMO filtro que el pipeline.
+
+    El post-proceso GPU se autocomprueba contra el camino clásico (motor +
+    ``pipeline._resize_frame``), así que el filtro tiene que ser el de allí:
+    cv2 INTER_AREA al reducir / INTER_LINEAR al agrandar, con PIL y numpy como
+    respaldo. Si se usara otro filtro, la comprobación compararía dos imágenes
+    legítimamente distintas y rechazaría el camino GPU sin motivo.
+
+    numpy se importa aquí dentro (no en el módulo) porque es el proceso del
+    host el que puede pagarlo; y hace falta aunque ``cv2`` esté: el respaldo
+    de PIL y el de numpy lo usan.
+    """
+    import numpy as np
+
+    dst_w, dst_h = int(dst_w), int(dst_h)
+    try:
+        import cv2
+
+        interp = (cv2.INTER_AREA
+                  if (dst_h < im.shape[0] or dst_w < im.shape[1])
+                  else cv2.INTER_LINEAR)
+        resized = cv2.resize(im, (dst_w, dst_h), interpolation=interp)
+        if resized.ndim == 2:
+            resized = resized[..., None].repeat(3, axis=2)
+        return resized
+    except ImportError:
+        pass
+    try:
+        from PIL import Image as _PILImage
+
+        resized = np.asarray(_PILImage.fromarray(im).resize(
+            (dst_w, dst_h), _PILImage.Resampling.BILINEAR))
+        if resized.ndim == 2:
+            resized = resized[..., None].repeat(3, axis=2)
+        return resized
+    except ImportError:
+        rows = np.linspace(0, im.shape[0] - 1, dst_h, dtype=int)
+        cols = np.linspace(0, im.shape[1] - 1, dst_w, dtype=int)
+        resized = im[rows[:, None], cols[None, :], :] if im.ndim == 3 else \
+            im[rows[:, None], cols[None, :]]
+        if resized.ndim == 2:
+            resized = resized[..., None].repeat(3, axis=2)
+        return resized
+
+
+def _job_engine_info(data: dict) -> dict:
+    engine = _ENGINES.get(str(data.get("handle")))
+    if engine is None:
+        raise KeyError(f"motor desconocido en el host: {data.get('handle')}")
+    return _engine_state(engine)
 
 
 def _job_engine_unload(data: dict) -> dict:
@@ -256,19 +360,70 @@ def _job_engine_unload(data: dict) -> dict:
 
 
 def _job_engine_gpu_post(data: dict) -> dict:
-    """P1 (post-proceso en GPU) todavía corre en el proceso de la app.
+    """P1: activa el pre/post-proceso en GPU DEL MOTOR QUE VIVE AQUÍ.
 
-    Se responde explícitamente ``active: False`` para que el pipeline use el
-    camino de siempre; lo que NO se hace es activarlo aquí y devolver un motor
-    que la GUI crea que está envuelto.
+    Es el mismo ``configure_gpu_post`` de los motores locales (construye el
+    grafo envuelto con cabeza/cola, lo autocomprueba y decide), sólo que
+    ocurre en este proceso, que es el que tiene onnxruntime. El ``resize_fn``
+    del pipeline no puede cruzar el protocolo, así que se pasa el reescalado
+    equivalente de aquí (``_host_resize_frame``): mismo filtro, así la
+    autocomprobación compara lo comparable.
+
+    Si el motor no soporta el camino GPU (terceros, mocks, PyTorch sin CUDA)
+    se responde ``active: False`` con el motivo; nunca se miente ni se rompe
+    el render.
     """
-    return {
-        "active": False,
-        "reason": (
-            "el post-proceso en GPU aún no vive en el host de IA; "
-            "se usa el camino estándar"
-        ),
-    }
+    engine = _ENGINES.get(str(data.get("handle")))
+    if engine is None:
+        raise KeyError(f"motor desconocido en el host: {data.get('handle')}")
+    configure = getattr(engine, "configure_gpu_post", None)
+    if not callable(configure):
+        return {"active": False, "reason": "not-supported",
+                "info": _engine_state(engine)}
+    input_size = data.get("input_size")
+    in_scale = data.get("in_scale")
+    scale = float(in_scale) if in_scale is not None else None
+    try:
+        result = configure(
+            data.get("width"), data.get("height"),
+            resize_fn=_host_resize_frame,
+            input_size=tuple(input_size) if input_size else None,
+            in_scale=scale,
+        )
+    except TypeError as exc:
+        # Motores que aún no conocen el ajuste de detalle: se les llama como
+        # antes en vez de declarar P1 roto (el detalle es opcional, no un
+        # requisito de la interfaz).
+        if "in_scale" not in str(exc):
+            logger.error("gpu_post falló en el host:\n%s", traceback.format_exc())
+            result = {"active": False,
+                      "reason": f"error:{type(exc).__name__}: {exc}"}
+        else:
+            try:
+                result = configure(
+                    data.get("width"), data.get("height"),
+                    resize_fn=_host_resize_frame,
+                    input_size=tuple(input_size) if input_size else None,
+                )
+            except Exception as inner:
+                logger.error("gpu_post falló en el host:\n%s", traceback.format_exc())
+                result = {"active": False,
+                          "reason": f"error:{type(inner).__name__}: {inner}"}
+    except Exception as exc:
+        logger.error("gpu_post falló en el host:\n%s", traceback.format_exc())
+        result = {"active": False,
+                  "reason": f"error:{type(exc).__name__}: {exc}"}
+    if not isinstance(result, dict):
+        result = {"active": False, "reason": "bad-result"}
+    report = {"active": bool(result.get("active")),
+              "reason": str(result.get("reason", ""))}
+    for key, value in result.items():
+        if key not in report:
+            report[key] = value
+    report["info"] = _engine_state(engine)
+    logger.info("gpu_post en el host: active=%s reason=%s",
+                report["active"], report["reason"])
+    return report
 
 
 # ---------------------------------------------------------------------------

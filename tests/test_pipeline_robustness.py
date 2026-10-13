@@ -588,3 +588,407 @@ def test_preview_encodes_the_same_forced_ratio_as_the_render(tmp_path,
         assert (stream["width"], stream["height"]) == (854, 480), stream
     finally:
         shutil.rmtree(artifacts["dir"], ignore_errors=True)
+
+
+def test_preview_retries_the_frame_when_the_seek_lands_past_the_clip(
+        tmp_path, ffmpeg_pair, monkeypatch):
+    """El preview no falla cuando el instante sorteado cae tras el último frame.
+
+    Fallo real medido: el ``-ss`` de entrada de FFmpeg descarta lo anterior al
+    instante pedido, así que en un clip corto (1 s a 5 fps: el hueco entre el
+    último frame y el final es de 0,2 s) el frame pedido podía no existir. De 30
+    previews sobre ese mismo clip, 6 fallaban (20%) con "Could not extract a
+    frame from the compressed preview clip" -- y el instante se sortea con
+    semilla del path, así que le tocaba a cualquiera.
+    """
+    import shutil
+
+    import src.processing.pipeline as pipeline
+
+    ffmpeg, _ffprobe = ffmpeg_pair
+    src = str(tmp_path / "in.mp4")
+    _make_clip(ffmpeg, src, size="720x480")  # 1 s a 5 fps
+
+    real = pipeline.extract_frame
+    attempts = []
+
+    def flaky(ffmpeg_path, video_path, time_sec, output_path, **kwargs):
+        attempts.append((os.path.basename(video_path), round(float(time_sec), 3)))
+        # El primer intento sobre el clip YA codificado falla, tal y como falla
+        # cuando el seek de entrada cae después de su último frame.
+        if len(attempts) == 1 and float(time_sec) > 0:
+            return False
+        return real(ffmpeg_path, video_path, time_sec, output_path, **kwargs)
+
+    monkeypatch.setattr(pipeline, "extract_frame", flaky)
+
+    _original, _compressed, artifacts = generate_preview(
+        ffmpeg, src,
+        {"codec": "h264", "resolution": "480", "aspect": "16:9", "bitrate": 2000,
+         "audio": "noaudio", "audio_boost": False, "format": "mp4",
+         "preset": "veryfast", "pixel_format": "yuv420p"},
+    )
+    try:
+        comprimido = [t for name, t in attempts
+                      if name.startswith("preview_compressed")]
+        original = [t for name, t in attempts if name == "in.mp4"]
+        assert comprimido, attempts
+        assert len(comprimido) == 2, attempts  # falló el primero: se reintentó
+        assert comprimido[1] < comprimido[0], comprimido
+        # El antes/después tiene que ser el MISMO momento: el frame original se
+        # extrae en el instante del reintento, desplazado por el inicio del clip
+        # (el 20 % de un video de 1 s).
+        assert len(original) == 1, attempts
+        assert original[0] - comprimido[1] == pytest.approx(0.2, abs=0.05)
+    finally:
+        shutil.rmtree(artifacts["dir"], ignore_errors=True)
+
+
+# ------------------------------- staging del mux y limpieza de restos
+# Fallo real medido: el temporal del mux nacía en %TEMP% (unidad del sistema)
+# mientras el destino estaba en otra unidad (D:, E:, NAS). El ``os.replace``
+# final devolvía WinError 17 (cross-device) y el mux tiraba un vídeo YA
+# procesado entero. Estos tests fijan las dos mitades del arreglo: el temporal
+# vive junto al destino y la limpieza barre de verdad esa carpeta.
+import errno  # noqa: E402  (solo lo usa el shim de Windows de abajo)
+import subprocess  # noqa: E402
+
+
+class _WindowsReplaceShim:
+    """``os`` con el ``os.replace`` de Windows: entre unidades, OSError.
+
+    Cualquier ``replace`` entre carpetas distintas falla igual que en Windows
+    (``WinError 17`` = ``EXDEV``), así que un test que pase con este shim
+    demuestra que el mux no necesita cruzar de unidad.
+    """
+
+    def __init__(self, real):
+        self._real = real
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+    def replace(self, src, dst):
+        src_dir = os.path.dirname(os.path.abspath(src))
+        dst_dir = os.path.dirname(os.path.abspath(dst))
+        if src_dir != dst_dir:
+            raise OSError(errno.EXDEV, "Invalid cross-device link")
+        return self._real.replace(src, dst)
+
+
+class _FakeFFmpeg:
+    """ffmpeg doblado: escribe en su último argumento y sale con éxito."""
+
+    def __init__(self, command, **kwargs):
+        self.command = command
+        self.returncode = 0
+        with open(command[-1], "wb") as fh:
+            fh.write(b"muxed")
+
+    def poll(self):
+        return 0
+
+    def wait(self, timeout=None):
+        return 0
+
+
+def test_mux_stages_beside_the_destination_not_in_temp(tmp_path, monkeypatch):
+    """El temporal del mux se pide para la carpeta del destino (no %TEMP%)."""
+    import src.processing.pipeline as pipeline
+
+    destino = tmp_path / "render.mp4"
+    pedidos = []
+    real_make = pipeline._make_temp_output_path
+    monkeypatch.setattr(
+        pipeline, "_make_temp_output_path",
+        lambda path: (pedidos.append(path), real_make(path))[1],
+    )
+    monkeypatch.setattr(pipeline.subprocess, "Popen", _FakeFFmpeg)
+    monkeypatch.setattr(pipeline, "os", _WindowsReplaceShim(os))
+
+    assert pipeline._mux_audio("ffmpeg", "entrada.mp4", str(destino),
+                               audio_codec="copy", settings={}) is True
+    assert pedidos == [str(destino)], "el temporal no nace junto al destino"
+    assert destino.read_bytes() == b"muxed"
+    assert not list(tmp_path.glob(".draggy-render-*"))
+    assert not list(tmp_path.glob(".mux-*"))
+
+
+def _make_clip_with_audio(ffmpeg, path, size="320x240"):
+    cmd = [ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
+           "-f", "lavfi", "-i", f"testsrc2=size={size}:rate=5:duration=1",
+           "-f", "lavfi", "-i", "sine=frequency=440:duration=1",
+           "-c:v", "libx264", "-pix_fmt", "yuv420p",
+           "-c:a", "aac", "-shortest", path]
+    if subprocess.run(cmd, capture_output=True, timeout=120).returncode != 0:
+        pytest.skip("could not build the test clip with audio")
+
+
+def test_mux_publishes_the_audio_into_the_destination(tmp_path, ffmpeg_pair,
+                                                     monkeypatch):
+    """Mux real con audio y publicación sin cruzar de unidad."""
+    import json
+
+    import src.processing.pipeline as pipeline
+
+    ffmpeg, ffprobe = ffmpeg_pair
+    src = str(tmp_path / "in.mp4")
+    _make_clip_with_audio(ffmpeg, src)
+    salida = tmp_path / "upscaled.mp4"
+    encode = subprocess.run(
+        [ffmpeg, "-y", "-hide_banner", "-loglevel", "error", "-i", src,
+         "-an", "-c:v", "copy", str(salida)],
+        capture_output=True, timeout=120,
+    )
+    assert encode.returncode == 0, encode.stderr
+
+    monkeypatch.setattr(pipeline, "os", _WindowsReplaceShim(os))
+    assert pipeline._mux_audio(
+        ffmpeg, src, str(salida), audio_codec="copy",
+        settings={"audio": "copy", "format": "mp4"},
+    ) is True
+
+    probe = subprocess.run(
+        [ffprobe, "-v", "error", "-select_streams", "a:0", "-show_entries",
+         "stream=codec_type", "-of", "json", str(salida)],
+        capture_output=True, text=True, timeout=60,
+    )
+    assert json.loads(probe.stdout)["streams"], "el mux dejó el vídeo sin audio"
+    assert not list(tmp_path.glob(".draggy-render-*"))
+
+
+def test_parallel_audio_stages_next_to_the_render(tmp_path, monkeypatch):
+    """El audio paralelo también se escribe junto al render, no en %TEMP%."""
+    import tempfile
+
+    import src.processing.pipeline as pipeline
+
+    monkeypatch.setattr(pipeline.subprocess, "Popen", _FakeFFmpeg)
+    monkeypatch.setattr(pipeline, "_get_duration_seconds", lambda *a, **k: 10.0)
+    carpeta = tmp_path / "render"
+    carpeta.mkdir()
+    settings = {"audio": "aac", "audio_boost": False, "format": "mp4",
+                "audio_stream_index": 0}
+
+    junto = pipeline._encode_audio_parallel("ffmpeg", "entrada.mkv", settings,
+                                            staging_dir=str(carpeta))
+    suelto = pipeline._encode_audio_parallel("ffmpeg", "entrada.mkv", settings)
+    try:
+        assert junto and os.path.dirname(junto) == str(carpeta)
+        assert suelto and os.path.dirname(os.path.abspath(suelto)) ==             os.path.abspath(tempfile.gettempdir())
+    finally:
+        for path in (junto, suelto):
+            if path and os.path.exists(path):
+                os.remove(path)
+
+
+def test_cleanup_stale_staging_scans_the_render_folders(tmp_path, monkeypatch):
+    """Los restos junto al render se limpian (antes solo se miraba %TEMP%)."""
+    import time as _time
+
+    import src.processing.pipeline as pipeline
+
+    salida = tmp_path / "renders"
+    salida.mkdir()
+    temp_dir = tmp_path / "temp"
+    temp_dir.mkdir()
+
+    def _viejo(path):
+        path.write_bytes(b"x")
+        os.utime(path, (_time.time() - 7200,) * 2)
+        return path
+
+    restos = [
+        _viejo(salida / ".draggy-render-abc.mp4"),
+        _viejo(salida / ".drag-audio-abc.m4a"),
+        _viejo(temp_dir / ".drag-audio-viejo.m4a"),  # sesión anterior
+    ]
+    reciente = salida / ".draggy-render-nuevo.mp4"
+    reciente.write_bytes(b"x")
+    ajena = _viejo(tmp_path / ".draggy-render-ajena.mp4")
+
+    monkeypatch.setattr(pipeline.tempfile, "gettempdir", lambda: str(temp_dir))
+    assert pipeline.cleanup_stale_staging(directories=[str(salida)]) == 3
+    assert not any(path.exists() for path in restos)
+    assert reciente.exists(), "un render en curso no se toca"
+    assert ajena.exists(), "no se barren carpetas que nadie pidió"
+
+
+def test_gpu_post_detail_reaches_only_the_last_engine(monkeypatch):
+    """El ajuste de detalle del usuario llega al ÚLTIMO paso de la cadena.
+
+    Bug real de este bucle: el nombre ``detail`` se reutilizaba para el
+    informe del motor, así que a partir del segundo paso el ajuste pedido se
+    sustituía por lo que hubiera reportado el paso anterior (o por ``None``) y
+    la cadena entera ignoraba la preferencia en silencio.
+    """
+    import src.ai.gpu_post as gpu_post
+    import src.processing.pipeline as pipeline
+
+    monkeypatch.setattr(gpu_post, "gpu_post_enabled", lambda: True)
+    monkeypatch.setattr(gpu_post, "get_detail_preference", lambda: 0.8)
+
+    class _Engine:
+        def __init__(self, engine_id, reported=None):
+            self.engine_id = engine_id
+            self._reported = reported
+            self.scales = []
+
+        def configure_gpu_post(self, width=None, height=None, resize_fn=None,
+                               input_size=None, in_scale=None):
+            self.scales.append(in_scale)
+            result = {"active": True, "reason": "ok"}
+            if self._reported is not None:
+                result["detail"] = self._reported
+            return result
+
+    primero = _Engine("paso-1", reported=1.0)
+    ultimo = _Engine("paso-2")
+    pipeline._configure_gpu_post_for_chain(
+        [], [primero, ultimo], None, 1920, 1440, 768, 576, None,
+    )
+
+    assert primero.scales == [1.0], "un paso intermedio no se reduce"
+    assert ultimo.scales == [0.8], "la preferencia no llegó al último paso"
+
+
+# ------------------------- bloqueo de una cadena que no puede con el vídeo
+class _FixedSizeUpscaler:
+    """Motor que solo acepta frames de un tamaño concreto (modelo real: 64x64).
+
+    Es el caso medido con el modelo de entrada fija del store: en el render
+    anterior se auto-desactivaba en el frame 0 y el vídeo salía sin upscale.
+    """
+
+    engine_id = "fixed-64"
+    _mode = "upscale"
+
+    def get_scale_factor(self):
+        return 2
+
+    def process_frame(self, frame):
+        h, w = frame.shape[0], frame.shape[1]
+        if (h, w) != (64, 64):
+            raise RuntimeError(
+                f"Got invalid dimensions for input: index: 2 Got: {h} Expected: 64"
+            )
+        return np.repeat(np.repeat(frame, 2, axis=0), 2, axis=1)
+
+
+def test_chain_contract_strict_flags_an_unusable_step():
+    """Modo estricto: el paso que no puede con el tamaño real bloquea.
+
+    Sin strict (comportamiento de siempre) el paso se salta y el contrato
+    pasa, que es justo lo que dejaba correr un render sin upscale.
+    """
+    from src.processing.pipeline import (
+        AIChainUnusable, validate_ai_chain_contract,
+    )
+
+    engine = _FixedSizeUpscaler()
+    assert validate_ai_chain_contract([engine], 576, 768) is True
+    with pytest.raises(AIChainUnusable) as err:
+        validate_ai_chain_contract([engine], 576, 768, strict=True)
+    message = str(err.value)
+    assert "fixed-64" in message and "768x576" in message, message
+    assert "Expected: 64" in message, "el motivo del motor tiene que viajar"
+
+
+def test_chain_contract_strict_ignores_a_step_already_disabled():
+    """Un motor ya desactivado para el render no bloquea nada."""
+    from src.processing.pipeline import validate_ai_chain_contract
+
+    engine = _FixedSizeUpscaler()
+    engine._failed = True
+    assert validate_ai_chain_contract([engine], 576, 768, strict=True) is True
+
+
+def test_ai_render_blocks_before_decoding_an_impossible_step(tmp_path,
+                                                             ffmpeg_pair):
+    """El render se corta antes de decodificar y no publica nada."""
+    from src.processing.pipeline import AIChainUnusable, compress_video_with_ai
+
+    ffmpeg, _ffprobe = ffmpeg_pair
+    src = str(tmp_path / "in.mp4")
+    _make_clip(ffmpeg, src, size="320x240")
+    dst = str(tmp_path / "out.mp4")
+    estados = []
+
+    with pytest.raises(AIChainUnusable) as err:
+        compress_video_with_ai(
+            ffmpeg, src, dst,
+            {"codec": "libx264", "resolution": "original", "bitrate": 1000,
+             "audio": "noaudio", "format": "mp4", "preset": "veryfast",
+             "pixel_format": "yuv420p"},
+            inference_engines=[_FixedSizeUpscaler()],
+            status_callback=estados.append,
+        )
+
+    assert "fixed-64" in str(err.value)
+    assert not os.path.exists(dst), "no debe quedar salida publicada"
+    assert any("AI chain blocked" in str(s) for s in estados), estados
+    # Y no puede quedar NADA a medias: el bloqueo va antes de arrancar el
+    # audio en paralelo y el encoder, así que no hay temporales ni procesos.
+    restos = [p for p in os.listdir(str(tmp_path))
+              if p.startswith((".draggy-render-", ".drag-audio-", ".mux-"))]
+    assert restos == [], restos
+
+
+def test_prune_render_logs_keeps_the_newest_and_touches_nothing_else(tmp_path,
+                                                                   monkeypatch):
+    """Los logs de render se podan por antigüedad y sin tocar el resto.
+
+    La carpeta crecía sin límite (3109 ficheros / 21 MB medidos): uno por
+    render y uno por cada test que lanza uno.
+    """
+    import src.processing.pipeline as pipeline
+
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    nombres = [f"render_2026010{d}_0000{i}.json" for i, d in enumerate(range(5))]
+    for nombre in nombres:
+        (logs / nombre).write_text("{}")
+    (logs / "app.log").write_text("x")
+    (logs / "ffmpeg.log").write_text("x")
+    (logs / "loudnorm.log").write_text("x")
+    (logs / "backup").mkdir()
+    (logs / "backup" / "app-2026.log").write_text("x")
+
+    monkeypatch.setattr(pipeline, "get_logs_dir", lambda: str(logs))
+
+    assert pipeline.prune_render_logs(keep=2) == 3
+    assert sorted(p.name for p in logs.glob("render_*.json")) == nombres[-2:]
+    # Ni los otros logs ni la carpeta de respaldos se tocan.
+    assert (logs / "app.log").exists()
+    assert (logs / "ffmpeg.log").exists()
+    assert (logs / "loudnorm.log").exists()
+    assert (logs / "backup" / "app-2026.log").exists()
+
+    # Poda con la carpeta ausente o sin nada que borrar: nunca lanza.
+    monkeypatch.setattr(pipeline, "get_logs_dir", lambda: str(tmp_path / "nope"))
+    assert pipeline.prune_render_logs() == 0
+    assert pipeline.prune_render_logs(keep="basura") == 0
+    assert pipeline.prune_render_logs(keep=99) == 0
+
+
+def test_saving_a_render_log_prunes_the_old_ones(tmp_path):
+    """Escribir el log de un render deja la carpeta acotada: los más nuevos.
+
+    La política vive en el único sitio que escribe logs de render, así que la
+    carpeta no puede crecer sin límite ni depende del arranque de la GUI.
+    """
+    import src.processing.pipeline as pipeline
+
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    # La poda actua sobre la carpeta del propio log, asi que basta escribir
+    # uno mas que el limite para que el mas viejo desaparezca.
+    for i in range(pipeline.RENDER_LOGS_KEEP + 1):
+        pipeline._save_render_log(
+            str(logs / f"render_20260101_{i:06d}.json"), {"i": i},
+        )
+    restantes = sorted(logs.glob("render_*.json"))
+    assert len(restantes) == pipeline.RENDER_LOGS_KEEP
+    nombres = [p.name for p in restantes]
+    assert nombres[0] == "render_20260101_000001.json", nombres[0]
+    assert nombres[-1] == f"render_20260101_{pipeline.RENDER_LOGS_KEEP:06d}.json"

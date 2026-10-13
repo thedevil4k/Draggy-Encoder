@@ -252,28 +252,91 @@ def _make_temp_output_path(output_path: str) -> str:
     return path
 
 
-def cleanup_stale_staging(older_than_seconds=3600):
+def cleanup_stale_staging(older_than_seconds=3600, directories=None):
     """Remove abandoned render staging files left by a previous crash.
 
     Staging files are created beside their destination (``.draggy-render-*``
-    / ``.drag-audio-*``); if the app died before ``os.replace`` they would
-    otherwise accumulate forever. Only files older than ``older_than_seconds``
+    del render, ``.drag-audio-*`` del audio en paralelo y del mux); if the
+    app died before ``os.replace`` they would otherwise accumulate forever
+    next to the user's videos. Only files older than ``older_than_seconds``
     are touched so a concurrent render in this same process is never harmed.
+
+    ``directories`` (opcional): carpetas de salida que hay que barrer,
+    además de ``%TEMP%``. Se necesitan las dos cosas: el staging vive junto
+    al render (donde el usuario vería los restos) y las sesiones versiones
+    anteriores dejaban temporales en ``%TEMP%``. La GUI pasa su carpeta de
+    salida y las de la cola de renders.
     """
     import glob as _glob
     import time as _time
     now = _time.time()
     removed = 0
-    for pattern in (".draggy-render-*", ".drag-audio-*"):
+    roots = [tempfile.gettempdir()]
+    seen = {os.path.normcase(os.path.abspath(roots[0]))}
+    for directory in (directories or ()):
         try:
-            for path in _glob.glob(os.path.join(tempfile.gettempdir(), pattern)):
-                try:
-                    if now - os.path.getmtime(path) >= older_than_seconds:
-                        os.remove(path)
-                        removed += 1
-                except OSError:
-                    pass
+            candidate = os.path.abspath(str(directory))
         except Exception:
+            continue
+        key = os.path.normcase(candidate)
+        if key in seen or not os.path.isdir(candidate):
+            continue
+        seen.add(key)
+        roots.append(candidate)
+    for root in roots:
+        for pattern in (".draggy-render-*", ".drag-audio-*", ".mux-*"):
+            try:
+                for path in _glob.glob(os.path.join(root, pattern)):
+                    try:
+                        if now - os.path.getmtime(path) >= older_than_seconds:
+                            os.remove(path)
+                            removed += 1
+                    except OSError:
+                        pass
+            except Exception:
+                pass
+    return removed
+
+
+#: Cuántos logs de render se conservan (los más recientes). Se poda cada vez
+#: que se escribe uno nuevo: la carpeta existe para diagnosticar el último
+#: render, no como histórico permanente.
+RENDER_LOGS_KEEP = 300
+
+
+def prune_render_logs(keep=RENDER_LOGS_KEEP, directory=None):
+    """Borra los logs de render más antiguos y deja los ``keep`` más nuevos.
+
+    ``bin/logs/render_*.json`` crecía sin límite: cada render escribe un JSON
+    (una vez, al terminar) que nadie vuelve a leer desde la app. Medido en un
+    checkout de desarrollo tras meses de renders y de tests: **3109 ficheros /
+    21 MB**, en la carpeta que el usuario abre desde Preferences → Logs.
+
+    Se ordenan por nombre — el timestamp ``YYYYMMDD_HHMMSS`` es monotónico, así
+    que el orden alfabético es el cronológico (misma convención que
+    ``log_backup.rotate``) — y se conservan los más recientes, que son los que
+    sirven para diagnosticar el último render. No toca ningún otro fichero de
+    la carpeta (``app.log``, ``ffmpeg.log``, ``loudnorm.log``, ``backup/``) y
+    nunca lanza: devuelve cuántos borró.
+    """
+    try:
+        keep = max(0, int(keep))
+    except (TypeError, ValueError):
+        keep = 300
+    try:
+        log_dir = directory or get_logs_dir()
+        names = sorted(
+            name for name in os.listdir(log_dir)
+            if name.startswith("render_") and name.endswith(".json")
+        )
+    except Exception:
+        return 0
+    removed = 0
+    for name in names[: max(0, len(names) - keep)]:
+        try:
+            os.remove(os.path.join(log_dir, name))
+            removed += 1
+        except OSError:
             pass
     return removed
 
@@ -557,6 +620,28 @@ def compress_video(ffmpeg_path, input_path, output_path, settings,
         _cleanup_path(temp_output)
 
 
+def _preview_frame_candidates(frame_time):
+    """Instantes a probar para el frame del preview (el pedido va primero).
+
+    Devuelve el instante pedido, la mitad del clip y el principio, sin
+    repetidos. El seek de entrada de FFmpeg (``-ss`` antes de ``-i``) descarta
+    lo anterior al instante pedido: si el pedido cae en el hueco que va del
+    último frame codificado al final del clip, no hay ninguna imagen que sacar.
+    Reintentar en un instante anterior es más útil que devolver un error, y el
+    último recurso (t=0) siempre tiene frame porque el clip se acaba de
+    codificar.
+    """
+    candidates = []
+    for value in (frame_time, frame_time * 0.5, 0.0):
+        try:
+            value = round(max(0.0, float(value)), 3)
+        except (TypeError, ValueError):
+            value = 0.0
+        if value not in candidates:
+            candidates.append(value)
+    return candidates
+
+
 def generate_preview(ffmpeg_path, input_path, settings, progress_callback=None,
                      status_callback=None, abort_event=None, ai_engines=None,
                      inference_engines=None, on_process=None, on_processes=None,
@@ -714,22 +799,41 @@ def generate_preview(ffmpeg_path, input_path, settings, progress_callback=None,
         # Nunca pidamos un tiempo mayor que la duración real del clip.
         frame_time = min(frame_offset, clip_length - 0.1)
         compressed_frame = os.path.join(tmpdir, "compressed_frame.jpg")
-        ok_comp = extract_frame(
-            ffmpeg_path, compressed_path, frame_time, compressed_frame,
-            abort_event=abort_event, supervisor=supervisor,
-        )
-
-        original_time = start + frame_time
         original_frame = os.path.join(tmpdir, "original_frame.jpg")
-        ok_orig = extract_frame(
-            ffmpeg_path, input_path, original_time, original_frame,
-            abort_event=abort_event, supervisor=supervisor,
-        )
+        # Se prueban varios instantes, del pedido hacia atrás. Motivo medido: el
+        # ``-ss`` de entrada de FFmpeg descarta todo lo anterior al instante
+        # pedido, así que si cae DESPUÉS del último frame codificado del clip no
+        # decodifica nada y la extracción falla. En un clip de 1 s a 5 fps ese
+        # hueco final es de 0,2 s: de 30 previews, 6 fallaban (20%) con "Could
+        # not extract a frame from the compressed preview clip". Las dos imágenes
+        # (original y comprimida) se extraen en el MISMO instante: si no, el
+        # antes/después estaría comparando dos momentos distintos del video.
+        ok_comp = False
+        ok_orig = False
+        frame_time_used = frame_time
+        original_time = start + frame_time
+        for candidate in _preview_frame_candidates(frame_time):
+            original_time = start + candidate
+            if not extract_frame(
+                ffmpeg_path, compressed_path, candidate, compressed_frame,
+                abort_event=abort_event, supervisor=supervisor,
+            ):
+                ok_comp = False
+                continue
+            ok_comp = True
+            if extract_frame(
+                ffmpeg_path, input_path, original_time, original_frame,
+                abort_event=abort_event, supervisor=supervisor,
+            ):
+                ok_orig = True
+                frame_time_used = candidate
+                break
 
         if not ok_comp:
             raise RuntimeError("Could not extract a frame from the compressed preview clip.")
         if not ok_orig:
             raise RuntimeError(f"Could not extract the original frame at t={original_time:.2f}s.")
+        frame_time = frame_time_used
         if not os.path.exists(compressed_frame) or not os.path.exists(original_frame):
             raise RuntimeError("Generated frame files are missing.")
         if os.path.getsize(compressed_frame) == 0 or os.path.getsize(original_frame) == 0:
@@ -1259,6 +1363,36 @@ def compress_video_with_ai(
     pixel_fmt = settings.get("pixel_format", "yuv420p")
     extra_flags = settings.get("extra_video_flags", "")
 
+    # --- ¿Puede la cadena con ESTE vídeo? ---------------------------------
+    # Un paso que no puede procesar un frame del tamaño real que le va a
+    # llegar se corta AQUÍ, antes de arrancar hilos, subprocesos ni fases:
+    # antes se descubría en el frame 0, el motor se desactivaba, el render
+    # seguía (horas de GPU) y el vídeo salía sin el paso que el usuario pidió.
+    # Colocado antes del audio en paralelo, bloquear no deja nada a medias.
+    try:
+        validate_ai_chain_contract(engines, src.height, src.width, strict=True)
+    except AIChainUnusable as exc:
+        for _e in engines:
+            _reset = getattr(_e, "reset_cumulative_timing", None)
+            if callable(_reset):
+                try:
+                    _reset()  # los frames de la prueba no son del render
+                except Exception:
+                    pass
+        message = f"AI chain blocked: {exc}"
+        logger.error("%s (video %dx%d)", message, src.width, src.height)
+        if status_callback:
+            status_callback(f"\u26a0 {message}")
+        _cleanup_path(output_path)
+        raise
+    except RuntimeError as exc:
+        # Viola el contrato de frames (canales, tamaño...) pero el render puede
+        # seguir como hasta ahora: se avisa y la cadena degrada ese paso si
+        # falla de verdad, en vez de abortar el trabajo del usuario.
+        logger.warning("AI chain contract violation: %s", exc)
+        if status_callback:
+            status_callback(f"\u26a0 {exc}")
+
     # --- Fases (tasks panel) ---
     phase_labels = []
     phase_labels.append(("probe", "Analyzing video"))
@@ -1302,6 +1436,9 @@ def compress_video_with_ai(
                     status_callback=status_callback, phase_cb=phase_cb,
                     abort_event=abort_event,
                     supervisor=supervisor,
+                    # Junto al render, no en la unidad del sistema: mismo
+                    # criterio que el staging y el temporal del mux.
+                    staging_dir=os.path.dirname(os.path.abspath(output_path)),
                 )
             except Exception as exc:
                 audio_error[0] = exc
@@ -2138,7 +2275,31 @@ def _check_frame_contract(engine_id, frame, expected_shape=None):
     return frame
 
 
-def validate_ai_chain_contract(engines, src_h=None, src_w=None):
+class AIChainUnusable(RuntimeError):
+    """Un paso de la cadena no puede procesar los frames de ESTE vídeo.
+
+    Lo lanza el modo estricto del contrato de cadena cuando un motor falla con
+    un frame de prueba del tamaño real que le va a llegar. No es una caída
+    transitoria que el render pueda degradar con sentido: ese paso va a fallar
+    siempre. Caso real medido: un modelo exportado con entrada fija
+    (``Got: 576 Expected: 64``) que se auto-desactivaba en el frame 0 y dejaba
+    el render entero sin upscale. Ahora el render se bloquea antes de
+    decodificar, en vez de publicar un vídeo sin el paso que el usuario pidió.
+    """
+
+
+def _unusable_step_message(engine, frame, exc):
+    """Motivo accionable del bloqueo (motor, tamaño real y error del motor)."""
+    engine_id = getattr(engine, "engine_id", "?") or "?"
+    h, w = int(frame.shape[0]), int(frame.shape[1])
+    return (
+        f"AI step '{engine_id}' cannot process the {w}x{h} frames of this "
+        f"video ({type(exc).__name__}: {str(exc)[:200]}). Pick another model "
+        "for that step, or re-export the model with a dynamic input size."
+    )
+
+
+def validate_ai_chain_contract(engines, src_h=None, src_w=None, strict=False):
     """Probe the whole chain ONCE before the real render starts.
 
     Runs a small synthetic frame through every engine in chain order and
@@ -2152,25 +2313,43 @@ def validate_ai_chain_contract(engines, src_h=None, src_w=None):
     ``_apply_steps``), and interpolation-only engines are exercised
     through their dedicated ``interpolate_frame`` path when possible.
     Raises RuntimeError only for contract violations.
+
+    ``strict=True`` (lo usa el render real, con el tamaño del propio vídeo)
+    convierte ese "se salta" en ``AIChainUnusable``: un motor que no puede con
+    un frame del tamaño que le va a llegar no es una degradación tolerable,
+    es un render entero perdiendo su paso de IA. Cuesta un frame por paso, el
+    mismo que el render hace a continuación, y los motores ya desactivados
+    (``_failed``, que el render ignora de todas formas) no bloquean nada. Los
+    pasos de interpolación quedan fuera del modo estricto: su fallo se reporta
+    por frame y el vídeo conserva la cadencia A/V.
     """
     steps_antes, steps_despues, interp_step = _split_ai_chain(engines)
     h = int(src_h or 64)
     w = int(src_w or 64)
     probe = np.zeros((h, w, 3), dtype=np.uint8)
-    for _e in steps_antes:
+
+    def _probe_step(_e, frame):
+        if getattr(_e, "_failed", False):
+            # Ya está desactivada para el render: aquí no hay nada que decidir.
+            return frame
         scale = _engine_scale(_e)
-        expected = None if scale > 1 else probe.shape
+        expected = None if scale > 1 else frame.shape
         try:
-            out = _e.process_frame(probe)
-        except Exception:
-            continue  # runtime degradation path covers this engine
-        try:
-            probe = _check_frame_contract(
-                getattr(_e, "engine_id", "?"), out,
-                expected_shape=expected,
-            )
-        except RuntimeError:
-            raise
+            out = _e.process_frame(frame)
+        except Exception as exc:
+            if strict:
+                raise AIChainUnusable(
+                    _unusable_step_message(_e, frame, exc)
+                ) from exc
+            return frame  # el camino de degradación del render lo cubre
+        # Una violación de contrato sí se reporta siempre (no es degradación
+        # silenciosa): el motor devuelve frames que no son BGR/HWC válidos.
+        return _check_frame_contract(
+            getattr(_e, "engine_id", "?"), out, expected_shape=expected,
+        )
+
+    for _e in steps_antes:
+        probe = _probe_step(_e, probe)
     if interp_step is not None:
         try:
             interp_out = interp_step.interpolate_frame(probe, probe)
@@ -2180,19 +2359,7 @@ def validate_ai_chain_contract(engines, src_h=None, src_w=None):
         except Exception:
             pass  # interpolation errors already degrade gracefully at runtime
     for _e in steps_despues:
-        scale = _engine_scale(_e)
-        expected = None if scale > 1 else probe.shape
-        try:
-            out = _e.process_frame(probe)
-        except Exception:
-            continue
-        try:
-            probe = _check_frame_contract(
-                getattr(_e, "engine_id", "?"), out,
-                expected_shape=expected,
-            )
-        except RuntimeError:
-            raise
+        probe = _probe_step(_e, probe)
     return True
 
 
@@ -2417,9 +2584,20 @@ def _configure_gpu_post_for_chain(steps_antes, steps_despues, interp_step,
         from src.ai import gpu_post
         if not gpu_post.gpu_post_enabled():
             return report
+        # Ajuste de detalle ("best" por defecto = 1.0, la calidad de siempre).
+        # Sólo se aplica al ÚLTIMO paso de la cadena, que es el único que
+        # reescala al tamaño del encoder: reducir la entrada de un paso
+        # intermedio le cambiaría el tamaño al siguiente.
+        detail = gpu_post.get_detail_preference()
     except Exception as exc:
         logger.debug("gpu_post unavailable: %s", exc)
         return report
+
+    if detail < 1.0:
+        logger.info(
+            "gpu_post: detalle de entrada al modelo al %.0f%% (ajuste del "
+            "usuario; cambia la nitidez y el coste del upscale)", detail * 100,
+        )
 
     last_engine = _last_chain_stage(steps_antes, steps_despues, interp_step)
     chain = [e for e in (list(steps_antes) + list(steps_despues)) if e is not None]
@@ -2440,7 +2618,24 @@ def _configure_gpu_post_for_chain(steps_antes, steps_despues, interp_step,
                 target[0], target[1],
                 resize_fn=resize_fn if is_last else None,
                 input_size=(src_w, src_h),
+                in_scale=detail if is_last else 1.0,
             )
+        except TypeError as exc:
+            # Motor sin el ajuste de detalle: se le llama como antes (el
+            # detalle es opcional, no un requisito de la interfaz).
+            if "in_scale" not in str(exc):
+                result = {"active": False,
+                          "reason": f"error:{type(exc).__name__}: {exc}"}
+            else:
+                try:
+                    result = engine.configure_gpu_post(
+                        target[0], target[1],
+                        resize_fn=resize_fn if is_last else None,
+                        input_size=(src_w, src_h),
+                    )
+                except Exception as inner:
+                    result = {"active": False,
+                              "reason": f"error:{type(inner).__name__}: {inner}"}
         except Exception as exc:
             result = {"active": False,
                       "reason": f"error:{type(exc).__name__}: {exc}"}
@@ -2455,12 +2650,16 @@ def _configure_gpu_post_for_chain(steps_antes, steps_despues, interp_step,
             "reason": str(result.get("reason", "")),
         }
         for key in ("precision", "cuda_graph", "max_diff", "mean_diff",
-                    "converted", "cached", "out_size"):
+                    "converted", "cached", "out_size", "detail"):
             if key in result:
                 entry[key] = result[key]
-        detail = result.get("detail")
-        if detail:
-            entry["detail"] = str(detail)[:400]
+        # Ojo con el nombre: ``detail`` es la preferencia del usuario (el
+        # ajuste pedido) y NO se puede reutilizar aquí. Hacerlo sustituía el
+        # ajuste por lo que hubiera reportado el paso anterior y a partir del
+        # segundo paso de la cadena la preferencia se perdía en silencio.
+        reported_detail = result.get("detail")
+        if reported_detail:
+            entry["detail"] = str(reported_detail)[:400]
         report.append(entry)
 
         if status_callback:
@@ -2531,12 +2730,25 @@ def _fps_string_to_float(value):
 
 
 def _save_render_log(path, entry):
-    """Guarda un log JSON del render actual. Silencia errores de escritura."""
+    """Guarda un log JSON del render actual. Silencia errores de escritura.
+
+    Tras escribir, poda los logs más antiguos de esa misma carpeta
+    (``prune_render_logs``): es el único sitio que crea logs de render, así que
+    la política de retención vive junto a su causa. Purgarlos en el arranque de
+    la GUI parecía más natural, pero esa ruta también la recorren los tests y
+    los subprocesos de diagnóstico, que no tienen por qué tocar la carpeta del
+    usuario.
+    """
     try:
         with open(path, "w", encoding="utf-8") as f:
             json.dump(entry, f, indent=2, default=str)
     except Exception as exc:
         logger.warning("Could not write render log %s: %s", path, exc)
+        return
+    try:
+        prune_render_logs(directory=os.path.dirname(os.path.abspath(path)))
+    except Exception:
+        pass
 
 
 def _audio_mux_args(audio_codec, loudnorm_meas, audio_boost, container_format="mp4",
@@ -2578,13 +2790,20 @@ def _audio_mux_args(audio_codec, loudnorm_meas, audio_boost, container_format="m
 
 def _encode_audio_parallel(ffmpeg_path, input_path, settings,
                            status_callback=None, phase_cb=None, abort_event=None,
-                           supervisor: ProcessSupervisor | None = None):
+                           supervisor: ProcessSupervisor | None = None,
+                           staging_dir: str | None = None):
     """Codifica la pista de audio COMPLETA a un archivo temporal.
 
     Corre en un hilo daemon mientras el vídeo se renderiza con la GPU.
     Devuelve la ruta del archivo temporal (con codec y loudnorm ya
     aplicados) o ``None`` si no procede / falla. El caller limpia el
     archivo con ``os.remove``.
+
+    ``staging_dir`` (opcional) coloca ese temporal junto al render, como
+    el resto del staging: sin él cae en ``%TEMP%`` y el audio completo se
+    escribiría en la unidad del sistema aunque el usuario renderice a
+    otra (y si esa unidad no tiene espacio, se perdería el encode en
+    paralelo). El caller real pasa la carpeta del render.
 
     El extension se elige según el codec final para que el mux del
     contenedor destino pueda copiar la pista sin re-encodear.
@@ -2632,7 +2851,22 @@ def _encode_audio_parallel(ffmpeg_path, input_path, settings,
     else:
         ext = ".m4a"
 
-    tmp_fd, tmp_path = tempfile.mkstemp(prefix=".drag-audio-", suffix=ext)
+    tmp_dir = None
+    if staging_dir:
+        try:
+            candidate = os.path.abspath(str(staging_dir))
+            if os.path.isdir(candidate):
+                tmp_dir = candidate
+        except Exception:
+            tmp_dir = None
+    try:
+        tmp_fd, tmp_path = tempfile.mkstemp(
+            prefix=".drag-audio-", suffix=ext, dir=tmp_dir,
+        )
+    except Exception:
+        # Si el destino no admite el temporal (permisos, unidad llena) el
+        # encode paralelo degrada a %TEMP% en vez de quedarse sin audio.
+        tmp_fd, tmp_path = tempfile.mkstemp(prefix=".drag-audio-", suffix=ext)
     try:
         os.close(tmp_fd)
     except Exception:
@@ -2840,10 +3074,18 @@ def _mux_audio(ffmpeg_path, input_path, output_path, audio_codec="copy",
 
     Uses ``ffmpeg -i upscaled.{ext} -i original.mp4 -map 0:v -map 1:a
     -c:v copy -c:a copy -shortest`` to avoid re-encoding audio. The
-    temp output uses ``tempfile.mkstemp`` with the same extension as
-    the destination container: previously the code hardcoded ``.mp4``
-    even when the user selected ``.mkv`` / ``.avi`` / ``.webm``,
-    which caused muxer-internal ``Invalid argument`` errors.
+    temp output keeps the same extension as the destination container:
+    previously the code hardcoded ``.mp4`` even when the user selected
+    ``.mkv`` / ``.avi`` / ``.webm``, which caused muxer-internal
+    ``Invalid argument`` errors.
+
+    El temporal se crea **junto al destino** (``_make_temp_output_path``),
+    nunca en ``%TEMP%``. Eso es lo que hace atómico el ``os.replace`` final
+    y lo que evita el fallo real medido: con el temporal en la unidad del
+    sistema y la salida en otra unidad (D:, E:, NAS), el ``replace`` moría
+    con ``WinError 17`` (cross-device) y tiraba el vídeo entero ya
+    procesado. De paso, ya no se escribe una copia completa del vídeo en
+    la unidad del sistema.
 
     ``audio_file`` (optional) is a pre-encoded audio track (produced in
     parallel by ``_encode_audio_parallel``); when given it is used as
@@ -2857,21 +3099,15 @@ def _mux_audio(ffmpeg_path, input_path, output_path, audio_codec="copy",
     out_ext = os.path.splitext(output_path)[1] or ".mp4"
     # Track temp path so el finally global lo limpia en TODA ruta de
     # salida (rc != 0, excepción, abort, input sin audio). Sin esto,
-    # los ``.mux-*`` quedan en la carpeta del usuario si cualquier
-    # rama escapa la limpieza explícita.
+    # los ``.draggy-render-*`` quedan en la carpeta del usuario si
+    # cualquier rama escapa la limpieza explícita.
     cleanup_path = None
     try:
         try:
-            tmp_fd, tmp_out = tempfile.mkstemp(
-                prefix=".mux-", suffix=out_ext,
-            )
+            tmp_out = _make_temp_output_path(output_path)
             cleanup_path = tmp_out
-            try:
-                os.close(tmp_fd)
-            except Exception:
-                pass
         except Exception:
-            # Fallback a un nombre fijo si mkstemp falla (raro en Win).
+            # Fallback a un nombre fijo si el helper falla (raro en Win).
             tmp_out = output_path + ".mux" + out_ext
             cleanup_path = tmp_out
 

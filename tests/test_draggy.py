@@ -1651,6 +1651,51 @@ def test_preferences_dialog_diagnostics_tab(qapp, monkeypatch):
         dialog.close()
 
 
+def test_preferences_detail_selector_needs_gpu_post(qapp, monkeypatch):
+    """El ajuste de detalle se deshabilita (y se explica) sin post-proceso GPU.
+
+    Caso real: la lista ofrecía "Fast (0.6x, ~2x fps)" con el post-proceso en
+    GPU apagado, que es el default. Elegirlo guardaba la preferencia pero no
+    cambiaba ni un frame: la reducción de la entrada al modelo la hace el
+    grafo envuelto (ONNX + GPU post), y en un motor PyTorch no se aplica
+    nunca. La interfaz no puede ofrecer un ajuste que no va a hacer nada.
+    """
+    from src.ui import preferences_dialog as pd
+    from src import preferences as prefs
+
+    real_get = prefs.get
+
+    def fake_get(key, default=None):
+        if key == pd._GPU_POST_KEY:
+            return False
+        if key == pd._DETAIL_KEY:
+            return "fast"  # el valor que antes se guardaba sin efecto alguno
+        return real_get(key, default)
+
+    monkeypatch.setattr(prefs, "get", fake_get)
+
+    dialog = pd.PreferencesDialog()
+    try:
+        # Sin post-proceso en GPU: selector apagado, pero el valor guardado no
+        # se pierde y la nota dice por qué.
+        assert dialog.chk_gpu_post.isChecked() is False
+        assert dialog.cmb_detail.isEnabled() is False
+        assert dialog.cmb_detail.currentData() == "fast"
+        assert dialog.lbl_detail_note.isHidden() is False
+        assert "GPU post-processing" in dialog.lbl_detail_note.text()
+
+        # Al marcarlo, el ajuste pasa a ser elegible.
+        dialog.chk_gpu_post.setChecked(True)
+        assert dialog.cmb_detail.isEnabled() is True
+
+        # Y volver a desmarcarlo no debe dejar el selector mintiendo.
+        dialog.chk_gpu_post.setChecked(False)
+        assert dialog.cmb_detail.isEnabled() is False
+        assert dialog.cmb_detail.currentData() == "fast"
+    finally:
+        dialog.close()
+
+
 def test_preferences_dialog_about_tab(qapp):
     """La pestaña About muestra versión, arquitectura y enlaces al repo/issues."""
     from src.ui import preferences_dialog as pd
@@ -8980,3 +9025,90 @@ def test_al_terminar_la_vista_previa_se_libera_el_id_y_se_avisa_si_no_hubo_cierr
         ventana._preview_task_id = None
         phase_writer.take_unwritten()
         phase_writer.flush(timeout=10)
+
+
+def test_startup_cleanup_removes_staging_left_beside_the_render(tmp_path,
+                                                              monkeypatch):
+    """El arranque limpia los restos que el usuario ve junto a sus vídeos.
+
+    ``cleanup_stale_staging`` miraba solo %TEMP% mientras el staging se crea
+    junto al destino, así que un render interrumpido dejaba su
+    ``.draggy-render-*`` en la carpeta de salida para siempre. La ventana ahora
+    le pasa esas carpetas (la suya y las de la cola de renders).
+    """
+    import time as _time
+
+    import src.task_queue as tq
+    from src.ui.main_window import MainWindow
+
+    monkeypatch.setattr(tq, "_path", lambda: str(tmp_path / "queue.json"))
+    salida = tmp_path / "renders"
+    salida.mkdir()
+    en_cola_dir = tmp_path / "otra_carpeta"
+    en_cola_dir.mkdir()
+
+    def _viejo(path):
+        path.write_bytes(b"x")
+        os.utime(path, (_time.time() - 7200,) * 2)
+        return path
+
+    resto_salida = _viejo(salida / ".draggy-render-interrumpido.mp4")
+    resto_cola = _viejo(en_cola_dir / ".drag-audio-interrumpido.m4a")
+    tq.enqueue(name="x.mp4", input_path="/in/x.mp4",
+               output_path=str(en_cola_dir / "x.mp4"), settings={})
+
+    mw = MainWindow.__new__(MainWindow)
+    mw.output_dir = str(salida)
+    mw.tasks_panel = type("_Panel", (), {
+        "rebuild_queue": lambda self, items: None,
+    })()
+    mensajes = []
+    mw._on_status_message = mensajes.append
+
+    mw._load_task_queue()
+
+    assert not resto_salida.exists(), "no se limpió el resto junto al render"
+    assert not resto_cola.exists(), "no se limpió la carpeta de un render en cola"
+    assert any("abandoned" in str(m) for m in mensajes), mensajes
+
+
+def test_worker_reports_the_blocked_chain_reason_to_the_user(tmp_path,
+                                                            monkeypatch):
+    """Un render bloqueado por un paso IA inutilizable lo dice, con el motivo.
+
+    El pipeline lanza ``AIChainUnusable``; el worker tiene que convertir ese
+    fallo en el ``error_message`` que la ventana muestra en el diálogo, con el
+    modelo y el tamaño reales, y no en un "Render failed" genérico.
+    """
+    import src.ui.main_window as mwmod
+    from src.processing.pipeline import AIChainUnusable
+
+    monkeypatch.setattr(mwmod, "validate_render_preflight", lambda *a, **k: [])
+    monkeypatch.setattr(
+        mwmod.CompressionWorker, "_build_ai_chain",
+        lambda self, status_cb: ([object()], ["Upscale"]),
+    )
+
+    def _blocked(*args, **kwargs):
+        raise AIChainUnusable(
+            "AI step 'upscale-realesrgan-x4plus' cannot process the 768x576 "
+            "frames of this video (Got invalid dimensions: Expected: 64)."
+        )
+
+    monkeypatch.setattr(mwmod, "compress_video_with_ai", _blocked)
+
+    entrada = tmp_path / "in.mp4"
+    entrada.write_bytes(b"x")
+    worker = mwmod.CompressionWorker(
+        "ffmpeg", str(entrada), str(tmp_path / "out.mp4"),
+        {"codec": "libx264", "audio": "noaudio", "format": "mp4"},
+        mode="compress",
+        ai_engines={"Upscale": {"engine_id": "upscale-realesrgan-x4plus"}},
+    )
+    worker.run()
+
+    assert worker.success is False
+    assert "upscale-realesrgan-x4plus" in worker.error_message
+    assert "768x576" in worker.error_message
+    assert "Expected: 64" in worker.error_message
+

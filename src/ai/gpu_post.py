@@ -51,6 +51,26 @@ GPU_POST_PREF = "gpu_post_process"
 #: Preferencia de precisión de inferencia: "model" | "fp16" | "fp32".
 PRECISION_PREF = "inference_precision"
 
+#: Preferencia de detalle del upscale: cuánta resolución de la fuente entra al
+#: modelo. Es el ÚNICO ajuste que cambia el coste de la inferencia, porque el
+#: coste del modelo es proporcional a los píxeles de entrada (medido: 274 GMAC
+#: fijos por frame a 768x576, lineales con el área).
+#:
+#: "best" (por defecto) = 1.0: el modelo ve el frame completo. Es lo de
+#: siempre y no se toca. Los otros dos existen porque medido en una RTX 3060
+#: con RealESR AnimeVideo v3 (768x576 -> x4 -> 960x720):
+#:   1.00 -> 54.3 ms/frame (18,4 fps)
+#:   0.80 -> 35.0 ms/frame (28,5 fps)  1,55x
+#:   0.60 -> ~19,5 ms/frame (~49 fps)  2,7x
+#: El precio se midió también, y no es pequeño: a 0,80 la imagen final se
+#: separa de la de 1,00 en 19,6 niveles de media (48x48 bloques) y la nitidez
+#: medida cae de 236 a 159. NO es un ajuste inocuo: el modelo ve menos detalle
+#: de la fuente y lo sustituye por lo que su prior sabe de dibujos animados.
+DETAIL_PREF = "upscale_detail"
+
+#: Niveles con nombre -> factor de resolución de entrada al modelo.
+DETAIL_LEVELS = {"best": 1.0, "balanced": 0.8, "fast": 0.6}
+
 #: Tolerancias de la autocomprobación (escala 0..255). No buscan igualdad bit a
 #: bit (el reescalado de la GPU usa otro filtro que PIL) sino detectar un
 #: grafo roto: canales invertidos, escala mal aplicada o dtype incorrecto.
@@ -81,6 +101,67 @@ def gpu_post_enabled() -> bool:
         return bool(preferences.get(GPU_POST_PREF, False))
     except Exception:
         return False
+
+
+def get_detail_preference() -> float:
+    """Factor de resolución que entra al modelo: 1.0 = calidad máxima.
+
+    Acepta los niveles con nombre (``"best"``/``"balanced"``/``"fast"``) o
+    un número directo. Cualquier valor raro cae a 1.0: nunca se degrada la
+    calidad por un ajuste mal escrito.
+    """
+    try:
+        import src.preferences as preferences
+        raw = preferences.get(DETAIL_PREF, "best")
+    except Exception:
+        return 1.0
+    if isinstance(raw, bool):
+        return 1.0
+    if isinstance(raw, (int, float)):
+        return min(1.0, max(MIN_DETAIL, float(raw)))
+    return DETAIL_LEVELS.get(str(raw or "").strip().lower(), 1.0)
+
+
+#: Por debajo de esto el modelo ve tan poco que deja de ser un upscale.
+MIN_DETAIL = 0.35
+
+
+def scale_input_size(input_size, factor: float):
+    """Tamaño (w, h) al que se reduce la entrada del modelo, par y >= 8 px."""
+    try:
+        width, height = int(input_size[0]), int(input_size[1])
+    except (TypeError, IndexError, ValueError):
+        return None
+    if width <= 0 or height <= 0:
+        return None
+    factor = min(1.0, max(MIN_DETAIL, float(factor or 1.0)))
+    out_w = max(8, int(round(width * factor / 2.0)) * 2)
+    out_h = max(8, int(round(height * factor / 2.0)) * 2)
+    if out_w >= width and out_h >= height:
+        return None
+    return out_w, out_h
+
+
+def resize_frame(frame, width: int, height: int):
+    """Reescalado de un frame BGR uint8 con el mismo filtro que el pipeline.
+
+    Lo usa la autocomprobación para construir la referencia del camino
+    clásico a la MISMA escala que el grafo (si no, compararía dos imágenes
+    deliberadamente distintas y rechazaría el ajuste sin motivo).
+    """
+    width, height = int(width), int(height)
+    try:
+        from PIL import Image as _PILImage
+
+        resized = np.asarray(_PILImage.fromarray(frame).resize(
+            (width, height), _PILImage.Resampling.BILINEAR))
+    except Exception:
+        rows = np.linspace(0, frame.shape[0] - 1, height, dtype=int)
+        cols = np.linspace(0, frame.shape[1] - 1, width, dtype=int)
+        resized = frame[rows[:, None], cols[None, :], :]
+    if resized.ndim == 2:
+        resized = resized[..., None].repeat(3, axis=2)
+    return resized
 
 
 def get_precision_preference() -> str:
@@ -261,6 +342,15 @@ def build_wrapped_model(src_path: str, out_size=None,
             (para engines intermedios de una cadena: solo se hace el
             pre/post-proceso, que es lo caro).
         precision: ``"model"`` (tal cual), ``"fp16"`` o ``"fp32"``.
+
+    El ajuste de detalle (``DETAIL_LEVELS``) NO se hace aquí: la reducción de
+    la entrada la aplica la engine con ``resize_frame`` antes de llamar al
+    grafo. Dentro del grafo se probó y se descartó: el Resize de la GPU no
+    antialiasa al reducir y PIL sí, así que la autocomprobación comparaba dos
+    filtros distintos y rechazaba el ajuste (medido: 50 niveles de diferencia
+    contra una tolerancia de 32, y con un canal desplazado 26). Con la
+    reducción fuera del grafo, los dos caminos que se comparan usan el MISMO
+    filtro y la comprobación vuelve a medir lo que tiene que medir.
 
     Returns:
         ``(ruta_del_modelo_derivado | None, info)``. ``info`` siempre trae

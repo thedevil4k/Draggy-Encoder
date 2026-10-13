@@ -197,8 +197,13 @@ class AIInferenceEngine:
 
     # --------------------------------------------------------- post GPU (P1)
     def configure_gpu_post(self, width=None, height=None, resize_fn=None,
-                           input_size=None) -> dict:
+                           input_size=None, in_scale=None) -> dict:
         """Activa el pre/post-proceso en GPU si el usuario lo pidió (P1).
+
+        ``in_scale`` es el ajuste de detalle (1.0 = calidad máxima): cuánta
+        resolución de la fuente entra al modelo. Es opcional; los motores que
+        no lo aplican deben decirlo en su informe (``detail``) en vez de
+        fingir que lo hicieron.
 
         Devuelve ``{"active": bool, "reason": str, ...}``. La implementación
         por defecto no ofrece este camino; las subclases que sí lo soportan lo
@@ -694,6 +699,15 @@ class ONNXRUNTIMEInferenceEngine(AIInferenceEngine):
             self.disable_gpu_post()
             return self.process_frame(frame)
 
+        # Ajuste de detalle: se reduce la entrada al modelo con el filtro del
+        # pipeline (PIL BILINEAR / numpy). Cuesta ~1,5 ms de CPU por frame a
+        # 768x576, y devuelve 20-40 ms de inferencia en este equipo.
+        detail_size = state.get("detail_size")
+        if detail_size:
+            from src.ai import gpu_post as _gp
+
+            frame = _gp.resize_frame(frame, detail_size[0], detail_size[1])
+
         t_pre = time.perf_counter()
         input_data = frame[None, ...]
         t_run = time.perf_counter()
@@ -731,7 +745,7 @@ class ONNXRUNTIMEInferenceEngine(AIInferenceEngine):
         return ort.InferenceSession(model_path, providers=providers)
 
     def configure_gpu_post(self, width=None, height=None, resize_fn=None,
-                           input_size=None) -> dict:
+                           input_size=None, in_scale=None) -> dict:
         """Construye y valida el grafo con cabeza/cola (P1).
 
         Devuelve ``{"active": bool, "reason": str, ...}``. Sólo se activa si:
@@ -739,6 +753,13 @@ class ONNXRUNTIMEInferenceEngine(AIInferenceEngine):
           - hay CUDA activo,
           - el grafo derivado se construye, se ejecuta y su salida coincide
             con el camino actual dentro de tolerancia.
+
+        ``in_scale`` (1.0 por defecto, o la preferencia de detalle) reduce la
+        entrada que ve el modelo: es el único ajuste que cambia el coste de la
+        inferencia y su precio en calidad está medido (ver
+        ``gpu_post.DETAIL_LEVELS``). Cuando se usa, la autocomprobación compara
+        contra el camino clásico A LA MISMA ESCALA: si comparara contra el
+        camino de escala completa rechazaría el ajuste por diseño, no por roto.
 
         Cualquier fallo devuelve ``active=False`` con el motivo, y el render
         continúa con el camino de siempre.
@@ -757,6 +778,11 @@ class ONNXRUNTIMEInferenceEngine(AIInferenceEngine):
             in_h, in_w = int(input_size[1]), int(input_size[0])
         if in_h <= 0 or in_w <= 0:
             return {"active": False, "reason": "input-size-unknown"}
+
+        if in_scale is None:
+            in_scale = gpu_post.get_detail_preference()
+        detail = min(1.0, max(gpu_post.MIN_DETAIL, float(in_scale or 1.0)))
+        detail_size = gpu_post.scale_input_size((in_w, in_h), detail)
 
         source = getattr(self, "_session_model_path", self.model_path)
         target = None
@@ -788,12 +814,23 @@ class ONNXRUNTIMEInferenceEngine(AIInferenceEngine):
                     "detail": f"{type(exc).__name__}: {exc}"}
 
         frames = gpu_post.sample_frames(in_h, in_w)
+        # Ajuste de detalle: la reducción la hace la ENGINE, fuera del grafo,
+        # con el mismo filtro que usa la referencia. Así la autocomprobación
+        # sigue midiendo el grafo (canales, escala, dtype) y no el ajuste que
+        # el usuario pidió a propósito.
+        state["detail"] = detail
+        state["detail_size"] = detail_size
+
+        def _scaled(fr):
+            if detail_size:
+                return gpu_post.resize_frame(fr, detail_size[0], detail_size[1])
+            return fr
 
         def fast(fr):
-            return self._run_with_state(state, fr)
+            return self._run_with_state(state, _scaled(fr))
 
         def reference(fr):
-            out = self.process_frame(fr)
+            out = self.process_frame(_scaled(fr))
             if target and resize_fn:
                 if (out.shape[1], out.shape[0]) != target:
                     out = resize_fn(out, target[0], target[1])
@@ -814,8 +851,9 @@ class ONNXRUNTIMEInferenceEngine(AIInferenceEngine):
         # Los frames de la autocomprobación no son frames del render.
         self.reset_cumulative_timing()
         logger.info(
-            "gpu_post: ACTIVO (%s, salida %s, coarse_diff %.2f, channel_diff "
-            "%.2f, max_diff %.1f)", self._precision, target or "sin resize",
+            "gpu_post: ACTIVO (%s, salida %s, detalle %.2f, coarse_diff %.2f, "
+            "channel_diff %.2f, max_diff %.1f)", self._precision,
+            target or "sin resize", detail,
             details.get("worst_coarse", 0.0), details.get("worst_channel", 0.0),
             details.get("worst_max", 0.0),
         )
@@ -823,6 +861,7 @@ class ONNXRUNTIMEInferenceEngine(AIInferenceEngine):
             "active": True,
             "reason": "ok",
             "precision": self._precision,
+            "detail": round(detail, 3),
             "out_size": target,
             "max_diff": round(float(details.get("worst_max", 0.0)), 2),
             "mean_diff": round(float(details.get("worst_mean", 0.0)), 3),
@@ -1097,16 +1136,26 @@ class PyTorchInferenceEngine(AIInferenceEngine):
         return output
 
     def configure_gpu_post(self, width=None, height=None, resize_fn=None,
-                           input_size=None) -> dict:
+                           input_size=None, in_scale=None) -> dict:
         """Reescalado en la GPU dentro del propio motor PyTorch (P1).
 
         Aquí no hay grafo que envolver: la conversión a uint8 ya se hacía en
         la tarjeta, así que lo único que se mueve es el reescalado final. Se
         valida igual que en ONNX (comparación contra el camino actual) antes
         de darlo por bueno.
+
+        ``in_scale`` (ajuste de detalle) NO se aplica en este motor: aquí el
+        coste lo manda el propio modelo de PyTorch y no hay grafo envuelto que
+        reducir. Se informa ``detail: 1.0`` para que el log del render diga la
+        verdad en vez de dar por hecho algo que no se hizo.
         """
         from src.ai import gpu_post
 
+        if in_scale is not None and float(in_scale) < 1.0:
+            logger.info(
+                "gpu_post (torch): el ajuste de detalle no se aplica en este "
+                "motor; se mantiene la resolución completa del modelo"
+            )
         if not gpu_post.gpu_post_enabled():
             return {"active": False, "reason": "preference-off"}
         if not self._loaded or self._model is None:
@@ -1145,7 +1194,7 @@ class PyTorchInferenceEngine(AIInferenceEngine):
                     details.get("worst_mean", 0.0))
         return {
             "active": True, "reason": "ok", "precision": self._precision_pref,
-            "out_size": target, "cuda_graph": False,
+            "out_size": target, "cuda_graph": False, "detail": 1.0,
             "max_diff": round(float(details.get("worst_max", 0.0)), 2),
             "mean_diff": round(float(details.get("worst_mean", 0.0)), 3),
         }

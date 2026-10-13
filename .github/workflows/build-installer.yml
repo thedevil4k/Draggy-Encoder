@@ -230,6 +230,26 @@ jobs:
             }
           }
 
+      # La suite de tests (1000+) sólo se ejecutaba a mano: el CI validaba
+      # imports, el selftest del EXE y el empaquetado, pero ningún test. Así
+      # vivió escondido un fallo real: dos tests que fallaban y, además, un
+      # segfault de CPython al imprimir su traceback, que ocultaba el fallo
+      # detrás del crash (``pytest tests/`` nunca llegaba al final).
+      #
+      # Va DESPUÉS del build del EXE para que la instalación de pytest no
+      # pueda influir en el análisis de PyInstaller, y NO bloquea el
+      # empaquetado todavía (`continue-on-error`): el runner limpio no tiene
+      # ffmpeg ni torch, así que hay que ver un run verde aquí antes de
+      # convertirlo en un gate. Los tests que necesitan esos runtimes se
+      # saltan solos (``pytest.importorskip``).
+      - name: Run test suite (observation mode)
+        continue-on-error: true
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: |
+          python -m pip install pytest
+          python -m pytest tests/ -q
+
       - name: Install Inno Setup
         run: choco install innosetup --yes --no-progress
 

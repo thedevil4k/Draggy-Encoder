@@ -67,6 +67,54 @@ def qapp():
     return app
 
 
+@pytest.fixture(autouse=True, scope="session")
+def isolated_logs_dir(tmp_path_factory):
+    """Redirige la carpeta de logs (``bin/logs``) a un temporal del test.
+
+    Dos motivos, los dos medidos en un checkout real:
+
+    * Los tests que lanzan un render escribian el ``render_*.json`` de verdad
+      en ``bin/logs``: **3109 ficheros / 21 MB**, casi todos de ejecuciones de
+      pytest, en la carpeta que el usuario abre desde Preferences -> Logs.
+    * Los logs de render se podan por antiguedad al escribir uno nuevo. Sin
+      aislar, un test que renderiza PODARIA los logs reales del desarrollador.
+
+    Es autouse (y de sesion) a proposito: cualquier test puede renderizar sin
+    saberlo, asi que el aislamiento tiene que ser la tonica y no una decision
+    que cada test tenga que recordar. Los tests que necesitan una carpeta
+    propia siguen parcheando ``get_logs_dir`` como hasta ahora (el monkeypatch
+    de cada test gana mientras dura el test).
+    """
+    logs = str(tmp_path_factory.mktemp("logs"))
+    mp = pytest.MonkeyPatch()
+    # ``get_logs_dir`` se parchea en cada módulo que lo captura al importarse
+    # (``from src.config import get_logs_dir``): los que lo importan dentro de
+    # una función ya quedan cubiertos por ``src.config``, pero estos lo miran a
+    # nivel de módulo y son los que ESCRIBEN de verdad en la carpeta
+    # (app.log, informes de crash, backup/, avisos de actualización).
+    import src.config as _config
+    import src.crash_report as _crash_report
+    import src.log_backup as _log_backup
+    import src.processing.pipeline as _pipeline
+    import src.ui.dependencies_dialog as _dependencies_dialog
+    import src.ui.preferences_dialog as _preferences_dialog
+
+    for module in (_config, _crash_report, _log_backup, _pipeline,
+                   _dependencies_dialog, _preferences_dialog):
+        mp.setattr(module, "get_logs_dir", lambda: logs, raising=False)
+    # Estos tres calculan la carpeta con os.path.join(get_bin_dir(), "logs").
+    import src.ffmpeg.codec_tester as _codec_tester
+    import src.ffmpeg.loudnorm as _loudnorm
+    import src.ffmpeg.runner as _runner
+
+    for module in (_codec_tester, _loudnorm, _runner):
+        mp.setattr(module, "_log_dir", lambda: logs, raising=False)
+    try:
+        yield logs
+    finally:
+        mp.undo()
+
+
 @pytest.fixture()
 def isolated_runtime(tmp_path_factory, monkeypatch):
     """Store de runtimes temporal y sin red, para tests de instalación.

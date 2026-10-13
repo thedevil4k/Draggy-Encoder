@@ -83,6 +83,10 @@ _INSECURE_CHECKPOINT_KEY = "allow_insecure_checkpoint_load"
 # Rendimiento de IA (P1/P2): post-proceso en GPU + precisión de inferencia.
 _GPU_POST_KEY = "gpu_post_process"
 _PRECISION_KEY = "inference_precision"
+# Detalle de entrada al modelo de upscale ("best" | "balanced" | "fast").
+# Es el único ajuste que cambia el coste de la inferencia y su precio en
+# calidad está medido; "best" (=1.0) es el comportamiento de siempre.
+_DETAIL_KEY = "upscale_detail"
 
 
 # ---------------------------------------------------------------------------
@@ -357,7 +361,7 @@ class PreferencesDialog(QDialog):
         # --------- Section: AI performance (P1 + P2) ---------
         perf_group = self._build_section(
             "AI performance",
-            "Dos ajustes independientes, los dos apagados/conservadores por "
+            "Tres ajustes, los dos primeros apagados/conservadores por "
             "defecto.\n\n"
             "GPU post-processing: mueve a la tarjeta gráfica el trabajo que "
             "hoy hace el procesador DESPUÉS de la IA (pasar el resultado a "
@@ -372,7 +376,21 @@ class PreferencesDialog(QDialog):
             "siempre). 'FP16' calcula a media precisión y 'FP32' fuerza "
             "precisión completa. En el backend ONNX la ganancia de FP16 se "
             "aprovecha sobre todo CON GPU post-processing activado; en "
-            "PyTorch ya se usa media precisión por defecto.",
+            "PyTorch ya se usa media precisión por defecto.\n\n"
+            "Upscale input detail: cuánta resolución de la fuente ve el modelo "
+            "de upscaling. 'Best' es 1:1 y es lo de siempre. Bajarlo reduce los "
+            "píxeles que procesa el modelo (su coste es proporcional a ellos) "
+            "y por tanto acelera, pero la imagen CAMBIA: con menos detalle el "
+            "resultado depende más de lo que el modelo se inventa. Medido en un "
+            "render real (RTX 3060, RealESR AnimeVideo v3, 768x576 -> x4 -> "
+            "960x720, HEVC/NVENC): Best 61,1 ms por frame (16,4 fps) y Balanced "
+            "46,5 ms (21,5 fps, +31%). A 0,80 la diferencia media por bloques de "
+            "48x48 es de 19,6 niveles sobre 255 y la nitidez medida cae de 236 a "
+            "159, así que es un cambio visible: no es un ajuste gratis.\n\n"
+            "IMPORTANTE: el detalle lo aplica el grafo del post-proceso en GPU, "
+            "así que sin 'GPU post-processing' (y en motores PyTorch, que no "
+            "reducen la entrada) el modelo ve el frame completo y el ajuste no "
+            "cambia nada. El selector se deshabilita mientras no tenga efecto.",
         )
         perf_group_layout = perf_group.layout()
         self.chk_gpu_post = QCheckBox(
@@ -406,6 +424,54 @@ class PreferencesDialog(QDialog):
         precision_row.addWidget(self.cmb_precision)
         precision_row.addStretch()
         perf_group_layout.addLayout(precision_row)
+
+        detail_row = QHBoxLayout()
+        detail_row.setSpacing(8)
+        detail_label = QLabel("Upscale input detail:")
+        detail_label.setStyleSheet("color: #a0a0b0; font-size: 11px;")
+        detail_row.addWidget(detail_label)
+        self.cmb_detail = QComboBox()
+        self.cmb_detail.addItem("Best (full source detail)", "best")
+        self.cmb_detail.addItem("Balanced (0.8x, +31% fps)", "balanced")
+        self.cmb_detail.addItem("Fast (0.6x, ~2x fps)", "fast")
+        self.cmb_detail.setMinimumWidth(240)
+        self.cmb_detail.setToolTip(
+            "SOLO se aplica con 'GPU post-processing' activado (arriba) y en\n"
+            "motores ONNX: sin él, el modelo ve siempre el frame completo y\n"
+            "elegir 'Balanced' o 'Fast' no cambia nada.\n"
+            "\n"
+            "Cuánta resolución de la fuente entra al modelo de upscaling.\n"
+            "  Best (por defecto): 1:1, la calidad de siempre. No cambia nada.\n"
+            "  Balanced: el modelo ve el 80% de la resolución. En un render real\n"
+            "            (RTX 3060, AnimeVideo v3, 768x576 -> x4 -> 960x720)\n"
+            "            pasa de 16,4 a 21,5 fps (+31%), pero la imagen cambia:\n"
+            "            diferencia media de 19,6 niveles sobre 255 por bloques\n"
+            "            de 48x48 y nitidez medida de 236 -> 159.\n"
+            "  Fast: el modelo ve el 60%. La inferencia pasa de 54,4 a 19,5 ms\n"
+            "        (unas 2x de fps en el render), con bastante menos detalle\n"
+            "        real: se nota que es el modelo el que rellena.\n"
+            "Es el único ajuste que cambia el coste de la inferencia: el resto\n"
+            "(precisión, provider) apenas lo mueve. La reducción la hace la CPU\n"
+            "(unos 4,7 ms por frame), ya descontados de las cifras."
+        )
+        detail_row.addWidget(self.cmb_detail)
+        detail_row.addStretch()
+        perf_group_layout.addLayout(detail_row)
+
+        # El detalle NO surte efecto por sí solo: la reducción de la entrada la
+        # hace el grafo envuelto del post-proceso en GPU (``gpu_post``), y sin esa
+        # casilla marcada ningún motor la aplica. Se dice en la propia fila y se
+        # deshabilita el selector: antes se podía elegir "Fast (0.6x, ~2x fps)"
+        # con el post-proceso apagado -- el caso por defecto -- y el ajuste se
+        # guardaba sin tocar ni un frame, sin que nada lo advirtiera.
+        self.lbl_detail_note = QLabel(
+            "Requires 'GPU post-processing' (above) and an ONNX engine. "
+            "Without it the model always sees the full-resolution frame."
+        )
+        self.lbl_detail_note.setWordWrap(True)
+        self.lbl_detail_note.setStyleSheet("color: #ffb74d; font-size: 11px;")
+        perf_group_layout.addWidget(self.lbl_detail_note)
+        self.chk_gpu_post.toggled.connect(self._sync_detail_availability)
         layout.addWidget(perf_group)
 
         # --------- Section: Checkpoint security ---------
@@ -829,7 +895,26 @@ class PreferencesDialog(QDialog):
             self.cmb_precision.setCurrentIndex(
                 precision_index if precision_index >= 0 else 0
             )
+            # Detalle de upscale: "best" por defecto. Un valor numérico (lo
+            # acepta el motor) se traduce al nivel más cercano para que la
+            # interfaz nunca mienta sobre lo que se está aplicando.
+            raw_detail = preferences.get(_DETAIL_KEY, "best")
+            if isinstance(raw_detail, bool):
+                detail = "best"
+            elif isinstance(raw_detail, (int, float)):
+                value = float(raw_detail)
+                detail = ("best" if value >= 0.99 else
+                          "balanced" if value >= 0.7 else "fast")
+            else:
+                detail = str(raw_detail or "best").strip().lower()
+                if detail not in ("best", "balanced", "fast"):
+                    detail = "best"
+            detail_index = self.cmb_detail.findData(detail)
+            self.cmb_detail.setCurrentIndex(
+                detail_index if detail_index >= 0 else 0
+            )
             self.txt_hf_token.setText(_get_hf_token())
+            self._sync_detail_availability()
         except Exception:
             self.chk_auto_update.setChecked(False)
             self.chk_auto_open_output.setChecked(True)
@@ -838,7 +923,19 @@ class PreferencesDialog(QDialog):
             self.chk_insecure_checkpoint.setChecked(False)
             self.chk_gpu_post.setChecked(False)
             self.cmb_precision.setCurrentIndex(0)
+            self.cmb_detail.setCurrentIndex(0)
             self.txt_hf_token.setText("")
+            self._sync_detail_availability()
+
+    def _sync_detail_availability(self):
+        """Ata el selector de detalle al post-proceso en GPU.
+
+        El ajuste lo aplica el grafo envuelto (ONNX + GPU post-processing): sin
+        esa casilla marcada no lo aplica ningún motor, así que el selector queda
+        deshabilitado mientras la nota explica la dependencia. Se conserva el
+        valor guardado (una preferencia no se pierde por desmarcar otra).
+        """
+        self.cmb_detail.setEnabled(bool(self.chk_gpu_post.isChecked()))
 
     def _on_accept(self):
         # Bloque unico: todas las preferencias nuevas + limpieza optional
@@ -878,6 +975,10 @@ class PreferencesDialog(QDialog):
             preferences.set(
                 _PRECISION_KEY,
                 str(self.cmb_precision.currentData() or "model"),
+            )
+            preferences.set(
+                _DETAIL_KEY,
+                str(self.cmb_detail.currentData() or "best"),
             )
             _set_hf_token(str(self.txt_hf_token.text() or ""))
             # Limpiamos la clave legacy si estaba presente para que no

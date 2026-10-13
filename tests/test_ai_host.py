@@ -340,3 +340,159 @@ def test_engine_errors_from_the_host_are_not_silent():
         host.engine_create("onnxruntime", str(REPO_ROOT))
 
     assert host.is_running()
+
+
+# ---------------------------------------------------------------------------
+# Post-proceso en GPU (P1): vive en el host, no en la GUI
+# ---------------------------------------------------------------------------
+
+def test_proxy_exposes_the_same_post_process_interface_as_local_engines():
+    """Paridad de interfaz: el pipeline trata igual a un motor local y a este.
+
+    Es la red que evita que un método se quede sólo en los motores locales y
+    el render remoto acabe con un ``AttributeError`` o, peor, sin P1.
+    """
+    from src.ai.inference import AIInferenceEngine
+    from src.ai.remote_engine import RemoteInferenceEngine
+
+    proxy = RemoteInferenceEngine("mock", "")
+    for name in ("configure_gpu_post", "gpu_post_active", "disable_gpu_post",
+                 "get_cumulative_timing", "reset_cumulative_timing",
+                 "describe_execution", "get_scale_factor", "process_frame",
+                 "unload", "load"):
+        assert hasattr(proxy, name), f"el proxy remoto no expone {name}()"
+        assert callable(getattr(proxy, name)), f"{name} no es invocable"
+    # ``gpu_post_active`` es MÉTODO en los motores locales, no propiedad.
+    assert callable(AIInferenceEngine.gpu_post_active)
+    assert proxy.gpu_post_active() is False
+    assert proxy._gpu_post is None
+    assert proxy._gpu_post_failure is None
+
+
+def test_gpu_post_is_activated_inside_the_host():
+    """``configure_gpu_post`` del proxy cruza el protocolo y el host manda.
+
+    Con el motor mock (sin CUDA) se comprueba el cableado completo: el host
+    construye/decide, el proxy propaga el informe y el dominio del motor
+    (``active``) viene del host, no de una suposición de la GUI.
+    """
+    from src.ai.remote_engine import RemoteInferenceEngine
+
+    host = host_client.get_host()
+    host.ping()
+    engine = RemoteInferenceEngine("mock", "")
+    assert engine.load() is True
+
+    report = engine.configure_gpu_post(960, 720, input_size=(768, 576))
+
+    assert report["active"] is True, report
+    assert report["reason"] == "ok"
+    assert tuple(report["out_size"]) == (960, 720)
+    assert "info" not in report, "la foto del motor no va en el informe del render"
+    assert engine.gpu_post_active() is True
+    # El host es la fuente de verdad: también lo dice en su propia foto.
+    assert host.engine_info(engine._handle)["gpu_post_active"] is True
+
+    frame = np.arange(4 * 6 * 3, dtype=np.uint8).reshape(4, 6, 3)
+    assert np.array_equal(engine.process_frame(frame), frame)
+    engine.unload()
+
+
+def test_frames_carry_the_state_so_the_hot_path_asks_nothing_extra(monkeypatch):
+    """Telemetría y estado de P1 viajan CON el frame (nada de IPC por frame).
+
+    El pipeline lee la telemetría antes y después de cada llamada al motor.
+    Si cada lectura fuese una petición al host, un render de 20k frames haría
+    40k peticiones que no aportan ni un píxel: aquí se comprueba que no se
+    hace ninguna (``engine.info`` revienta si alguien la pide).
+    """
+    from src.ai.remote_engine import RemoteInferenceEngine
+
+    host = host_client.get_host()
+    host.ping()
+    engine = RemoteInferenceEngine("mock", "")
+    assert engine.load() is True
+    before = engine.get_cumulative_timing()
+    assert set(before) == {"frames", "pre_ms", "infer_ms", "post_ms"}
+
+    def _no_extra_calls(*_args, **_kwargs):
+        raise AssertionError("el camino caliente pidió engine.info al host")
+
+    monkeypatch.setattr(host_client.RuntimeHost, "engine_info", _no_extra_calls)
+    engine.process_frame(np.zeros((4, 4, 3), dtype=np.uint8))
+    after = engine.get_cumulative_timing()
+    assert engine._state, "la respuesta del frame tendría que traer la foto"
+    assert isinstance(engine.describe_execution(), dict)
+    assert set(after) == set(before)
+    monkeypatch.undo()
+    engine.unload()
+
+
+def test_a_gpu_post_failure_reported_by_the_host_reaches_the_pipeline():
+    """Si el host abandona P1 a mitad de render, el proxy lo cuenta igual.
+
+    El pipeline lo lee dos veces: para el aviso al usuario y para el JSON del
+    render. Un proxy que se quede con ``active=True`` mentiría sobre la
+    velocidad y el usuario nunca sabría por qué bajó.
+    """
+    from src.ai.remote_engine import RemoteInferenceEngine
+
+    engine = RemoteInferenceEngine("mock", "")
+    engine._gpu_post = {"active": True, "out_size": (960, 720)}
+
+    engine._adopt_state({"gpu_post_active": False,
+                         "gpu_post_failure": "input size changed (640x480 vs 768x576)"})
+
+    assert engine.gpu_post_active() is False
+    assert engine._gpu_post is None
+    assert "input size changed" in engine._gpu_post_failure
+
+
+def _cuda_available() -> bool:
+    try:
+        from src.ai.inference import import_local_runtime
+
+        ort = import_local_runtime("onnxruntime")
+        return "CUDAExecutionProvider" in ort.get_available_providers()
+    except Exception:
+        return False
+
+
+@_skip_without_onnx
+@pytest.mark.skipif(not _cuda_available(), reason="este equipo no tiene CUDA")
+def test_gpu_post_really_engages_on_the_host_with_the_installed_model(capsys):
+    """Prueba real (RTX): el host activa P1 y la salida ya trae el tamaño final.
+
+    Se salta si el equipo no tiene CUDA o el store no tiene el modelo. Cuando
+    corre, comprueba lo que de verdad importa: que la marca de activo la da el
+    host tras su autocomprobación y que el frame llega al pipeline YA al
+    tamaño del encoder (sin el resize de CPU de después, que medido eran 40 ms
+    por frame en 3072x2304 -> 960x720).
+    """
+    from src import preferences
+    from src.ai.remote_engine import RemoteInferenceEngine
+
+    previous = preferences.get("gpu_post_process", None)
+    preferences.set("gpu_post_process", True)
+    try:
+        engine = RemoteInferenceEngine("onnxruntime", _ANIME_ONNX)
+        try:
+            assert engine.load() is True
+            report = engine.configure_gpu_post(960, 720, input_size=(768, 576))
+            if report.get("reason") == "no-cuda":
+                pytest.skip("la sesión ONNX de este equipo acabó en CPU")
+            assert report["active"] is True, report
+            assert engine.gpu_post_active() is True
+            assert report.get("precision") in ("fp16", "fp32", "model"), report
+
+            frame = np.random.default_rng(3).integers(
+                0, 256, (576, 768, 3), dtype=np.uint8)
+            out = engine.process_frame(frame)
+            assert out.shape == (720, 960, 3), (
+                f"P1 activo pero el frame llegó en {out.shape[1]}x{out.shape[0]}"
+            )
+            assert engine.gpu_post_active() is True
+        finally:
+            engine.unload()
+    finally:
+        preferences.set("gpu_post_process", previous)
