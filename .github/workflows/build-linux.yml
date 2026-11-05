@@ -347,7 +347,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          mapfile -t images < <(ls -1 DraggyEncoder-Linux-x86_64-*.AppImage)
+          shopt -s nullglob
+          images=(DraggyEncoder-Linux-x86_64-*.AppImage)
           if [ "${#images[@]}" -ne 1 ]; then
             echo "Expected exactly one AppImage, found ${#images[@]}" >&2
             printf '%s\n' "${images[@]}" >&2
@@ -367,7 +368,9 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p "$DRAGGY_DATA_DIR"
-          appimage="$(ls -1 DraggyEncoder-Linux-x86_64-*.AppImage | head -n 1)"
+          shopt -s nullglob
+          images=(DraggyEncoder-Linux-x86_64-*.AppImage)
+          appimage="${images[0]}"
           chmod +x "$appimage"
           "./$appimage" --selftest 2>&1 | tee appimage-selftest.log
           for line in \
