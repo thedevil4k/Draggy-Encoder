@@ -1,8 +1,8 @@
 import logging
 import os
 
-from PySide6.QtCore import Qt, QUrl, Signal
-from PySide6.QtGui import QPixmap
+from PySide6.QtCore import QMimeData, Qt, QTimer, QUrl, Signal
+from PySide6.QtGui import QDrag, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
     QComboBox,
@@ -31,6 +31,13 @@ NODE_CATEGORY = {
     "Colorize": ("Colorize",   "Colorization (DDColor, DeOldify, ...)"),
     "FaceRestore": ("FaceRestore", "Face restoration (GFPGAN, ...)"),
 }
+
+
+# --- Reordenado por arrastre -------------------------------------------------
+#: MIME propio para arrastrar un nodo intermedio dentro del flujo.
+_STEP_MIME = "application/x-draggy-workflow-step"
+#: Fichero de sesión donde se recuerda el orden de los nodos.
+_ORDER_FILE = "workflow_order.json"
 
 
 # -----------------------------------------------------------------------
@@ -325,6 +332,63 @@ class StatusLabel(QLabel):
 
 
 # -----------------------------------------------------------------------
+# DragHandle — arrastra un nodo para reordenar el flujo
+# -----------------------------------------------------------------------
+
+
+class DragHandle(QLabel):
+    """Punto de agarre (⠿) para arrastrar un nodo intermedio.
+
+    ``WorkflowWidget`` acepta el drop y recoloca el paso en la posición
+    horizontal donde se suelta. Las flechas ◀ ▶ siguen existiendo como
+    alternativa accesible (y son lo que se usa en tests/teclado).
+    """
+
+    def __init__(self, name: str, parent=None):
+        super().__init__("⠿", parent)
+        self._name = name
+        self._press_pos = None
+        self.setCursor(Qt.CursorShape.OpenHandCursor)
+        self.setToolTip("Drag to reorder this step")
+        self.setStyleSheet("color: #5f6f7f; font-size: 14px; font-weight: bold;")
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._press_pos = event.position().toPoint()
+            # No dejar que el click suba al nodo (activarlo/desactivarlo)
+            # cuando el usuario sólo quiere agarrar el asa.
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        self._press_pos = None
+        if event.button() == Qt.MouseButton.LeftButton:
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if self._press_pos is None:
+            super().mouseMoveEvent(event)
+            return
+        moved = (event.position().toPoint() - self._press_pos).manhattanLength()
+        if moved < QApplication.startDragDistance():
+            return
+        drag = QDrag(self)
+        mime = QMimeData()
+        mime.setData(_STEP_MIME, self._name.encode("utf-8"))
+        drag.setMimeData(mime)
+        source = self.parentWidget()
+        if source is not None:
+            pixmap = source.grab()
+            if not pixmap.isNull():
+                drag.setPixmap(pixmap.scaled(pixmap.size() / 2))
+        self._press_pos = None
+        drag.exec(Qt.DropAction.MoveAction)
+
+
+# -----------------------------------------------------------------------
 # AIWorkflowStep (NEW) — category-aware dropdown above each AI node.
 # -----------------------------------------------------------------------
 
@@ -358,6 +422,7 @@ class AIWorkflowStep(QFrame):
     engine_changed = Signal(str, str)
     active_changed = Signal(str, bool)
     search_requested = Signal(str)  # arg = categoría del nodo
+    install_requested = Signal(str)  # arg = engine_id a descargar
 
     def __init__(self, name, icon_path, parent=None,
                  fixed_width=200, fixed_height=150):
@@ -379,6 +444,10 @@ class AIWorkflowStep(QFrame):
             self.category, self._hint = (name, f"{name} engines")
         self.active = False
         self._all_model_files = []
+        self._installed = []
+        self._available = set()
+        self._last_engine_id = ""
+        self._pending_engine_id = ""
         self.setObjectName("AIWorkflowStep")
         self.setFixedSize(fixed_width, fixed_height)
         self._build(icon_path)
@@ -482,6 +551,8 @@ class AIWorkflowStep(QFrame):
         name_col.addWidget(self.sub_label)
 
         header.addLayout(name_col, stretch=1)
+        self.drag_handle = DragHandle(self.name)
+        header.addWidget(self.drag_handle, alignment=Qt.AlignmentFlag.AlignTop)
         layout.addLayout(header)
 
         # Engine dropdown + search button.
@@ -534,9 +605,51 @@ class AIWorkflowStep(QFrame):
 
     # -- event handlers --------------------------------------------------
 
+    def _current_engine_id(self) -> str:
+        """engine_id de una entrada INSTALADA seleccionada ("" si no hay)."""
+        data = self.combo.currentData()
+        if isinstance(data, dict):
+            if data.get("search") or data.get("installed") is False:
+                return ""
+            return str(data.get("engine_id") or "")
+        return str(data or "")
+
+    def _restore_engine_selection(self, engine_id):
+        """Vuelve a ``engine_id`` sin re-emitir ``engine_changed``."""
+        if not engine_id:
+            return
+        for i in range(self.combo.count()):
+            data = self.combo.itemData(i)
+            if isinstance(data, dict) and data.get("engine_id") == engine_id:
+                self.combo.blockSignals(True)
+                self.combo.setCurrentIndex(i)
+                self.combo.blockSignals(False)
+                self._last_engine_id = engine_id
+                return
+
     def _on_engine_changed(self, _idx):
-        """Engine dropdown changed — update scale dropdown."""
-        engine_id = self.combo.currentData() or ""
+        """Cambio en el desplegable: instalado, descarga o buscador HF."""
+        data = self.combo.currentData()
+        if isinstance(data, dict) and data.get("search"):
+            self._restore_engine_selection(getattr(self, "_last_engine_id", ""))
+            self.search_requested.emit(self.category)
+            return
+        # OJO: el id crudo, no ``_current_engine_id()`` (que devuelve ""
+        # justo para las entradas no instaladas).
+        raw_id = (
+            str(data.get("engine_id") or "") if isinstance(data, dict) else ""
+        )
+        if isinstance(data, dict) and data.get("installed") is False and raw_id:
+            # Modelo del catálogo aún no descargado: se pide la instalación
+            # y el desplegable vuelve a lo que había elegido antes. Al
+            # terminar, ``refresh_from_registry`` selecciona el recién
+            # instalado (``_pending_engine_id``).
+            self._pending_engine_id = raw_id
+            self._restore_engine_selection(getattr(self, "_last_engine_id", ""))
+            self.install_requested.emit(raw_id)
+            return
+        engine_id = self._current_engine_id()
+        self._last_engine_id = engine_id
         self._populate_scale_dropdown(engine_id)
         self._emit_engine_changed()
 
@@ -615,7 +728,7 @@ class AIWorkflowStep(QFrame):
         self.active = not self.active
         self._refresh_active_styles()
         self.active_changed.emit(self.name, bool(self.active))
-        self.combo.setEnabled(self.active and bool(self._installed))
+        self.combo.setEnabled(self.combo.count() > 1)
 
     def _refresh_active_styles(self):
         self.setProperty("active", "true" if self.active else "false")
@@ -628,17 +741,42 @@ class AIWorkflowStep(QFrame):
 
     def refresh_from_registry(self):
         """Re-query the catalog+state. Called on construct AND whenever
-        the bus broadcasts a state change."""
+        the bus broadcasts a state change.
+
+        El desplegable muestra TODO el catálogo de la categoría, no sólo lo
+        instalado: un nodo "vacío" era la razón de que Real-ESR AnimeVideo
+        v3 (y los modelos de face restore/denoise/colorize) no se pudieran
+        ni ver ni elegir. Los no instalados se marcan con ⬇ y su descarga se
+        pide al pulsarlos.
+        """
         try:
-            from src.ai.registry import list_installed as _list_installed
+            from src.ai.registry import CATALOG, list_installed as _list_installed
             self._installed = _list_installed(self.category)
+            catalog = [
+                entry for entry in CATALOG
+                if entry.get("category") == self.category
+            ]
         except Exception as exc:
             self._installed = []
+            catalog = []
             self.status_label.setText(f"Registry error: {exc}")
             self.status_label.setProperty("link", False)
             return
 
-        prev_engine = self.combo.currentData()
+        # Pesos ya presentes en disco aunque engines.json no los marque como
+        # instalados (p.ej. GFPGAN/CodeFormer/DeOldify descargados desde el
+        # buscador HF): se tratan como instalados para poder elegirlos sin
+        # volver a descargar cientos de MB.
+        known = {e.get("engine_id") for e in self._installed}
+        for entry in catalog:
+            eid = entry.get("engine_id", "")
+            if eid and eid not in known and self._engine_has_weights(eid):
+                self._installed.append(entry)
+                known.add(eid)
+
+        prev_engine = self._current_engine_id() or getattr(
+            self, "_last_engine_id", ""
+        )
 
         self.combo.blockSignals(True)
         self.combo.clear()
@@ -646,34 +784,86 @@ class AIWorkflowStep(QFrame):
         # Scan model files for all installed engines.
         self._all_model_files = self._scan_model_files()
 
-        if self._installed:
-            # Show unique engine entries (not per-file).
-            seen = set()
-            for entry in self._installed:
-                eid = entry["engine_id"]
-                if eid in seen:
-                    continue
-                seen.add(eid)
-                label = entry.get("display_name", eid)
-                self.combo.addItem(label, eid)
-        else:
-            self.combo.addItem("No engines installed", None)
+        # 1) Instalados primero: son los únicos que pueden renderizar ya.
+        installed_by_id = {}
+        for entry in self._installed:
+            eid = entry.get("engine_id", "")
+            if eid:
+                installed_by_id.setdefault(eid, entry)
+        for eid, entry in installed_by_id.items():
+            self.combo.addItem(
+                entry.get("display_name", eid),
+                {"engine_id": eid, "installed": True},
+            )
 
-        # Restore previous selection.
+        # 2) Resto del catálogo: visible y descargable desde el propio nodo.
+        available = set()
+        for entry in catalog:
+            eid = entry.get("engine_id", "")
+            if not eid or eid in installed_by_id:
+                continue
+            size = entry.get("onnx_size_estimate") or entry.get("size_estimate") or ""
+            label = f"⬇ {entry.get('display_name', eid)}"
+            if size:
+                label += f" ({size})"
+            self.combo.addItem(label, {"engine_id": eid, "installed": False})
+            available.add(eid)
+        self._available = available
+
+        # 3) Buscador de Hugging Face siempre a mano en el propio nodo.
+        if self.combo.count():
+            self.combo.insertSeparator(self.combo.count())
+        self.combo.addItem("🔍 Search Hugging Face…", {"search": True})
+
+        # Si venimos de pedir la descarga de un motor que ya está en disco,
+        # seleccionarlo automáticamente.
+        pending = getattr(self, "_pending_engine_id", "")
+        if pending and pending in installed_by_id:
+            prev_engine = pending
+            self._pending_engine_id = ""
+
+        # Restore previous selection (only installed entries count).
         idx_to_set = 0
-        if prev_engine:
-            for i in range(self.combo.count()):
-                if self.combo.itemData(i) == prev_engine:
-                    idx_to_set = i
-                    break
+        for i in range(self.combo.count()):
+            data = self.combo.itemData(i)
+            if isinstance(data, dict) and data.get("engine_id") == prev_engine:
+                idx_to_set = i
+                break
         self.combo.setCurrentIndex(idx_to_set)
+        selected = self.combo.itemData(idx_to_set)
+        self._last_engine_id = (
+            str(selected.get("engine_id", ""))
+            if isinstance(selected, dict) and selected.get("installed")
+            else ""
+        )
         self.combo.blockSignals(False)
 
         # Populate scale dropdown for the current engine.
-        self._populate_scale_dropdown(self.combo.currentData() or "")
+        self._populate_scale_dropdown(self._current_engine_id())
 
-        self.combo.setEnabled(self.active and bool(self._installed))
+        # Siempre operativo: elegir modelo no exige activar el nodo antes.
+        self.combo.setEnabled(self.combo.count() > 1)
         self._render_status()
+
+    def _engine_has_weights(self, engine_id: str) -> bool:
+        """True si el directorio del motor ya contiene pesos utilizables."""
+        try:
+            from src.ai.registry import get_engine_dir
+            root_dir = get_engine_dir(engine_id)
+        except Exception:
+            return False
+        if not root_dir or not os.path.isdir(root_dir):
+            return False
+        weight_exts = {".pth", ".pt", ".onnx", ".safetensors", ".bin"}
+        for root, dirs, files in os.walk(root_dir):
+            dirs[:] = [
+                d for d in dirs
+                if not d.startswith(".") and d != "__pycache__"
+            ]
+            for fname in files:
+                if os.path.splitext(fname)[1].lower() in weight_exts:
+                    return True
+        return False
 
     def _scan_model_files(self):
         """Scan installed engine directories for .pth/.onnx model files.
@@ -750,8 +940,13 @@ class AIWorkflowStep(QFrame):
 
                 # Escala real del fichero, leída por dentro (ver
                 # _detect_file_scale). Nada de fiarse del nombre: el
-                # dropdown de escala sólo ofrece factores probados.
-                scale, scale_proven = _detect_file_scale(mp)
+                # dropdown de escala sólo ofrece factores probados. Sólo
+                # Upscale la necesita; en el resto de categorías el factor
+                # no se usa y leer cada peso retrasaría el arranque.
+                if self.category == "Upscale":
+                    scale, scale_proven = _detect_file_scale(mp)
+                else:
+                    scale, scale_proven = 1, False
 
                 # Build a human label.
                 short_name = os.path.splitext(fname)[0]
@@ -786,21 +981,33 @@ class AIWorkflowStep(QFrame):
             self.status_label.setProperty("link", False)
             self.status_label.setCursor(Qt.CursorShape.ArrowCursor)
             return
-        n_total = len(self._installed)
-        if n_total == 0:
-            self.status_label.setText("No engines — click to open AI Engines Manager")
+        n_installed = len({
+            e.get("engine_id") for e in getattr(self, "_installed", [])
+            if e.get("engine_id")
+        })
+        n_available = len(getattr(self, "_available", set()))
+        if n_installed == 0:
+            if n_available:
+                self.status_label.setText(
+                    f"No engines installed · {n_available} available — pick one to download"
+                )
+            else:
+                self.status_label.setText(
+                    "No engines — click to open AI Engines Manager"
+                )
             self.status_label.setProperty("link", True)
             self.status_label.setCursor(Qt.CursorShape.PointingHandCursor)
-        else:
-            current = self.combo.currentText() if self.combo.count() else ""
-            current_id = self.combo.currentData()
-            if not current_id or not current:
-                human = f"{n_total} installed"
-            else:
-                human = f"{n_total} installed · active: {current}"
-            self.status_label.setText(human)
-            self.status_label.setProperty("link", False)
-            self.status_label.setCursor(Qt.CursorShape.ArrowCursor)
+            return
+        current_id = self._current_engine_id()
+        current = self.combo.currentText() if current_id else ""
+        if len(current) > 26:
+            current = current[:25] + "…"
+        human = f"{n_installed} installed · {n_available} available"
+        if current:
+            human += f" · active: {current}"
+        self.status_label.setText(human)
+        self.status_label.setProperty("link", False)
+        self.status_label.setCursor(Qt.CursorShape.ArrowCursor)
 
     # -- Mutation convenience methods --------------------------------------
 
@@ -815,22 +1022,17 @@ class AIWorkflowStep(QFrame):
             self.active = bool(value)
             self._refresh_active_styles()
             self.active_changed.emit(self.name, self.active)
-        self.combo.setEnabled(self.active and bool(self._installed))
+        self.combo.setEnabled(self.combo.count() > 1)
 
     def get_selected_engine_id(self) -> str:
         """Return the dropdown's engine_id (empty string if none)."""
         if not self.active:
             return ""
-        data = self.combo.currentData()
-        if data is None:
-            return ""
-        return str(data)
+        return self._current_engine_id()
 
     def get_selected_model_info(self):
         """Return dict with engine_id, model_path, scale, mode for current selection."""
-        engine_id = self.combo.currentData() or ""
-        if isinstance(engine_id, dict):
-            engine_id = engine_id.get("engine_id", "")
+        engine_id = self._current_engine_id()
         if not self.combo_scale.isHidden() and self.combo_scale.count() > 0:
             scale_data = self.combo_scale.currentData()
             if scale_data and isinstance(scale_data, dict):
@@ -893,10 +1095,15 @@ class WorkflowWidget(QWidget):
     # Emitted when the user clicks the Import step (replaces the removed
     # "Select Videos" button; MainWindow opens the file dialog).
     import_clicked = Signal()
+    # Emitted when a not-yet-installed model is chosen in a node dropdown.
+    # Arg: engine_id from the catalog; MainWindow opens the install dialog.
+    install_requested = Signal(str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
+        self.setAcceptDrops(True)
         self._setup_steps()
+        self._restore_order()
         self._render_layout()
         self._connect_state_bus()
 
@@ -920,6 +1127,7 @@ class WorkflowWidget(QWidget):
         for step in self.middle_steps:
             step.clicked_for_manage.connect(self._on_step_manage_requested)
             step.search_requested.connect(self._on_search_requested)
+            step.install_requested.connect(self.install_requested.emit)
             step.engine_changed.connect(self.engine_changed.emit)
             step.active_changed.connect(self.active_changed.emit)
 
@@ -1060,6 +1268,94 @@ class WorkflowWidget(QWidget):
             self.middle_steps[new_index], self.middle_steps[index],
         )
         self._render_layout()
+        self._save_order()
+
+    # -- order persistence + drag & drop ----------------------------------
+
+    def _order_file(self) -> str:
+        from src.config import get_session_dir
+        return os.path.join(get_session_dir(), _ORDER_FILE)
+
+    def _restore_order(self):
+        """Restaura el orden guardado de la sesión anterior."""
+        import json
+
+        try:
+            with open(self._order_file(), "r", encoding="utf-8") as fh:
+                saved = json.load(fh).get("order") or []
+        except (OSError, ValueError, AttributeError):
+            return
+        if not isinstance(saved, list) or not saved:
+            return
+        by_name = {step.name: step for step in self.middle_steps}
+        restored = []
+        for name in saved:
+            step = by_name.pop(name, None)
+            if step is not None:
+                restored.append(step)
+        # Nodos nuevos (añadidos en una versión posterior) van al final.
+        restored.extend(by_name.values())
+        self.middle_steps = restored
+
+    def _save_order(self):
+        """Persiste el orden actual para el próximo arranque."""
+        import json
+
+        path = self._order_file()
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            tmp = path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump({"order": [s.name for s in self.middle_steps]}, fh)
+            os.replace(tmp, path)
+        except OSError as exc:
+            logger.debug("No se pudo guardar el orden del flujo: %s", exc)
+
+    def _reorder_from_drop(self, name: str, x: float):
+        """Reubica el paso ``name`` en la posición horizontal ``x``."""
+        src = next(
+            (i for i, s in enumerate(self.middle_steps) if s.name == name), None
+        )
+        if src is None:
+            return
+        target = 0
+        for step in self.middle_steps:
+            center = step.mapTo(self, step.rect().center()).x()
+            if x > center:
+                target += 1
+        step = self.middle_steps.pop(src)
+        if target > src:
+            target -= 1
+        target = max(0, min(target, len(self.middle_steps)))
+        if target == src:
+            return
+        self.middle_steps.insert(target, step)
+        self._render_layout()
+        self._save_order()
+
+    def dragEnterEvent(self, event):
+        if event.mimeData().hasFormat(_STEP_MIME):
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dragMoveEvent(self, event):
+        if event.mimeData().hasFormat(_STEP_MIME):
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dropEvent(self, event):
+        if not event.mimeData().hasFormat(_STEP_MIME):
+            event.ignore()
+            return
+        name = bytes(event.mimeData().data(_STEP_MIME)).decode("utf-8", "replace")
+        x = event.position().x()
+        event.acceptProposedAction()
+        # El reordenado se aplica cuando el QDrag del origen ha terminado:
+        # reconstruir el layout en mitad del drop reparenta el widget que
+        # está siendo arrastrado.
+        QTimer.singleShot(0, lambda: self._reorder_from_drop(name, x))
 
     # -- public hooks -----------------------------------------------------
 

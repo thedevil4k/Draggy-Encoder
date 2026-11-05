@@ -259,28 +259,19 @@ jobs:
           if ($v -like "v*") { $v = $v.Substring(1) }
           iscc "/DDRAGGY_VERSION=$v" draggy_encoder.iss
 
-      # Las tags adjuntan el instalador a la Release. Para pushes y ejecuciones
-      # manuales mantenemos una única copia descargable de un día; así no se
-      # acumulan instaladores idénticos en la cuota de Actions.
-      - name: Upload installer artifact
-        id: upload_installer_artifact
-        if: github.event_name == 'workflow_dispatch' || !startsWith(github.ref, 'refs/tags/v')
-        uses: actions/upload-artifact@v7
-        with:
-          name: DraggyEncoder-Installer
-          path: installer/*.exe
-          if-no-files-found: error
-          retention-days: 1
-          compression-level: 0
-        # El artifact es solo una comodidad para inspección. Una cuota llena
-        # no debe ocultar que el instalador ya se compiló correctamente.
-        continue-on-error: true
-
-      - name: Report installer artifact quota issue
-        if: steps.upload_installer_artifact.outcome == 'failure'
+      - name: Verify exactly one Windows installer
         shell: pwsh
-        run: Write-Warning "No se pudo subir DraggyEncoder-Installer porque la cuota de GitHub Actions está agotada. Ejecuta Manage GitHub Actions artifacts en modo delete, espera el recálculo de GitHub (6-12 h) y relanza el workflow."
+        run: |
+          $installers = @(Get-ChildItem -Path installer -Filter *.exe -File)
+          if ($installers.Count -ne 1) {
+            throw "Expected exactly one Windows installer, found $($installers.Count)"
+          }
+          $installers | ForEach-Object { "{0} {1} bytes" -f $_.Name, $_.Length }
 
+      # ÚNICO paquete de Windows: el instalador x64. No se sube además un
+      # artifact de Actions (era una segunda copia del mismo EXE y gastaba
+      # cuota); la descarga vive solo en la Release.
+      #
       # En pushes/manuales la descarga estable va a la release rodante
       # "latest": los assets de Releases NO cuentan contra la cuota de
       # artifacts de GitHub Actions, así que el instalador siempre queda
@@ -296,4 +287,4 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v3
         with:
-          files: installer/*.exe
+          files: installer/DraggyEncoder-Setup-*.exe

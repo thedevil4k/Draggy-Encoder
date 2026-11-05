@@ -155,7 +155,7 @@ jobs:
           desktop-file-validate packaging/linux/appimage.desktop
 
   build-linux:
-    name: Build Linux packages
+    name: Build Linux AppImage (x86_64)
     needs: smoke-packaging
     runs-on: ubuntu-latest
     permissions:
@@ -343,6 +343,45 @@ jobs:
           chmod +x /tmp/appimagetool.AppImage
           ARCH=x86_64 APPIMAGE_EXTRACT_AND_RUN=1 /tmp/appimagetool.AppImage "$appdir" "DraggyEncoder-Linux-x86_64-${version}.AppImage"
 
+      - name: Verify exactly one AppImage
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -t images < <(ls -1 DraggyEncoder-Linux-x86_64-*.AppImage)
+          if [ "${#images[@]}" -ne 1 ]; then
+            echo "Expected exactly one AppImage, found ${#images[@]}" >&2
+            printf '%s\n' "${images[@]}" >&2
+            exit 1
+          fi
+          ls -l "${images[0]}"
+
+      # Prueba de humo REAL del paquete: se ejecuta el AppImage (no el
+      # bundle de dist/) y se exige que pase el selftest de la app. Sin
+      # esto solo sabríamos que el binario suelto funciona.
+      - name: Selftest the built AppImage
+        env:
+          QT_QPA_PLATFORM: offscreen
+          APPIMAGE_EXTRACT_AND_RUN: "1"
+          DRAGGY_DATA_DIR: ${{ runner.temp }}/draggy-appimage-data
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$DRAGGY_DATA_DIR"
+          appimage="$(ls -1 DraggyEncoder-Linux-x86_64-*.AppImage | head -n 1)"
+          chmod +x "$appimage"
+          "./$appimage" --selftest 2>&1 | tee appimage-selftest.log
+          for line in \
+            "OK   QApplication offscreen" \
+            "OK   MainWindow offscreen" \
+            "OK   DependenciesDialog offscreen" \
+            "OK   host de IA arranca" \
+            "OK   host de IA: frames ida y vuelta" \
+            "SELFTEST PASS"; do
+            grep -Fq "$line" appimage-selftest.log \
+              || { echo "Missing from AppImage selftest: $line" >&2; exit 1; }
+          done
+          echo "AppImage selftest OK: $(stat -c '%n %s bytes' "$appimage")"
+
       # Solo se publica el AppImage. En pushes/manuales queda en la release
       # rodante "latest" y en tags en la Release versionada (ver más abajo):
       # los assets de Releases NO cuentan contra la cuota de artifacts, así
@@ -381,6 +420,7 @@ jobs:
           files: |
             DraggyEncoder-Linux-x86_64-*.AppImage
             screenshots/*.png
+            appimage-selftest.log
 
       - name: Attach AppImage to release
         if: startsWith(github.ref, 'refs/tags/v')
@@ -389,3 +429,4 @@ jobs:
           files: |
             DraggyEncoder-Linux-x86_64-*.AppImage
             screenshots/*.png
+            appimage-selftest.log

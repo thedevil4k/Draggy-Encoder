@@ -1052,6 +1052,11 @@ class MainWindow(QMainWindow):
         self.workflow.model_selected.connect(
             self._on_model_selected_from_search
         )
+        # Un modelo del catálogo elegido en el desplegable del nodo que aún
+        # no está en disco: se abre el gestor y se lanza su descarga.
+        self.workflow.install_requested.connect(
+            self._on_engine_install_requested
+        )
         self.workflow.engine_changed.connect(
             self._on_engine_changed
         )
@@ -1753,6 +1758,22 @@ class MainWindow(QMainWindow):
         if model.get("is_user"):
             self._register_user_model(model)
         self._open_dependencies(initial_tab="ai_engines", install_engine_id=engine_id)
+
+    def _on_engine_install_requested(self, engine_id: str):
+        """Descarga el motor elegido en el desplegable de un nodo del flujo.
+
+        El desplegable lista todo el catálogo de la categoría con los no
+        instalados marcados con ⬇; al elegirlos se llega aquí con su id.
+        Al cerrar el gestor se refrescan los nodos para que el modelo
+        recién instalado quede seleccionable.
+        """
+        if not engine_id:
+            return
+        self._open_dependencies(initial_tab="ai_engines", install_engine_id=engine_id)
+        try:
+            self.workflow.refresh_steps()
+        except Exception:
+            pass
 
     def _register_user_model(self, model: dict):
         """Persiste el registro de un motor de usuario (buscador del Hub)."""
