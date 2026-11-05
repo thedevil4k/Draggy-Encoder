@@ -2454,6 +2454,48 @@ def test_workflow_maps_face_restore_node(qapp):
         widget.deleteLater()
 
 
+def test_workflow_unavailable_models_are_marked_and_not_selectable(qapp):
+    """Los modelos sin loader no se ofrecen para descargar ni seleccionar.
+
+    Denoise/Colorize/FaceRestore no tienen cargador en este build: el nodo
+    debe quedar deshabilitado con un aviso explícito, sin selección parcial y
+    sin botón de búsqueda. En Upscale (que sí tiene loaders) las entradas no
+    ejecutables deben seguir visibles pero deshabilitadas y sin ⬇.
+    """
+    from src.ai.arch_specs import NOT_AVAILABLE_LABEL
+    from src.ui.workflow_widget import WorkflowWidget
+
+    widget = WorkflowWidget()
+    try:
+        for name in ("Denoise", "Colorize", "FaceRestore"):
+            step = next(s for s in widget.middle_steps if s.name == name)
+            assert step.combo.count() == 1, [
+                step.combo.itemText(i) for i in range(step.combo.count())
+            ]
+            assert not step.combo.isEnabled()
+            assert NOT_AVAILABLE_LABEL in step.combo.itemText(0).lower()
+            assert step.get_selected_engine_id() == ""
+            assert NOT_AVAILABLE_LABEL in step._activation_block_reason().lower()
+
+        ups = next(s for s in widget.middle_steps if s.name == "Upscale")
+        runnable = 0
+        for i in range(ups.combo.count()):
+            data = ups.combo.itemData(i)
+            if not isinstance(data, dict):
+                continue
+            if data.get("supported"):
+                runnable += 1
+            if data.get("supported") is False:
+                text = ups.combo.itemText(i)
+                assert NOT_AVAILABLE_LABEL in text.lower(), text
+                assert "⬇" not in text, text
+                item = ups.combo.model().item(i)
+                assert item is not None and not item.isEnabled(), text
+        assert runnable > 0, "Upscale debe tener al menos un loader real"
+    finally:
+        widget.deleteLater()
+
+
 def test_import_step_click_emits_import_clicked(qapp):
     """Click en la casilla Import equivale al botón "Select Videos"
     eliminado: emite ``import_clicked`` (MainWindow abre el diálogo)."""

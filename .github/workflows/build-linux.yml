@@ -105,6 +105,7 @@ jobs:
             "OK   QApplication offscreen" \
             "OK   MainWindow offscreen" \
             "OK   DependenciesDialog offscreen" \
+            "OK   workflow: modelos sin loader marcados como no disponibles" \
             "OK   guard torch (store de prueba): sin import in-process" \
             "OK   guard onnxruntime (store de prueba): sin import in-process" \
             "OK   host de IA arranca" \
@@ -294,6 +295,7 @@ jobs:
             "OK   QApplication offscreen" \
             "OK   MainWindow offscreen" \
             "OK   DependenciesDialog offscreen" \
+            "OK   workflow: modelos sin loader marcados como no disponibles" \
             "OK   guard torch (store de prueba): sin import in-process" \
             "OK   guard onnxruntime (store de prueba): sin import in-process" \
             "OK   host de IA arranca" \
@@ -377,6 +379,7 @@ jobs:
             "OK   QApplication offscreen" \
             "OK   MainWindow offscreen" \
             "OK   DependenciesDialog offscreen" \
+            "OK   workflow: modelos sin loader marcados como no disponibles" \
             "OK   host de IA arranca" \
             "OK   host de IA: frames ida y vuelta" \
             "SELFTEST PASS"; do

@@ -359,6 +359,86 @@ def _selftest_ai_host(report) -> bool:
     return True
 
 
+def _selftest_model_capabilities(report) -> bool:
+    """Comprueba que la UI no ofrece modelos que este build no puede cargar.
+
+    Los nodos Denoise/Colorize/FaceRestore deben quedar deshabilitados con el
+    aviso explícito, y en Upscale ninguna entrada sin loader puede ser
+    seleccionable ni descargable. Se ejecuta en cada build (fuente, bundle y
+    AppImage) para que una regresión no llegue al usuario.
+    """
+    import traceback
+
+    try:
+        from PySide6.QtWidgets import QApplication
+
+        from src.ai.arch_specs import NOT_AVAILABLE_LABEL
+        from src.ui.workflow_widget import WorkflowWidget
+
+        if QApplication.instance() is None:
+            report("  SKIP workflow capabilities (sin QApplication)")
+            return True
+
+        widget = WorkflowWidget()
+        problems = []
+        try:
+            for name in ("Denoise", "Colorize", "FaceRestore"):
+                step = next(
+                    (s for s in widget.middle_steps if s.name == name), None
+                )
+                if step is None:
+                    problems.append(f"{name}: nodo ausente")
+                    continue
+                text = step.combo.itemText(0) if step.combo.count() else ""
+                if NOT_AVAILABLE_LABEL not in text.lower():
+                    problems.append(f"{name}: no marcado como no disponible")
+                if step.combo.isEnabled():
+                    problems.append(f"{name}: desplegable habilitado")
+                if step.get_selected_engine_id():
+                    problems.append(f"{name}: motor seleccionado")
+                if NOT_AVAILABLE_LABEL not in step._activation_block_reason().lower():
+                    problems.append(f"{name}: sin mensaje de bloqueo")
+
+            ups = next(
+                (s for s in widget.middle_steps if s.name == "Upscale"), None
+            )
+            if ups is None:
+                problems.append("Upscale: nodo ausente")
+            else:
+                runnable = 0
+                for i in range(ups.combo.count()):
+                    data = ups.combo.itemData(i)
+                    if not isinstance(data, dict):
+                        continue
+                    if data.get("supported"):
+                        runnable += 1
+                    if data.get("supported") is False:
+                        if "⬇" in ups.combo.itemText(i):
+                            problems.append("Upscale: no ejecutable con descarga")
+                        try:
+                            enabled = ups.combo.model().item(i).isEnabled()
+                        except Exception:
+                            enabled = True
+                        if enabled:
+                            problems.append("Upscale: no ejecutable seleccionable")
+                if runnable == 0:
+                    problems.append("Upscale: sin opción ejecutable")
+        finally:
+            widget.deleteLater()
+
+        if problems:
+            report("  FAIL workflow capabilities: " + "; ".join(problems))
+            return False
+        report("  OK   workflow: modelos sin loader marcados como no disponibles")
+        return True
+    except Exception:
+        report(
+            "  FAIL workflow capabilities:\n  "
+            + traceback.format_exc().strip().replace("\n", "\n  ")
+        )
+        return False
+
+
 def run_selftest() -> int:
     """Verificación rápida de salud sin abrir la GUI (flag ``--selftest``).
 
@@ -447,6 +527,9 @@ def run_selftest() -> int:
             report("  " + detail)
         else:
             report(f"  SKIP {name} (sin QApplication válida)")
+
+    if not _selftest_model_capabilities(report):
+        ok = False
 
     try:
         from src.config import get_bin_dir

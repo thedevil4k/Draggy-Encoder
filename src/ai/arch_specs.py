@@ -32,6 +32,43 @@ def arch_is_onnx_convertible(arch: str) -> bool:
     return bool(arch) and arch in ONNX_CONVERTIBLE_ARCHS
 
 
+#: Arquitecturas con cargador PyTorch real en este build
+#: (``architectures.build_model_from_state_dict``).
+TORCH_RUNTIME_ARCHS = frozenset({"omnisr", "rrdb", "srvgg", "cugan"})
+#: Arquitecturas que sólo se ejecutan por la ruta ONNX ya existente (RIFE).
+ONNX_RUNTIME_ARCHS = frozenset({"rife"})
+#: Texto exacto que la UI usa para marcar lo que este build no puede cargar.
+NOT_AVAILABLE_LABEL = "not available in this build"
+
+
+def runtime_support(arch: str, onnx_available: bool = False):
+    """``(runnable, reason)`` para un motor, sin importar torch.
+
+    La UI usa esto para no ofrecer un modelo que luego fallaría al cargar.
+    ``rrdb/srvgg/cugan/omnisr`` tienen cargador PyTorch; ``rife`` sólo corre
+    por su ONNX. Cualquier otra arquitectura (GFPGAN, CodeFormer, GPEN,
+    NAFNet, DDColor, DeOldify, FILM, SwinIR) no tiene loader en este build.
+    """
+    arch = (arch or "").strip().lower()
+    if arch in TORCH_RUNTIME_ARCHS:
+        return True, ""
+    if arch in ONNX_RUNTIME_ARCHS:
+        if onnx_available:
+            return True, ""
+        return False, (
+            f"{NOT_AVAILABLE_LABEL}: {arch.upper()} needs its ONNX weight file"
+        )
+    if not arch:
+        if onnx_available:
+            return True, ""
+        return False, (
+            f"{NOT_AVAILABLE_LABEL}: the model architecture could not be identified"
+        )
+    return False, (
+        f"{NOT_AVAILABLE_LABEL}: no inference loader for '{arch}' in this release"
+    )
+
+
 #: Patrones (compilados de forma perezosa) que parecen una escala en el nombre.
 _SCALE_NAME_RE = None
 

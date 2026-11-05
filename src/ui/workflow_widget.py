@@ -9,12 +9,14 @@ from PySide6.QtWidgets import (
     QFrame,
     QHBoxLayout,
     QLabel,
+    QMessageBox,
     QPushButton,
     QSizePolicy,
     QVBoxLayout,
     QWidget,
 )
 
+from src.ai.arch_specs import NOT_AVAILABLE_LABEL, runtime_support
 from src.config import get_asset_path
 from src.ui.model_search_dialog import ModelSearchDialog
 
@@ -448,6 +450,11 @@ class AIWorkflowStep(QFrame):
         self._available = set()
         self._last_engine_id = ""
         self._pending_engine_id = ""
+        self._runnable_installed = 0
+        self._runnable_available = 0
+        self._runnable_total = 0
+        self._unsupported_count = 0
+        self._unsupported_names = []
         self.setObjectName("AIWorkflowStep")
         self.setFixedSize(fixed_width, fixed_height)
         self._build(icon_path)
@@ -606,13 +613,38 @@ class AIWorkflowStep(QFrame):
     # -- event handlers --------------------------------------------------
 
     def _current_engine_id(self) -> str:
-        """engine_id de una entrada INSTALADA seleccionada ("" si no hay)."""
+        """engine_id de una entrada INSTALADA y RUNNABLE ("" si no hay)."""
         data = self.combo.currentData()
         if isinstance(data, dict):
-            if data.get("search") or data.get("installed") is False:
+            if (data.get("search") or data.get("unavailable")
+                    or data.get("supported") is False
+                    or data.get("installed") is False):
                 return ""
             return str(data.get("engine_id") or "")
         return str(data or "")
+
+    def _activation_block_reason(self) -> str:
+        """Mensaje explícito si este nodo no puede activarse; "" si puede.
+
+        Un nodo sin ningún modelo ejecutable no debe activarse en silencio:
+        el pipeline lo ignoraría y el usuario creería que hizo algo.
+        """
+        if self._runnable_installed:
+            return ""
+        names = ", ".join(getattr(self, "_unsupported_names", []) or [])
+        if self._runnable_available:
+            return (
+                f"{self.category}: no model is installed yet.\n\n"
+                "Pick one from the list to download it first; this node stays "
+                "inactive until a runnable model is installed."
+            )
+        return (
+            f"{self.category} is {NOT_AVAILABLE_LABEL}.\n\n"
+            f"{names or 'This model type'} need an inference loader that is not "
+            "shipped in this release.\n\n"
+            "Only Real-ESRGAN/CUGAN/OmniSR upscaling and RIFE interpolation "
+            "can run here; no model will be downloaded for this node."
+        )
 
     def _restore_engine_selection(self, engine_id):
         """Vuelve a ``engine_id`` sin re-emitir ``engine_changed``."""
@@ -633,6 +665,16 @@ class AIWorkflowStep(QFrame):
         if isinstance(data, dict) and data.get("search"):
             self._restore_engine_selection(getattr(self, "_last_engine_id", ""))
             self.search_requested.emit(self.category)
+            return
+        if isinstance(data, dict) and data.get("supported") is False:
+            # Las entradas no ejecutables están deshabilitadas en el combo;
+            # si algo las selecciona por código, no se deja a medias.
+            self._restore_engine_selection(getattr(self, "_last_engine_id", ""))
+            QMessageBox.information(
+                self,
+                "Not available in this build",
+                data.get("reason") or f"{self.category} is {NOT_AVAILABLE_LABEL}.",
+            )
             return
         # OJO: el id crudo, no ``_current_engine_id()`` (que devuelve ""
         # justo para las entradas no instaladas).
@@ -725,10 +767,20 @@ class AIWorkflowStep(QFrame):
         self._toggle_active()
 
     def _toggle_active(self):
+        if not self.active:
+            blocked = self._activation_block_reason()
+            if blocked:
+                title = (
+                    "Model not installed yet"
+                    if self._runnable_available
+                    else "Not available in this build"
+                )
+                QMessageBox.information(self, title, blocked)
+                return
         self.active = not self.active
         self._refresh_active_styles()
         self.active_changed.emit(self.name, bool(self.active))
-        self.combo.setEnabled(self.combo.count() > 1)
+        self.combo.setEnabled(bool(self._runnable_total))
 
     def _refresh_active_styles(self):
         self.setProperty("active", "true" if self.active else "false")
@@ -743,14 +795,19 @@ class AIWorkflowStep(QFrame):
         """Re-query the catalog+state. Called on construct AND whenever
         the bus broadcasts a state change.
 
-        El desplegable muestra TODO el catálogo de la categoría, no sólo lo
-        instalado: un nodo "vacío" era la razón de que Real-ESR AnimeVideo
-        v3 (y los modelos de face restore/denoise/colorize) no se pudieran
-        ni ver ni elegir. Los no instalados se marcan con ⬇ y su descarga se
-        pide al pulsarlos.
+        Sólo se ofrecen modelos que este build puede cargar de verdad:
+        ``rrdb/srvgg/cugan/omnisr`` (PyTorch) y RIFE (ONNX). El resto del
+        catálogo se muestra DESHABILITADO y con el motivo explícito, sin ⬇ y
+        sin botón de búsqueda, para que no se descargue algo que luego
+        fallaría al cargar. Si no hay ningún modelo ejecutable, el nodo
+        entero queda inactivo y avisa al pulsarlo.
         """
         try:
-            from src.ai.registry import CATALOG, list_installed as _list_installed
+            from src.ai.registry import (
+                CATALOG,
+                get_catalog_arch,
+                list_installed as _list_installed,
+            )
             self._installed = _list_installed(self.category)
             catalog = [
                 entry for entry in CATALOG
@@ -765,8 +822,7 @@ class AIWorkflowStep(QFrame):
 
         # Pesos ya presentes en disco aunque engines.json no los marque como
         # instalados (p.ej. GFPGAN/CodeFormer/DeOldify descargados desde el
-        # buscador HF): se tratan como instalados para poder elegirlos sin
-        # volver a descargar cientos de MB.
+        # buscador HF): se listan, pero sólo se habilitan si hay loader.
         known = {e.get("engine_id") for e in self._installed}
         for entry in catalog:
             eid = entry.get("engine_id", "")
@@ -783,67 +839,172 @@ class AIWorkflowStep(QFrame):
 
         # Scan model files for all installed engines.
         self._all_model_files = self._scan_model_files()
+        onnx_ids = {
+            m.get("engine_id") for m in self._all_model_files
+            if str(m.get("model_path") or "").lower().endswith(".onnx")
+        }
 
-        # 1) Instalados primero: son los únicos que pueden renderizar ya.
+        def _support(entry, installed):
+            eid = entry.get("engine_id", "")
+            arch = entry.get("arch") or ""
+            if not arch:
+                try:
+                    arch = get_catalog_arch(eid) or ""
+                except Exception:
+                    arch = ""
+            onnx = eid in onnx_ids
+            if not installed:
+                onnx = onnx or bool(entry.get("onnx_repo_id"))
+            return runtime_support(arch, onnx)
+
         installed_by_id = {}
+        installed_runnable = []
+        installed_unavailable = []
         for entry in self._installed:
             eid = entry.get("engine_id", "")
-            if eid:
-                installed_by_id.setdefault(eid, entry)
-        for eid, entry in installed_by_id.items():
-            self.combo.addItem(
-                entry.get("display_name", eid),
-                {"engine_id": eid, "installed": True},
-            )
+            if not eid or eid in installed_by_id:
+                continue
+            installed_by_id[eid] = entry
+            ok, reason = _support(entry, True)
+            if ok:
+                installed_runnable.append((eid, entry))
+            else:
+                installed_unavailable.append((eid, entry, reason))
 
-        # 2) Resto del catálogo: visible y descargable desde el propio nodo.
-        available = set()
+        available_runnable = []
+        available_unavailable = []
         for entry in catalog:
             eid = entry.get("engine_id", "")
             if not eid or eid in installed_by_id:
                 continue
+            ok, reason = _support(entry, False)
+            if ok:
+                available_runnable.append((eid, entry))
+            else:
+                available_unavailable.append((eid, entry, reason))
+
+        self._runnable_installed = len(installed_runnable)
+        self._runnable_available = len(available_runnable)
+        self._runnable_total = self._runnable_installed + self._runnable_available
+        self._available = {eid for eid, _ in available_runnable}
+        unsupported_entries = installed_unavailable + available_unavailable
+        self._unsupported_count = len(unsupported_entries)
+        self._unsupported_names = [
+            entry.get("display_name", eid)
+            for eid, entry, _ in unsupported_entries
+        ]
+
+        # Ningún modelo ejecutable: una sola entrada explicativa, sin
+        # descargas ni búsqueda que prometan algo que el build no puede hacer.
+        if self._runnable_total == 0:
+            reason = (
+                unsupported_entries[0][2] if unsupported_entries
+                else f"{NOT_AVAILABLE_LABEL}: this model type has no runnable engine"
+            )
+            self._add_unavailable_item(
+                f"{self.category} — {NOT_AVAILABLE_LABEL}",
+                {"unavailable": True, "supported": False, "reason": reason},
+            )
+            self.combo.setCurrentIndex(0)
+            self.combo.blockSignals(False)
+            self.combo.setEnabled(False)
+            self.combo.setToolTip(reason)
+            self._last_engine_id = ""
+            self._pending_engine_id = ""
+            self.btn_search.setVisible(False)
+            self._populate_scale_dropdown("")
+            self._render_status()
+            return
+
+        # 1) Instalados y ejecutables primero.
+        for eid, entry in installed_runnable:
+            self.combo.addItem(
+                entry.get("display_name", eid),
+                {"engine_id": eid, "installed": True, "supported": True},
+            )
+
+        # 2) Resto ejecutable del catálogo: visible y descargable.
+        for eid, entry in available_runnable:
             size = entry.get("onnx_size_estimate") or entry.get("size_estimate") or ""
             label = f"⬇ {entry.get('display_name', eid)}"
             if size:
                 label += f" ({size})"
-            self.combo.addItem(label, {"engine_id": eid, "installed": False})
-            available.add(eid)
-        self._available = available
+            self.combo.addItem(
+                label,
+                {"engine_id": eid, "installed": False, "supported": True},
+            )
 
-        # 3) Buscador de Hugging Face siempre a mano en el propio nodo.
-        if self.combo.count():
+        # 3) Catálogo no ejecutable: visible pero deshabilitado y sin ⬇.
+        if unsupported_entries:
             self.combo.insertSeparator(self.combo.count())
+            for eid, entry, reason in unsupported_entries:
+                self._add_unavailable_item(
+                    f"{entry.get('display_name', eid)} — {NOT_AVAILABLE_LABEL}",
+                    {
+                        "engine_id": eid,
+                        "installed": eid in installed_by_id,
+                        "supported": False,
+                        "unavailable": True,
+                        "reason": reason,
+                    },
+                )
+
+        # 4) Buscador de Hugging Face (sólo si la categoría puede ejecutar).
+        self.combo.insertSeparator(self.combo.count())
         self.combo.addItem("🔍 Search Hugging Face…", {"search": True})
 
-        # Si venimos de pedir la descarga de un motor que ya está en disco,
-        # seleccionarlo automáticamente.
+        # Si venimos de pedir la descarga de un motor que ya está en disco y
+        # es ejecutable, seleccionarlo automáticamente.
         pending = getattr(self, "_pending_engine_id", "")
-        if pending and pending in installed_by_id:
+        runnable_ids = {eid for eid, _ in installed_runnable}
+        if pending and pending in runnable_ids:
             prev_engine = pending
             self._pending_engine_id = ""
 
-        # Restore previous selection (only installed entries count).
-        idx_to_set = 0
+        # Restaurar selección: sólo cuentan las entradas instaladas y
+        # ejecutables. Sin ninguna, no se selecciona una descarga a medias.
+        idx_to_set = -1
         for i in range(self.combo.count()):
             data = self.combo.itemData(i)
-            if isinstance(data, dict) and data.get("engine_id") == prev_engine:
+            if (isinstance(data, dict) and data.get("installed")
+                    and data.get("supported")
+                    and data.get("engine_id") == prev_engine):
                 idx_to_set = i
                 break
+        if idx_to_set < 0 and installed_runnable:
+            idx_to_set = 0
         self.combo.setCurrentIndex(idx_to_set)
-        selected = self.combo.itemData(idx_to_set)
+        selected = self.combo.itemData(idx_to_set) if idx_to_set >= 0 else None
         self._last_engine_id = (
             str(selected.get("engine_id", ""))
-            if isinstance(selected, dict) and selected.get("installed")
+            if isinstance(selected, dict)
+            and selected.get("installed")
+            and selected.get("supported")
             else ""
         )
+        if idx_to_set < 0:
+            self.combo.setPlaceholderText("Select a model to download…")
         self.combo.blockSignals(False)
 
-        # Populate scale dropdown for the current engine.
+        self.combo.setEnabled(True)
+        self.combo.setToolTip("")
+        self.btn_search.setVisible(True)
         self._populate_scale_dropdown(self._current_engine_id())
-
-        # Siempre operativo: elegir modelo no exige activar el nodo antes.
-        self.combo.setEnabled(self.combo.count() > 1)
         self._render_status()
+
+    def _add_unavailable_item(self, label, data):
+        """Añade una opción visible pero no seleccionable, con su motivo."""
+        self.combo.addItem(label, data)
+        idx = self.combo.count() - 1
+        self.combo.setItemData(
+            idx, data.get("reason", ""), Qt.ItemDataRole.ToolTipRole
+        )
+        try:
+            item = self.combo.model().item(idx)
+            if item is not None:
+                item.setEnabled(False)
+        except Exception:
+            pass
 
     def _engine_has_weights(self, engine_id: str) -> bool:
         """True si el directorio del motor ya contiene pesos utilizables."""
@@ -981,28 +1142,30 @@ class AIWorkflowStep(QFrame):
             self.status_label.setProperty("link", False)
             self.status_label.setCursor(Qt.CursorShape.ArrowCursor)
             return
-        n_installed = len({
-            e.get("engine_id") for e in getattr(self, "_installed", [])
-            if e.get("engine_id")
-        })
-        n_available = len(getattr(self, "_available", set()))
-        if n_installed == 0:
-            if n_available:
-                self.status_label.setText(
-                    f"No engines installed · {n_available} available — pick one to download"
-                )
-            else:
-                self.status_label.setText(
-                    "No engines — click to open AI Engines Manager"
-                )
-            self.status_label.setProperty("link", True)
-            self.status_label.setCursor(Qt.CursorShape.PointingHandCursor)
+        if self._runnable_total == 0:
+            names = ", ".join(self._unsupported_names) or "these models"
+            self.status_label.setText(
+                f"{self.category} {NOT_AVAILABLE_LABEL}: {names}"
+            )
+            self.status_label.setProperty("link", False)
+            self.status_label.setCursor(Qt.CursorShape.ArrowCursor)
             return
+        if self._runnable_installed == 0:
+            human = (
+                f"No model installed · {self._runnable_available} runnable "
+                "available to download"
+            )
+        else:
+            human = (
+                f"{self._runnable_installed} installed · "
+                f"{self._runnable_available} to download"
+            )
+        if self._unsupported_count:
+            human += f" · {self._unsupported_count} {NOT_AVAILABLE_LABEL}"
         current_id = self._current_engine_id()
         current = self.combo.currentText() if current_id else ""
         if len(current) > 26:
             current = current[:25] + "…"
-        human = f"{n_installed} installed · {n_available} available"
         if current:
             human += f" · active: {current}"
         self.status_label.setText(human)
@@ -1022,7 +1185,7 @@ class AIWorkflowStep(QFrame):
             self.active = bool(value)
             self._refresh_active_styles()
             self.active_changed.emit(self.name, self.active)
-        self.combo.setEnabled(self.combo.count() > 1)
+        self.combo.setEnabled(bool(self._runnable_total))
 
     def get_selected_engine_id(self) -> str:
         """Return the dropdown's engine_id (empty string if none)."""
