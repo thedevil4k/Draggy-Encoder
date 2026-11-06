@@ -49,6 +49,43 @@ def get_bin_dir():
     return os.path.join(get_data_dir(), "bin")
 
 
+def get_temp_dir():
+    """Directorio temporal privado de la aplicación, junto a sus datos.
+
+    Los bundles portables no deben dejar temporales en el perfil del usuario
+    ni en ``%TEMP%``: el render, el host de IA y el propio selftest pueden
+    necesitar varios cientos de MB y el usuario eligió la unidad de
+    instalación para todo lo pesado. Se mantiene dentro de ``bin`` para que
+    la limpieza sea la misma que la de modelos, runtimes y logs.
+    """
+    return os.path.join(get_bin_dir(), "tmp")
+
+
+def configure_process_temp():
+    """Redirige los temporales del proceso (y de sus hijos) a ``bin/tmp``.
+
+    Hay que fijar las tres variables de entorno y ``tempfile.tempdir``:
+    Python cachea el primer ``gettempdir()`` y, si ya se llamó antes, cambiar
+    solo ``TMP``/``TEMP`` no mueve los ficheros que crea ``tempfile``. Los
+    procesos hijos (ffmpeg, Python privado del host) heredan las variables.
+
+    Devuelve la ruta configurada o ``None`` si no se pudo crear/escribir.
+    """
+    import tempfile
+
+    path = get_temp_dir()
+    try:
+        os.makedirs(path, exist_ok=True)
+        if not os.access(path, os.W_OK):
+            return None
+    except OSError:
+        return None
+    for var in ("TMP", "TEMP", "TMPDIR"):
+        os.environ[var] = path
+    tempfile.tempdir = path
+    return path
+
+
 def get_ffmpeg_dir():
     """Subcarpeta dedicada a FFmpeg (ffmpeg.exe + ffprobe.exe + manifest)."""
     return os.path.join(get_bin_dir(), "ffmpeg")

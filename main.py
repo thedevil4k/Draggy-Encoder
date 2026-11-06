@@ -17,8 +17,18 @@ import logging
 # perfil del usuario en paquetes Linux instalados). Importar src.config aquí
 # es seguro: solo usa os/sys/platform y NO dispara torch/PySide6.
 try:
-    from src.config import ensure_runtime_dirs, get_logs_dir
+    from src.config import (
+        configure_process_temp,
+        ensure_runtime_dirs,
+        get_logs_dir,
+    )
     ensure_runtime_dirs()
+    # El render, el host de IA y el guard del selftest crean temporales. En
+    # un bundle portable deben vivir junto a la app, no en C:/%TEMP%.
+    try:
+        configure_process_temp()
+    except Exception:
+        pass
     _APP_LOG_PATH = os.path.join(get_logs_dir(), "app.log")
     _FAULTHANDLER_LOG_PATH = os.path.join(get_logs_dir(), "faulthandler.log")
 except Exception:
@@ -245,16 +255,22 @@ def _heavy_guard_check(report, manager, module_name: str, label: str,
             "prueba (¿el Python privado no puede importar?)"
         )
         return False
-    if not status.get("gpu"):
+    # ``gpu`` es una CAPACIDAD, no un requisito: en un equipo sin CUDA
+    # onnx_status() devuelve gpu=False porque el runtime CPU es válido.
+    # Exigir True convertía una instalación CPU perfectamente utilizable en
+    # FAIL. Lo que este guard debe demostrar es que la sonda respondió (la
+    # clave existe) y que el post-install corrió fuera de este proceso.
+    if "gpu" not in status:
         report(
             f"  FAIL guard {module_name} ({label}): la sonda no reportó "
-            "capacidades (cuda) desde el subproceso"
+            "capacidades (ni cuda ni cpu) desde el subproceso"
         )
         return False
     if not post_ok:
         report(f"  FAIL guard {module_name} ({label}): post-install: {detail}")
         return False
-    report(f"  OK   guard {module_name} ({label}): sin import in-process")
+    capability = "GPU" if status.get("gpu") else "CPU"
+    report(f"  OK   guard {module_name} ({label}): sin import in-process ({capability})")
     return True
 
 
@@ -268,13 +284,16 @@ def _selftest_heavy_runtime_guard(report, check_real_store: bool | None = None) 
     import shutil
     import tempfile
 
+    from src.config import get_temp_dir
     from src.runtimes import manager
 
     if check_real_store is None:
         check_real_store = bool(getattr(sys, "frozen", False))
 
     ok = True
-    store = tempfile.mkdtemp(prefix="draggy-guard-")
+    guard_root = get_temp_dir()
+    os.makedirs(guard_root, exist_ok=True)
+    store = tempfile.mkdtemp(prefix="draggy-guard-", dir=guard_root)
     original_store = manager.RUNTIME_MODULES_DIR
     original_path = list(sys.path)
     try:
@@ -382,12 +401,33 @@ def _selftest_model_capabilities(report) -> bool:
         widget = WorkflowWidget()
         problems = []
         try:
+            installed_categories = []
             for name in ("Denoise", "Colorize", "FaceRestore"):
                 step = next(
                     (s for s in widget.middle_steps if s.name == name), None
                 )
                 if step is None:
                     problems.append(f"{name}: nodo ausente")
+                    continue
+                # Un motor de usuario instalado es una configuración válida:
+                # la app debe ofrecerlo y seleccionarlo. El supuesto antiguo
+                # (todos estos nodos siempre bloqueados) solo es cierto en un
+                # bundle limpio sin modelos instalados, no en esta instalación.
+                installed_runnable = int(
+                    getattr(step, "_runnable_installed", 0) or 0
+                )
+                if installed_runnable:
+                    installed_categories.append(name)
+                    if not step.combo.isEnabled():
+                        problems.append(
+                            f"{name}: motor instalado pero desplegable deshabilitado"
+                        )
+                    # Un nodo inactivo devuelve "" por diseño; la selección
+                    # solo es obligatoria cuando el usuario lo activa.
+                    if getattr(step, "active", False) and not step.get_selected_engine_id():
+                        problems.append(
+                            f"{name}: motor instalado pero sin selección"
+                        )
                     continue
                 text = step.combo.itemText(0) if step.combo.count() else ""
                 if NOT_AVAILABLE_LABEL not in text.lower():
@@ -429,7 +469,14 @@ def _selftest_model_capabilities(report) -> bool:
         if problems:
             report("  FAIL workflow capabilities: " + "; ".join(problems))
             return False
-        report("  OK   workflow: modelos sin loader marcados como no disponibles")
+        if installed_categories:
+            report(
+                "  OK   workflow: motores instalados habilitados "
+                f"({', '.join(installed_categories)}); "
+                "categorías sin loader bloqueadas"
+            )
+        else:
+            report("  OK   workflow: modelos sin loader marcados como no disponibles")
         return True
     except Exception:
         report(
@@ -590,6 +637,10 @@ if __name__ == "__main__":
         from src.crash_report import open_crash_report
         open_crash_report()
         sys.exit(0)
+    if "--encode-job" in sys.argv:
+        from src.cli_encode import run_encode_cli
+        # sys.argv[0] es el ejecutable; el parser recibe solo los argumentos.
+        sys.exit(run_encode_cli(sys.argv[1:]))
     if "--selftest" in sys.argv:
         sys.exit(run_selftest())
     # Import diferido: importar PySide6/QtGUI solo cuando se va a abrir la
