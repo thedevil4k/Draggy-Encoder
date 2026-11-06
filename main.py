@@ -674,6 +674,12 @@ if __name__ == "__main__":
         from src.cli_encode import run_encode_cli
         # sys.argv[0] es el ejecutable; el parser recibe solo los argumentos.
         sys.exit(run_encode_cli(sys.argv[1:]))
+    # Instalación desatendida de un motor: usa el mismo diálogo, worker de
+    # HuggingFace y host de IA que el botón Add Engine de la GUI. Permite
+    # verificar la descarga de extremo a extremo en el EXE publicado.
+    if "--install-engine" in sys.argv:
+        from src.cli_install_engine import run_install_engine_cli
+        sys.exit(run_install_engine_cli(sys.argv[1:]))
     if "--selftest" in sys.argv:
         sys.exit(run_selftest())
     # Import diferido: importar PySide6/QtGUI solo cuando se va a abrir la
