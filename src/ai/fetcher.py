@@ -35,6 +35,12 @@ from PySide6.QtCore import QThread, Signal
 
 _log = logging.getLogger(__name__)
 
+# Se fija también a nivel de módulo para cualquier entrypoint que importe
+# este worker sin pasar por main.py. El helper de abajo corrige además el
+# caso en que huggingface_hub ya se haya importado (hf_search lo hace para
+# el navegador de modelos) y sus constantes ya estén cacheadas.
+os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
+
 
 # ---------------------------------------------------------------------------
 # Capability probes
@@ -63,6 +69,34 @@ def _cleanup_partial(target_dir: str) -> None:
             shutil.rmtree(target_dir, ignore_errors=True)
         except Exception:
             pass
+
+
+def _configure_hf_download_environment() -> Optional[str]:
+    """Disable HF progress bars and keep its cache off the system drive.
+
+    ``HF_HUB_DISABLE_PROGRESS_BARS`` is read when huggingface_hub is first
+    imported. The model browser may import it before this worker runs, so
+    setting the environment variable here is not enough; we also flip the
+    already-imported constant. ``HF_HOME``/``HF_HUB_CACHE`` are pointed at
+    the app's own ``bin/.cache`` so a model download never fills C:.
+    """
+    os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
+    cache_dir = None
+    try:
+        from src.config import get_bin_dir
+        hf_home = os.path.join(get_bin_dir(), ".cache", "huggingface")
+        cache_dir = os.path.join(hf_home, "hub")
+        os.makedirs(cache_dir, exist_ok=True)
+        os.environ["HF_HOME"] = hf_home
+        os.environ["HF_HUB_CACHE"] = cache_dir
+    except Exception as exc:
+        _log.warning("No se pudo configurar la caché HF en el directorio de datos: %s", exc)
+    try:
+        import huggingface_hub.constants as hf_constants
+        hf_constants.HF_HUB_DISABLE_PROGRESS_BARS = True
+    except Exception:
+        pass
+    return cache_dir
 
 
 # ---------------------------------------------------------------------------
@@ -120,8 +154,8 @@ class HFDownloadWorker(QThread):
         # In PyInstaller GUI builds (console=False), sys.stderr is None.
         # HuggingFace's tqdm progress bars crash trying to write to it.
         # Disable them — the worker already manages its own progress via
-        # Qt signals.
-        os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
+        # Qt signals. Also keep the HF cache beside the app's data.
+        cache_dir = _configure_hf_download_environment()
 
         try:
             from huggingface_hub import HfApi, hf_hub_download
@@ -210,6 +244,7 @@ class HFDownloadWorker(QThread):
                             repo_id=self.repo_id,
                             filename=filename,
                             local_dir=self.target_dir,
+                            cache_dir=cache_dir,
                             token=_token,
                         )
                         last_error = None
@@ -332,7 +367,7 @@ class OnnxFileDownloadWorker(QThread):
             self.failed.emit("cancelled before start")
             return
 
-        os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
+        cache_dir = _configure_hf_download_environment()
 
         try:
             from huggingface_hub import hf_hub_download
@@ -384,6 +419,7 @@ class OnnxFileDownloadWorker(QThread):
                     repo_id=self.repo_id,
                     filename=self.filename,
                     local_dir=self.target_dir,
+                    cache_dir=cache_dir,
                     token=_token,
                 )
                 last_error = None

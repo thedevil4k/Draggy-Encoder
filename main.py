@@ -4,6 +4,12 @@ import os
 # Asegurar que src/ esté en el path para imports
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+# HuggingFace lee esto al importar el paquete. En el EXE windowed
+# sys.stderr es None y tqdm falla con "'NoneType' object has no attribute
+# 'write'" al descargar modelos. Debe quedar fijado ANTES de que hf_search
+# importe huggingface_hub; hacerlo solo dentro del worker llega tarde.
+os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
+
 # ---------------------------------------------------------------------------
 # Logging centralizado + sys.excepthook (lo antes posible, antes de importar
 # nada más). El ejecutable empaquetado es "windowed" (sin consola):
@@ -20,9 +26,17 @@ try:
     from src.config import (
         configure_process_temp,
         ensure_runtime_dirs,
+        get_bin_dir,
         get_logs_dir,
     )
     ensure_runtime_dirs()
+    # La caché de HuggingFace también debe vivir junto a los datos de la
+    # app, no en C:\Users\...\.cache\huggingface. Se fija antes de cualquier
+    # import de huggingface_hub.
+    _hf_home = os.path.join(get_bin_dir(), ".cache", "huggingface")
+    os.makedirs(os.path.join(_hf_home, "hub"), exist_ok=True)
+    os.environ["HF_HOME"] = _hf_home
+    os.environ["HF_HUB_CACHE"] = os.path.join(_hf_home, "hub")
     # El render, el host de IA y el guard del selftest crean temporales. En
     # un bundle portable deben vivir junto a la app, no en C:/%TEMP%.
     try:
@@ -584,6 +598,25 @@ def run_selftest() -> int:
     except Exception:
         ok = False
         report("  FAIL runtime dirs:\n  " + traceback.format_exc().strip())
+
+    # La descarga de modelos de HuggingFace usa tqdm; en el EXE windowed
+    # sys.stderr es None. El selftest comprueba que el arranque desactiva las
+    # barras y que la caché HF queda dentro de bin/, no en C:.
+    try:
+        from src.ai.fetcher import _configure_hf_download_environment
+        hf_cache = _configure_hf_download_environment()
+        if os.environ.get("HF_HUB_DISABLE_PROGRESS_BARS") != "1":
+            raise RuntimeError("HF_HUB_DISABLE_PROGRESS_BARS no está activo")
+        if not hf_cache:
+            raise RuntimeError("No se pudo configurar la caché de HuggingFace")
+        from src.config import get_bin_dir as _get_bin_dir
+        bin_root = os.path.abspath(_get_bin_dir())
+        if not os.path.abspath(hf_cache).startswith(bin_root + os.sep):
+            raise RuntimeError(f"caché HF fuera de bin: {hf_cache}")
+        report(f"  OK   HuggingFace: progreso desactivado, caché {hf_cache}")
+    except Exception:
+        ok = False
+        report("  FAIL HuggingFace setup:\n  " + traceback.format_exc().strip())
 
     if getattr(sys, "frozen", False):
         try:

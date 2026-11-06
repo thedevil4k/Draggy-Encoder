@@ -2094,6 +2094,26 @@ def test_hf_download_worker_cancel_contract(qapp):
     w.deleteLater()
 
 
+def test_hf_download_environment_disables_progress_and_uses_d_drive(monkeypatch, tmp_path):
+    """HF must not draw tqdm on a None stderr, and its cache must live with
+    Draggy's data (not in C:\\Users\\...\\.cache)."""
+    import huggingface_hub.constants as hf_constants
+    from src.ai import fetcher
+
+    monkeypatch.setenv("DRAGGY_DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("HF_HUB_DISABLE_PROGRESS_BARS", "0")
+    monkeypatch.setattr(hf_constants, "HF_HUB_DISABLE_PROGRESS_BARS", None)
+
+    cache_dir = fetcher._configure_hf_download_environment()
+
+    assert os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] == "1"
+    assert hf_constants.HF_HUB_DISABLE_PROGRESS_BARS is True
+    assert cache_dir == os.path.join(
+        str(tmp_path), "bin", ".cache", "huggingface", "hub"
+    )
+    assert os.path.isdir(cache_dir)
+
+
 # ==--------------------------------------------------------------------==
 # 6. GPU NVENC rescale + compress smoke test (real encode)
 # ==--------------------------------------------------------------------==
