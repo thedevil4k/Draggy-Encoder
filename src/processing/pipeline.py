@@ -703,6 +703,14 @@ def generate_preview(ffmpeg_path, input_path, settings, progress_callback=None,
     # 5 s desde el 20 % del vídeo + frame aleatorio reproducible. El parámetro
     # tiene prioridad; si llega por settings (el camino normal desde la UI)
     # se lee de ahí también.
+    #
+    # Una preview con IA NO necesita un clip: el diálogo solo enseña un
+    # fotograma. Renderizar 5 s por la cadena de modelos significaba procesar
+    # 125 fotogramas (25 fps) para mostrar uno; con Real-ESRGAN x4 eso son
+    # minutos. En ese camino se codifica UN solo fotograma en el instante
+    # elegido. La preview sin IA conserva el clip de 5 s y su selector porque
+    # FFmpeg lo genera en una fracción de segundo.
+    single_frame_preview = bool(inference_engines)
     if preview_time is None:
         preview_time = settings.get("preview_time")
     try:
@@ -711,17 +719,26 @@ def generate_preview(ffmpeg_path, input_path, settings, progress_callback=None,
         t = None
 
     if t is not None:
-        # Clip de 5 s centrado en ``t``, recortado a [0, duration].
-        start = max(0.0, t - 2.5)
-        end = min(duration, t + 2.5) if duration > 0 else t + 2.5
-        if end <= start:
-            end = start + 5.0
-            if duration > 0:
-                end = min(end, duration)
-        clip_length = max(0.1, end - start)
-        # Frame exacto pedido (offset dentro del clip), nunca más allá del
-        # final real del clip.
-        frame_offset = min(max(0.0, t - start), clip_length - 0.1)
+        if single_frame_preview:
+            # Un frame: el decoder solo tiene que entregar el primero. El
+            # ``-t`` amplio evita depender del redondeo del fps; el pipeline
+            # corta después del primer frame (``max_frames``).
+            start = max(0.0, min(t, max(0.0, duration - 0.1)))
+            end = min(duration, start + 0.1) if duration > 0 else start + 0.1
+            clip_length = max(0.1, end - start)
+            frame_offset = 0.0
+        else:
+            # Clip de 5 s centrado en ``t``, recortado a [0, duration].
+            start = max(0.0, t - 2.5)
+            end = min(duration, t + 2.5) if duration > 0 else t + 2.5
+            if end <= start:
+                end = start + 5.0
+                if duration > 0:
+                    end = min(end, duration)
+            clip_length = max(0.1, end - start)
+            # Frame exacto pedido (offset dentro del clip), nunca más allá del
+            # final real del clip.
+            frame_offset = min(max(0.0, t - start), clip_length - 0.1)
     else:
         start = max(0, duration * 0.2) if duration > 0 else 0
         end = start + min(5, max(1, duration - start))
@@ -734,6 +751,14 @@ def generate_preview(ffmpeg_path, input_path, settings, progress_callback=None,
         # basada en el path para reproducibilidad entre previews.
         rng = random.Random(input_path)
         frame_offset = rng.uniform(0.1, max(0.2, clip_length - 0.1))
+        if single_frame_preview:
+            # El instante aleatorio sigue siendo el mismo de siempre, pero
+            # ahora la ventana se reduce a ese único fotograma.
+            chosen = start + frame_offset
+            start = max(0.0, min(chosen, max(0.0, duration - 0.1)))
+            end = min(duration, start + 0.1) if duration > 0 else start + 0.1
+            clip_length = max(0.1, end - start)
+            frame_offset = 0.0
 
     # Medimos loudness SOBRE EL MISMO CLIP que se va a codificar. El preview
     # solo enseña una imagen (y el fragmento de audio lo mide su propio
@@ -756,6 +781,15 @@ def generate_preview(ffmpeg_path, input_path, settings, progress_callback=None,
         preview_settings["audio_boost"] = False
         preview_settings["start_time"] = str(start)
         preview_settings["end_time"] = str(end)
+        if inference_engines:
+            # El pipeline de IA comprueba la cadena con un frame sintético del
+            # tamaño real (pipeline.py: validate_ai_chain_contract). En una
+            # preview ese chequeo cuesta otra inferencia completa y duplica la
+            # espera; el worker ya validó la cadena una vez con 64x64 antes de
+            # llamar aquí. La preview comprueba el resultado final de todas
+            # formas (frame JPEG + dimensiones).
+            preview_settings["skip_ai_contract_probe"] = True
+            preview_settings["max_frames"] = 1
 
         fmt = settings.get("format", "mp4")
         compressed_path = os.path.join(tmpdir, f"preview_compressed.{fmt}")
@@ -763,6 +797,8 @@ def generate_preview(ffmpeg_path, input_path, settings, progress_callback=None,
             # Use the exact frame-by-frame pipeline used by Compress. The
             # preview settings already disable audio and constrain the input
             # to the short clip above, so no temporary audio track is needed.
+            if status_callback:
+                status_callback("AI preview: rendering one frame...")
             ok = compress_video_with_ai(
                 ffmpeg_path,
                 input_path,
@@ -870,6 +906,7 @@ def generate_preview(ffmpeg_path, input_path, settings, progress_callback=None,
             "ffmpeg": ffmpeg_path,
             "duration": duration,
             "time": original_time,
+            "single_frame": single_frame_preview,
         }
         _emit_phase(phase_cb, "progress", "preview", pct=100)
         _emit_phase(phase_cb, "end", "preview")
@@ -1145,6 +1182,16 @@ def compress_video_with_ai(
     if not engines:
         raise ValueError("compress_video_with_ai got an empty engine list")
 
+    # Preview-only cap: the UI renders exactly one frame through the AI chain
+    # and then stops. Without it, a 5 s preview at 25 fps runs 125 inferences
+    # just to display one still comparison.
+    try:
+        max_frames = int(settings.get("max_frames") or 0)
+    except (TypeError, ValueError):
+        max_frames = 0
+    if max_frames < 0:
+        max_frames = 0
+
     # Render into a staging file next to the final destination. This keeps
     # direct callers safe as well as the GUI worker: only a fully finalized
     # video is ever published under ``output_path``.
@@ -1177,6 +1224,10 @@ def compress_video_with_ai(
     except (TypeError, ValueError):
         nb_frames_int = 0
     total_frames = nb_frames_int or est_total
+    if max_frames:
+        # Progress and the completion line refer to the frames really sent
+        # through the chain, not the whole source duration.
+        total_frames = max_frames
 
     # Geometría de la frame que sale del decoder, resuelta una sola vez: todo
     # lo que sigue (frame_size, reshape, tamaño del encoder, export, probe)
@@ -1370,7 +1421,13 @@ def compress_video_with_ai(
     # seguía (horas de GPU) y el vídeo salía sin el paso que el usuario pidió.
     # Colocado antes del audio en paralelo, bloquear no deja nada a medias.
     try:
-        validate_ai_chain_contract(engines, src.height, src.width, strict=True)
+        if settings.get("skip_ai_contract_probe"):
+            # The preview worker already validated the chain with a small
+            # synthetic frame. Re-running the probe at full source resolution
+            # costs one more expensive inference and doubles preview latency.
+            logger.debug("AI contract probe skipped for preview")
+        else:
+            validate_ai_chain_contract(engines, src.height, src.width, strict=True)
     except AIChainUnusable as exc:
         for _e in engines:
             _reset = getattr(_e, "reset_cumulative_timing", None)
@@ -1847,6 +1904,8 @@ def compress_video_with_ai(
     try:
         while True:
             frame_t0 = time.perf_counter()
+            if max_frames and frame_num >= max_frames:
+                break
             if abort_event and abort_event.is_set():
                 break
 
@@ -2180,16 +2239,24 @@ def compress_video_with_ai(
     # Duración esperada REAL del trozo renderizado. Antes, en cuanto
     # ``start_time`` traía cualquier valor, la comprobación se saltaba entera:
     # un render truncado con Trim podía publicarse sin revisarse.
-    try:
-        _full_duration = _get_duration_seconds(ffmpeg_path, input_path)
-        if _decode_end_s is not None and _decode_end_s > _decode_start_s:
-            _expected_duration = _decode_end_s - _decode_start_s
-        elif _decode_start_s:
-            _expected_duration = max(0.0, _full_duration - _decode_start_s)
-        else:
-            _expected_duration = _full_duration
-    except Exception:
+    #
+    # Con ``max_frames`` la salida es un still de un frame (0,04 s a 25 fps),
+    # no la ventana completa: compararla con la ventana haría fallar la
+    # validación por "unexpectedly shorter". El gate de FFprobe sigue
+    # exigiendo stream y duración válidos.
+    if max_frames:
         _expected_duration = None
+    else:
+        try:
+            _full_duration = _get_duration_seconds(ffmpeg_path, input_path)
+            if _decode_end_s is not None and _decode_end_s > _decode_start_s:
+                _expected_duration = _decode_end_s - _decode_start_s
+            elif _decode_start_s:
+                _expected_duration = max(0.0, _full_duration - _decode_start_s)
+            else:
+                _expected_duration = _full_duration
+        except Exception:
+            _expected_duration = None
     valid, detail = validate_render_output(
         ffmpeg_path,
         output_path,

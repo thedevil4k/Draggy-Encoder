@@ -2094,6 +2094,61 @@ def test_hf_download_worker_cancel_contract(qapp):
     w.deleteLater()
 
 
+def test_hf_auth_error_hint_explicitly_names_missing_api_key():
+    """Un fallo de autenticación sin token debe decir que falta la API key."""
+    from src.ai.fetcher import hf_auth_error_hint, is_hf_auth_error
+
+    message = "401 Client Error: Unauthorized for url: https://huggingface.co/..."
+    assert is_hf_auth_error(message) is True
+
+    hint = hf_auth_error_hint(message, token_configured=False)
+    low = hint.lower()
+    assert "api token" in low
+    assert "not configured" in low
+    assert "preferences > behavior" in low
+    assert "rejected" not in low
+
+
+def test_hf_auth_error_hint_distinguishes_rejected_token_and_404_private_repo():
+    from src.ai.fetcher import hf_auth_error_hint, is_hf_auth_error
+
+    private_repo = (
+        "Repository Not Found for url: https://huggingface.co/...\n"
+        "If you are trying to access a private or gated repo, make sure you "
+        "are authenticated."
+    )
+    assert is_hf_auth_error(private_repo) is True
+    assert "not configured" in hf_auth_error_hint(
+        private_repo, token_configured=False
+    ).lower()
+
+    rejected = hf_auth_error_hint("403 Forbidden", token_configured=True)
+    assert "rejected" in rejected.lower()
+    assert "not configured" not in rejected.lower()
+    assert is_hf_auth_error("HTTP 500 Internal Server Error") is False
+    assert hf_auth_error_hint("Download produced no output directory", False) == ""
+
+
+def test_engines_tab_warns_explicitly_when_hf_token_missing(qapp, monkeypatch):
+    """El catálogo debe avisar antes de intentar un modelo gated/privado."""
+    import src.personal as personal
+    from src.ui.engines_tab import EnginesTab
+
+    monkeypatch.setattr(personal, "has_token", lambda: False)
+    tab = EnginesTab()
+    try:
+        assert tab._token_warning is not None
+        text = tab._token_warning.text().lower()
+        assert "api token" in text
+        assert "not configured" in text
+        assert "preferences" in text
+    finally:
+        tab._timer.stop()
+        tab.setParent(None)
+        tab.deleteLater()
+        qapp.processEvents()
+
+
 def test_hf_download_environment_disables_progress_and_uses_d_drive(monkeypatch, tmp_path):
     """HF must not draw tqdm on a None stderr, and its cache must live with
     Draggy's data (not in C:\\Users\\...\\.cache)."""
@@ -4271,13 +4326,67 @@ def test_generate_preview_runs_the_real_ai_chain(nvenc_clip):
     assert original.startswith(b"\xff\xd8")
     assert processed.startswith(b"\xff\xd8")
     assert engine.order_log, "the preview never called the AI engine"
-    # Artefactos persistentes para el selector de frame del diálogo.
-    assert artifacts
+    # The AI preview renders ONE frame: the old path ran the whole 5 s window
+    # (125 frames at 25 fps) only to display a still.
+    assert len(engine.order_log) == 1, engine.order_log
+    assert artifacts["single_frame"] is True
+    assert artifacts["clip_length"] <= 0.2
     assert os.path.isfile(artifacts["compressed_clip"])
     assert artifacts["source"] == src
     assert artifacts["duration"] > 0
     assert 0 <= artifacts["time"] <= artifacts["duration"]
     shutil.rmtree(artifacts["dir"], ignore_errors=True)
+
+
+def test_preview_dialog_ai_single_frame_hides_the_frame_slider(qapp, tmp_path):
+    """A one-frame AI preview must not offer a 5 s scrubber it cannot fill."""
+    from PySide6.QtGui import QPixmap
+    from src.ui.preview_dialog import PreviewDialog
+
+    pixmap = QPixmap(64, 36)
+    pixmap.fill()
+    artifacts = {
+        "dir": str(tmp_path),
+        "compressed_clip": str(tmp_path / "clip.mp4"),
+        "clip_start": 12.0,
+        "clip_length": 0.1,
+        "duration": 600.0,
+        "time": 12.0,
+        "single_frame": True,
+    }
+    dialog = PreviewDialog(pixmap, pixmap, "", artifacts=artifacts)
+    try:
+        assert not hasattr(dialog, "frame_slider")
+    finally:
+        dialog.close()
+
+
+def test_preview_dialog_frame_slider_is_limited_to_the_clip(qapp, tmp_path):
+    """The scrubber covers the encoded 5 s clip, not the whole source video.
+
+    Before, it ranged over the full source duration and asking for minute 10
+    showed the last frame of a 5 s clip next to the original at minute 10.
+    """
+    from PySide6.QtGui import QPixmap
+    from src.ui.preview_dialog import PreviewDialog
+
+    pixmap = QPixmap(64, 36)
+    pixmap.fill()
+    artifacts = {
+        "dir": str(tmp_path),
+        "compressed_clip": str(tmp_path / "clip.mp4"),
+        "clip_start": 10.0,
+        "clip_length": 5.0,
+        "duration": 600.0,
+        "time": 12.5,
+        "single_frame": False,
+    }
+    dialog = PreviewDialog(pixmap, pixmap, "", artifacts=artifacts)
+    try:
+        assert dialog.frame_slider.maximum() == 50
+        assert dialog.frame_slider.value() == 25
+    finally:
+        dialog.close()
 
 
 def test_generate_preview_honors_preview_time(nvenc_clip):
@@ -4305,7 +4414,8 @@ def test_generate_preview_honors_preview_time(nvenc_clip):
     assert processed.startswith(b"\xff\xd8")
     # El instante comparado es el pedido, no un frame aleatorio.
     assert abs(artifacts["time"] - target) < 0.2
-    # El clip de 5 s está centrado (recortado) en el instante pedido.
+    # La preview sin IA conserva el clip de 5 s y su selector.
+    assert artifacts["single_frame"] is False
     assert abs((artifacts["clip_start"] + artifacts["clip_length"] / 2) - target) < 1.0
     shutil.rmtree(artifacts["dir"], ignore_errors=True)
 

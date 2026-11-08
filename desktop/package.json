@@ -1,0 +1,42 @@
+{
+  "name": "draggy-encoder-desktop",
+  "productName": "Draggy Encoder",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Draggy Encoder de escritorio (Electron + WebGPU)",
+  "author": "Draggy",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "dist": "electron-builder --win --x64",
+    "e2e": "node ../web/e2e.mjs electron:."
+  },
+  "build": {
+    "appId": "com.draggy.encoder",
+    "productName": "Draggy Encoder",
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "main.js",
+      "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": "../web/dist",
+        "to": "dist"
+      }
+    ],
+    "win": {
+      "target": [
+        "dir"
+      ],
+      "icon": "build/icon.ico"
+    },
+    "asar": true
+  },
+  "devDependencies": {
+    "electron": "^45.2.2",
+    "electron-builder": "^26.18.0"
+  }
+}

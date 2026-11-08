@@ -118,6 +118,56 @@ def is_hf_hub_available() -> bool:
         return False
 
 
+# Respuestas que Hugging Face usa cuando el repo es gated/privado o cuando
+# el token falta/es inválido. Incluye el texto de ``RepositoryNotFoundError``
+# para repos privados: HF responde 404 a propósito para no revelar su
+# existencia, pero añade "make sure you are authenticated" al mensaje.
+_HF_AUTH_ERROR_MARKERS = (
+    "401",
+    "403",
+    "unauthorized",
+    "forbidden",
+    "access denied",
+    "access to model",
+    "restricted",
+    "gated",
+    "authentication",
+    "authenticated",
+    "invalid username or password",
+    "token",
+)
+
+
+def is_hf_auth_error(message: object) -> bool:
+    """True si el error de Hugging Face parece de autenticación/gating."""
+    text = str(message or "").lower()
+    return any(marker in text for marker in _HF_AUTH_ERROR_MARKERS)
+
+
+def hf_auth_error_hint(message: object, token_configured: bool) -> str:
+    """Devuelve un mensaje accionable para fallos de autenticación de HF.
+
+    La diferencia importante es explícita: si no hay token, el usuario debe
+    saber que falta la API key, no ver sólo un 401/403/404 genérico. Si sí
+    hay token, el mensaje indica que el token configurado fue rechazado.
+    """
+    if not is_hf_auth_error(message):
+        return ""
+    if token_configured:
+        return (
+            "\n\nHugging Face rejected the configured API token. "
+            "Check that it is valid, has Read access, and that your account "
+            "has accepted the model's license. Update it in "
+            "Preferences > Behavior > HuggingFace API Token."
+        )
+    return (
+        "\n\nHugging Face API token (API key) is NOT configured. "
+        "This model requires authentication. Add a free Read token in "
+        "Preferences > Behavior > HuggingFace API Token "
+        "(https://huggingface.co/settings/tokens), then try again."
+    )
+
+
 class HFDownloadWorker(QThread):
     """Download a HuggingFace repo via ``huggingface_hub``.
 
@@ -190,22 +240,18 @@ class HFDownloadWorker(QThread):
         except Exception:
             _token = None
 
-        if not _token:
-            self.status.emit("No HuggingFace token set — public repos only.")
+        token_configured = bool(_token)
+        if not token_configured:
+            self.status.emit(
+                "No Hugging Face API token configured — public models only."
+            )
 
         try:
             repo_files = HfApi(token=_token).list_repo_files(self.repo_id)
         except Exception as exc:
             _cleanup_partial(self.target_dir)
             exc_str = str(exc)
-            if "401" in exc_str or "403" in exc_str or "Access Denied" in exc_str:
-                exc_str += (
-                    "\n\nTip: This HuggingFace repo requires a token for "
-                    "LFS file downloads.\n\n"
-                    "1. Go to https://huggingface.co/settings/tokens\n"
-                    "2. Create a free token (read access is enough)\n"
-                    "3. Paste it in Preferences > Behavior > HuggingFace API Token"
-                )
+            exc_str += hf_auth_error_hint(exc_str, token_configured)
             self.failed.emit(f"Could not read repo file list: {exc_str}")
             return
 
@@ -266,15 +312,8 @@ class HFDownloadWorker(QThread):
                 if last_error is not None:
                     _cleanup_partial(self.target_dir)
                     exc_str = str(last_error)
-                    if "401" in exc_str or "403" in exc_str or "Access Denied" in exc_str:
-                        exc_str += (
-                            "\n\nTip: This HuggingFace repo requires a token for "
-                            "LFS file downloads.\n\n"
-                            "1. Go to https://huggingface.co/settings/tokens\n"
-                            "2. Create a free token (read access is enough)\n"
-                            "3. Paste it in Preferences > Behavior > HuggingFace API Token"
-                        )
-                    elif "NoneType" in exc_str and "write" in exc_str:
+                    exc_str += hf_auth_error_hint(exc_str, token_configured)
+                    if "NoneType" in exc_str and "write" in exc_str:
                         exc_str += (
                             "\n\nTip: This may be a permissions or disk space issue. "
                             "Try running as administrator or free up disk space."
@@ -401,8 +440,11 @@ class OnnxFileDownloadWorker(QThread):
         except Exception:
             _token = None
 
-        if not _token:
-            self.status.emit("No HuggingFace token set — public repos only.")
+        token_configured = bool(_token)
+        if not token_configured:
+            self.status.emit(
+                "No Hugging Face API token configured — public models only."
+            )
 
         MAX_RETRIES = 3
         RETRY_DELAY_BASE = 5  # seconds
@@ -445,14 +487,7 @@ class OnnxFileDownloadWorker(QThread):
         if last_error is not None or not final_path or not os.path.exists(final_path):
             _cleanup_partial(self.target_dir)
             exc_str = str(last_error) if last_error else "no output file produced"
-            if "401" in exc_str or "403" in exc_str or "Access Denied" in exc_str:
-                exc_str += (
-                    "\n\nTip: This HuggingFace repo requires a token for "
-                    "LFS file downloads.\n\n"
-                    "1. Go to https://huggingface.co/settings/tokens\n"
-                    "2. Create a free token (read access is enough)\n"
-                    "3. Paste it in Preferences > Behavior > HuggingFace API Token"
-                )
+            exc_str += hf_auth_error_hint(exc_str, token_configured)
             self.failed.emit(
                 f"ONNX download failed after {MAX_RETRIES} attempts: {exc_str}"
             )

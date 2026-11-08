@@ -293,7 +293,7 @@ class CompressionWorker(QThread):
                         metrics_cb=metrics_cb,
                     )
                 else:
-                    status_cb("AI preview: rendering the selected chain...")
+                    status_cb("AI preview: rendering one frame...")
                     self.preview_original, self.preview_compressed, self.preview_artifacts = generate_preview(
                         self.ffmpeg_path,
                         self.input_path,
@@ -350,6 +350,16 @@ class CompressionWorker(QThread):
             self.success = False
             self.error_message = str(exc)
             logger.error("CompressionWorker exception (%s): %s", self.mode, exc)
+        finally:
+            # Descargar SIEMPRE los motores del host al terminar. Sin esto el
+            # host retenía cada cadena cargada entre previews: tras dos
+            # ejecuciones quedaban ~11,5 GB de VRAM ocupados y la siguiente
+            # preview se quedaba sin memoria (minutos en cargar el motor).
+            for _engine in locals().get("engines", []) or []:
+                try:
+                    _engine.unload()
+                except Exception:
+                    logger.debug("No se pudo descargar el motor %r", _engine)
 
     def _emit_progress(self, value):
         self.progress.emit(value)
@@ -490,6 +500,15 @@ class CompressionWorker(QThread):
                                     torch_engine = create_inference_engine("torch", pth_path)
                                     if getattr(torch_engine, "is_loaded", False):
                                         inference_engine = torch_engine
+                                        # El ONNX de tanteo ya no se usa: si se
+                                        # queda cargado en el host, cada preview
+                                        # acumula un motor y la VRAM se agota.
+                                        try:
+                                            engine_candidate.unload()
+                                        except Exception:
+                                            logger.debug(
+                                                "No se pudo descargar el ONNX de tanteo"
+                                            )
                                     else:
                                         node_errors.append(
                                             "PyTorch load failed; keeping ONNX Runtime (CPU)"
@@ -606,6 +625,11 @@ class CompressionWorker(QThread):
                             "'PyTorch' in the AI Engines Manager to force the "
                             "PyTorch backend."
                         )
+                    for _loaded in engines:
+                        try:
+                            _loaded.unload()
+                        except Exception:
+                            logger.debug("No se pudo descargar %r", _loaded)
                     raise RuntimeError(
                         f"{node_label} could not load.\nDetails: {detail}\n{hint}"
                     )
@@ -2789,10 +2813,18 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "Preview Error", "Could not load preview frames.")
             _cleanup_preview_artifacts(artifacts)
             return
+        info_text = (
+            "Original (left) vs Compressed (right). Use the slider to compare."
+        )
+        if artifacts and artifacts.get("single_frame"):
+            info_text = (
+                "AI preview: one frame through the full chain. Original (left) "
+                "vs Compressed (right)."
+            )
         dialog = PreviewDialog(
             original_pixmap,
             compressed_pixmap,
-            "Original (left) vs Compressed (right). Use the slider to compare.",
+            info_text,
             self,
             artifacts=artifacts,
         )

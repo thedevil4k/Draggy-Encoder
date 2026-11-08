@@ -599,7 +599,8 @@ class ModelSearchDialog(QDialog):
             pass
         if not has_token:
             banner = QLabel(
-                "\u26a0\ufe0f  Some models require a HuggingFace token for downloads.  "
+                "\u26a0\ufe0f  No Hugging Face API token is configured. Public "
+                "models still work; gated/private models need one.  "
                 '<a href="https://huggingface.co/settings/tokens" style="color:#00d2d3;">'
                 "Get free token</a> \u2014 add it in Preferences > Behavior"
             )

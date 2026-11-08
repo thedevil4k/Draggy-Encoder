@@ -37,6 +37,16 @@ huggingface_token*
 # Herramientas de escritorio
 .freebuff/
 
+# App de escritorio (Electron): dependencias, build y perfil de usuario
+desktop/node_modules/
+desktop/release/
+desktop/.data/
+desktop/.smoke/
+
+# App web (Vite): dependencias y build
+web/node_modules/
+web/dist/
+
 # Outputs y temporales
 # Vídeo: los seis contenedores que ofrece el desplegable de formato.
 *.mkv

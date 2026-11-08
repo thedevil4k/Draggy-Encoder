@@ -47,6 +47,7 @@ from src.ai.fetcher import (
     HFDownloadWorker,
     OnnxFileDownloadWorker,
     OnnxConvertWorker,
+    is_hf_auth_error,
     is_hf_hub_available,
 )
 from src.ai.registry import get_engine_dir
@@ -1233,16 +1234,38 @@ class DependenciesDialog(QDialog):
         hint += f"\n    {get_engine_dir(engine_id)}"
         hint += "\n    and re-open the AI Engines tab so it detects them."
 
-        # Check if this is an auth-related failure (403/401/Access Denied).
-        is_auth_error = any(
-            kw in msg for kw in ("401", "403", "Access Denied", "token")
-        )
+        # Distinguir autenticación de un fallo genérico. El caso "sin token"
+        # se nombra explícitamente: no queremos que el usuario vea sólo un
+        # 401/403/404 y crea que el modelo no existe o que la red falló.
+        try:
+            from src.personal import has_token as _has_hf_token
+            token_configured = bool(_has_hf_token())
+        except Exception:
+            token_configured = True
+
+        is_auth_error = is_hf_auth_error(msg)
         if is_auth_error:
             from PySide6.QtWidgets import QMessageBox as _MB
             box = _MB(self)
             box.setIcon(_MB.Icon.Critical)
-            box.setWindowTitle("Add Engine failed")
-            box.setText(f"Could not install '{engine_id}':\n\n{msg}{hint}")
+            if not token_configured:
+                box.setWindowTitle("Hugging Face API token missing")
+                box.setText(
+                    f"No Hugging Face API token (API key) is configured, so "
+                    f"'{engine_id}' could not be downloaded.\n\n"
+                    "This model requires authentication. Add a free Read token "
+                    "in Preferences > Behavior > HuggingFace API Token, then "
+                    "try again.\n\n"
+                    f"Details:\n{msg}{hint}"
+                )
+            else:
+                box.setWindowTitle("Hugging Face token rejected")
+                box.setText(
+                    f"Could not install '{engine_id}':\n\n{msg}{hint}\n\n"
+                    "The configured Hugging Face token may be invalid, expired, "
+                    "or lack access to this model. Check it in Preferences > "
+                    "Behavior > HuggingFace API Token."
+                )
             btn_get_token = box.addButton("Open Token Page", _MB.ButtonRole.ActionRole)
             box.addButton(_MB.StandardButton.Ok)
             box.exec()

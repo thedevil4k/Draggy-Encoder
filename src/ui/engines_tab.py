@@ -94,6 +94,7 @@ class EnginesTab(QWidget):
         self._rows_by_id: dict[str, EngineRow] = {}
         self._chunks: list[tuple[str, list[dict]]] = []
         self._loading_label: QLabel | None = None
+        self._token_warning: QLabel | None = None
         # Conversión en curso (engine_id + estado): sobrevive a los
         # repopulates para que el progreso no se pierda al repintar.
         self._converting_id: str | None = None
@@ -118,6 +119,41 @@ class EnginesTab(QWidget):
         intro.setWordWrap(True)
         return intro
 
+    def _make_token_warning(self) -> Optional[QLabel]:
+        """Aviso explícito si no hay API token de Hugging Face configurada.
+
+        Algunos modelos públicos se descargan sin token; otros (gated o
+        privados) fallan con 401/403/404. Mostrar el motivo aquí evita que
+        el usuario interprete el fallo como un error genérico de red.
+        """
+        try:
+            from src.personal import has_token
+            if has_token():
+                return None
+        except Exception:
+            # Si no se puede leer el estado del token, no afirmamos que falte.
+            return None
+        warning = QLabel(
+            "⚠️ Hugging Face API token (API key) not configured. Public models "
+            "can still be downloaded, but gated or private models will fail. "
+            "Add a free Read token in Preferences > Behavior > "
+            "HuggingFace API Token."
+        )
+        warning.setWordWrap(True)
+        warning.setStyleSheet(
+            "background-color: #2c1810; color: #f0c040; "
+            "border: 1px solid #8a6d1f; border-radius: 6px; "
+            "padding: 8px 10px; font-size: 11px;"
+        )
+        return warning
+
+    def _add_intro(self, parent_layout) -> None:
+        """Añade la introducción y, si aplica, el aviso de API key."""
+        parent_layout.addWidget(self._make_intro())
+        self._token_warning = self._make_token_warning()
+        if self._token_warning is not None:
+            parent_layout.addWidget(self._token_warning)
+
     def _build(self) -> None:
         layout = QVBoxLayout(self)
         layout.setSpacing(0)
@@ -135,7 +171,7 @@ class EnginesTab(QWidget):
         container_layout.setContentsMargins(8, 8, 8, 8)
         self._container_layout = container_layout
 
-        container_layout.addWidget(self._make_intro())
+        self._add_intro(container_layout)
 
         scroll.setWidget(container)
         layout.addWidget(scroll)
@@ -240,8 +276,9 @@ class EnginesTab(QWidget):
                 w.deleteLater()
         self._section_widgets.clear()
         self._rows_by_id.clear()
+        self._token_warning = None
 
-        layout.addWidget(self._make_intro())
+        self._add_intro(layout)
         self._start_progressive_build()
 
     # -----------------------------------------------------------------

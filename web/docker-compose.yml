@@ -1,0 +1,9 @@
+services:
+  web:
+    build: .
+    container_name: draggy-web
+    ports:
+      - "8080:80"
+    restart: unless-stopped
+    # Sin GPU: el procesado ocurre en el navegador del usuario.
+    # Los datos de Docker deben vivir fuera de C: (ver DOCKER_DATA_ROOT en el README).

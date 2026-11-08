@@ -1,0 +1,234 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="dark" />
+    <link rel="icon" href="data:," />
+    <title>Draggy Encoder v1</title>
+    <meta
+      name="description"
+      content="Draggy Encoder en el navegador: la misma cadena de trabajo, con la GPU de tu equipo vía WebGPU. El archivo no sale de tu ordenador."
+    />
+  </head>
+  <body>
+    <div class="app">
+      <div class="topbar">
+        <button
+          class="topbtn"
+          id="btn-dependencies"
+          title="FFmpeg, PyTorch, ONNX Runtime: download, update and uninstall the non-AI binaries and runtimes."
+        >
+          Dependencies
+        </button>
+        <button class="topbtn" id="btn-output" title="Where the finished files go.">
+          Output: Downloads
+        </button>
+        <button
+          class="topbtn"
+          id="btn-hardware"
+          title="Detected hardware and available codecs."
+        >
+          Hardware Info
+        </button>
+        <button
+          class="topbtn"
+          id="btn-engines"
+          title="AI model catalog: download, convert and remove upscale, interpolation, denoise, colorize and face-restore engines."
+        >
+          <img class="btnicon" src="/icons/AI%20panel.png" alt="" />AI Engines
+        </button>
+        <button class="topbtn" id="btn-preferences" title="Preferences.">
+          Preferences
+        </button>
+      </div>
+
+      <div class="gpu-badge" id="gpu-badge">Detecting GPU…</div>
+
+      <div class="workflow-scroll">
+        <div class="workflow" id="workflow">
+          <div
+            class="node import"
+            id="node-import"
+            role="button"
+            tabindex="0"
+            title="Click to select videos, or drop them anywhere on the window"
+          >
+            <img class="node-icon lg" src="/icons/Import.png" alt="" />
+            <div class="node-name">Import</div>
+            <div class="node-info" id="import-info">No video</div>
+          </div>
+
+          <div class="arrow">→</div>
+
+          <div class="node" id="node-upscale" title="Click to enable/disable this step">
+            <div class="node-head">
+              <img class="node-icon" src="/icons/AI%20Upscaling.png" alt="" />
+              <div class="node-titles">
+                <div class="node-name">Upscale</div>
+                <div class="node-hint">Upscale engines (bicubic Catmull-Rom)</div>
+              </div>
+            </div>
+            <select id="upscale-factor" disabled>
+              <option value="2">2x</option>
+              <option value="3">3x</option>
+              <option value="4">4x</option>
+            </select>
+            <div class="node-status" id="upscale-status">—</div>
+          </div>
+
+          <div class="arrow">→</div>
+
+          <div class="node" id="node-sharpen" title="Click to enable/disable this step">
+            <div class="node-head">
+              <img class="node-icon" src="/icons/AI%20Denoise.png" alt="" />
+              <div class="node-titles">
+                <div class="node-name">Sharpen</div>
+                <div class="node-hint">Detail engines (unsharp mask)</div>
+              </div>
+            </div>
+            <select id="sharpen-amount" disabled>
+              <option value="0.25">0.25</option>
+              <option value="0.45">0.45</option>
+              <option value="0.8">0.80</option>
+              <option value="1.2">1.20</option>
+            </select>
+            <div class="node-status" id="sharpen-status">—</div>
+          </div>
+
+          <div class="arrow">→</div>
+
+          <div class="node compress" id="node-compress" title="Render the chain with the settings below">
+            <img class="node-icon lg" src="/icons/Export.png" alt="" />
+            <div class="node-name">Compress</div>
+          </div>
+        </div>
+      </div>
+
+      <div class="columns">
+        <div class="main-col">
+          <fieldset class="group">
+            <legend>Compression Settings</legend>
+            <div class="grid">
+              <label for="set-mode">Mode</label>
+              <select id="set-mode">
+                <option value="bitrate">Target Bitrate (kbps)</option>
+              </select>
+
+              <label for="set-bitrate">Bitrate (kbps)</label>
+              <div class="value-row">
+                <input
+                  id="set-bitrate"
+                  type="number"
+                  min="100"
+                  max="50000"
+                  step="100"
+                  value="8000"
+                />
+                <input
+                  id="set-bitrate-slider"
+                  type="range"
+                  min="100"
+                  max="50000"
+                  step="100"
+                  value="8000"
+                />
+              </div>
+
+              <span></span>
+              <div class="muted small" id="original-bitrate">Original video bitrate: —</div>
+
+              <label for="set-name">Output Name</label>
+              <input id="set-name" placeholder="Leave empty for original name" />
+
+              <label for="set-resolution">Resolution</label>
+              <select id="set-resolution">
+                <option value="0">Keep source</option>
+                <option value="1080">1080p</option>
+                <option value="720">720p</option>
+                <option value="480">480p</option>
+              </select>
+
+              <label for="set-device">Device</label>
+              <select id="set-device">
+                <option>Detecting…</option>
+              </select>
+
+              <label for="set-codec">Codec</label>
+              <select id="set-codec">
+                <option value="avc">H.264 (AVC)</option>
+              </select>
+
+              <label for="set-format">Export</label>
+              <select id="set-format">
+                <option>MP4</option>
+              </select>
+            </div>
+          </fieldset>
+        </div>
+
+        <aside class="tasks">
+          <div class="tasks-head">Tasks</div>
+          <div class="tasks-actions">
+            <button id="btn-start-queue" class="mini">Start queue</button>
+            <button id="btn-clear-queue" class="mini">Clear queue</button>
+            <button id="btn-clear-finished" class="mini">Clear finished</button>
+          </div>
+          <ul class="task-list" id="task-list">
+            <li class="task-empty" id="task-empty">No tasks yet</li>
+          </ul>
+        </aside>
+      </div>
+
+      <div class="actions">
+        <button id="btn-compress" class="primary">Compress</button>
+        <button id="btn-preview" class="primary">Preview</button>
+        <label class="muted" for="preview-time">Frame at</label>
+        <input id="preview-time" class="time" placeholder="auto" title="Preview frame instant (HH:MM:SS, MM:SS or seconds). Empty = a frame near the start." />
+        <button id="btn-queue" class="primary">Add to queue</button>
+        <button id="btn-abort" class="primary" disabled>Abort</button>
+      </div>
+
+      <div class="status" id="status">Ready</div>
+      <div class="progress"><i id="bar"></i></div>
+
+      <div class="metrics">
+        <span>GPU <b id="m-gpu">—</b></span>
+        <span>REND <b id="m-rend">—</b></span>
+        <span>ENC <b id="m-enc">—</b></span>
+      </div>
+    </div>
+
+    <div class="modal" id="modal" hidden>
+      <div class="modal-card">
+        <div class="modal-head">
+          <span id="modal-title"></span>
+          <button class="close" id="modal-close" aria-label="Close">✕</button>
+        </div>
+        <div class="modal-body" id="modal-body"></div>
+      </div>
+    </div>
+
+    <div class="modal" id="preview-modal" hidden>
+      <div class="modal-card wide">
+        <div class="modal-head">
+          <span id="preview-title">Preview</span>
+          <button class="close" id="preview-close" aria-label="Close">✕</button>
+        </div>
+        <div class="preview-grid">
+          <figure>
+            <canvas id="preview-before"></canvas>
+            <figcaption>Original · <span id="preview-time-label">—</span></figcaption>
+          </figure>
+          <figure>
+            <canvas id="preview-after"></canvas>
+            <figcaption>Compressed · <span id="preview-size-label">—</span></figcaption>
+          </figure>
+        </div>
+      </div>
+    </div>
+
+    <input id="file" type="file" accept="video/*" multiple hidden />
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

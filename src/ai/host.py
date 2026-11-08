@@ -346,6 +346,30 @@ def _job_engine_info(data: dict) -> dict:
     return _engine_state(engine)
 
 
+def _release_gpu_memory() -> None:
+    """Devuelve a la GPU la memoria que el motor descargado aún retenía.
+
+    torch guarda en su caché de CUDA los bloques liberados; sin
+    ``empty_cache`` el host seguía apareciendo como dueño de GB y la
+    siguiente preview se quedaba sin VRAM aunque el motor ya no existiera.
+    Solo se toca torch si ya está importado en este proceso (no forzamos
+    una carga de ~2 s cuando el motor era ONNX Runtime).
+    """
+    import gc
+    import sys
+
+    gc.collect()
+    torch = sys.modules.get("torch")
+    if torch is None:
+        return
+    try:
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.ipc_collect()
+    except Exception:
+        logger.debug("No se pudo vaciar la caché CUDA:\n%s", traceback.format_exc())
+
+
 def _job_engine_unload(data: dict) -> dict:
     handle = str(data.get("handle"))
     engine = _ENGINES.pop(handle, None)
@@ -356,6 +380,7 @@ def _job_engine_unload(data: dict) -> dict:
                 unload()
             except Exception:
                 logger.warning("unload falló:\n%s", traceback.format_exc())
+    _release_gpu_memory()
     return {"unloaded": engine is not None}
 
 

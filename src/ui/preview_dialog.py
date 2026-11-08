@@ -332,6 +332,13 @@ class PreviewDialog(QDialog):
         self.setWindowTitle("Compression Preview")
         self.setMinimumSize(900, 700)
         self.artifacts = artifacts or None
+        self._single_frame = bool(
+            self.artifacts and self.artifacts.get("single_frame")
+        )
+        self._frame_origin = (
+            float(self.artifacts.get("clip_start", 0) or 0)
+            if self.artifacts else 0.0
+        )
         self._regen_timer = QTimer(self)
         self._regen_timer.setSingleShot(True)
         self._regen_timer.setInterval(300)
@@ -359,12 +366,20 @@ class PreviewDialog(QDialog):
 
         # Selector de instante: re-extrae frames del clip ya codificado
         # (sin repetir la cadena IA) y del origen en el nuevo instante.
-        if self.artifacts:
-            duration = float(self.artifacts.get("duration", 0) or 0)
+        # La preview de IA solo renderiza un frame, así que no hay clip que
+        # recorrer: se oculta el selector y se usa el campo "Frame at" para
+        # pedir otro instante.
+        if self.artifacts and not self._single_frame:
+            clip_start = float(self.artifacts.get("clip_start", 0) or 0)
+            clip_length = float(self.artifacts.get("clip_length", 5) or 5)
+            frame_time = float(self.artifacts.get("time", 0) or 0)
             self.frame_slider = QSlider(Qt.Orientation.Horizontal)
-            self.frame_slider.setRange(0, max(10, int(duration * 10)))
+            self.frame_slider.setRange(0, max(10, int(round(clip_length * 10))))
             self.frame_slider.setValue(
-                int(float(self.artifacts.get("time", 0)) * 10)
+                max(0, min(
+                    self.frame_slider.maximum(),
+                    int(round((frame_time - clip_start) * 10)),
+                ))
             )
             self.frame_slider.valueChanged.connect(self._on_frame_slider)
             self.frame_time_label = QLabel("")
@@ -405,7 +420,13 @@ class PreviewDialog(QDialog):
         info_label.setWordWrap(True)
         layout.addWidget(info_label)
 
-        if self.artifacts:
+        if self.artifacts and self._single_frame:
+            hint_text = (
+                "La preview de IA compara un solo fotograma. Arrastra la línea "
+                "vertical para comparar; cambia 'Frame at' y vuelve a lanzar "
+                "Preview para otro instante. Ctrl + rueda para zoom."
+            )
+        elif self.artifacts:
             hint_text = (
                 "Arrastra la línea vertical para comparar; usa el deslizador "
                 "de frame para elegir el instante. Ctrl + rueda para zoom."
@@ -457,7 +478,7 @@ class PreviewDialog(QDialog):
     def _update_frame_time_label(self):
         if not hasattr(self, "frame_slider"):
             return
-        t = self.frame_slider.value() / 10.0
+        t = self._frame_origin + self.frame_slider.value() / 10.0
         self.frame_time_label.setText(seconds_to_time(t))
 
     def _regenerate_frames(self):
@@ -472,7 +493,10 @@ class PreviewDialog(QDialog):
             clip = artifacts.get("compressed_clip")
             clip_start = float(artifacts.get("clip_start", 0))
             clip_length = float(artifacts.get("clip_length", 5))
-            t = self.frame_slider.value() / 10.0
+            # El slider está acotado a la ventana del clip (no a la duración
+            # completa del vídeo): antes se podía pedir el minuto 10 y se
+            # comparaba contra el último frame del clip de 5 s.
+            t = clip_start + self.frame_slider.value() / 10.0
             out_dir = artifacts.get("dir")
             orig_jpg = os.path.join(out_dir, f"frame_orig_{t:.1f}.jpg")
             comp_jpg = os.path.join(out_dir, f"frame_comp_{t:.1f}.jpg")
