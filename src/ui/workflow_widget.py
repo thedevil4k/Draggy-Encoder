@@ -834,6 +834,19 @@ class AIWorkflowStep(QFrame):
             self, "_last_engine_id", ""
         )
 
+        # Recomendación para este hardware: se marca con ⭐ tanto si el
+        # modelo ya está instalado como si hay que descargarlo. Se calcula
+        # solo con el catálogo local (sin red) y es barata porque reutiliza
+        # la detección de hardware ya publicada al arrancar.
+        self._recommended_id = ""
+        try:
+            from src.ai.hardware_fit import get_catalog_recommendation
+
+            rec = get_catalog_recommendation(self.category)
+            self._recommended_id = str(rec.get("engine_id") or "")
+        except Exception as exc:
+            logger.debug("hardware recommendation unavailable for %s: %s", self.category, exc)
+
         self.combo.blockSignals(True)
         self.combo.clear()
 
@@ -918,15 +931,19 @@ class AIWorkflowStep(QFrame):
 
         # 1) Instalados y ejecutables primero.
         for eid, entry in installed_runnable:
+            label = entry.get("display_name", eid)
+            if eid == self._recommended_id:
+                label = f"⭐ {label}"
             self.combo.addItem(
-                entry.get("display_name", eid),
+                label,
                 {"engine_id": eid, "installed": True, "supported": True},
             )
 
         # 2) Resto ejecutable del catálogo: visible y descargable.
         for eid, entry in available_runnable:
             size = entry.get("onnx_size_estimate") or entry.get("size_estimate") or ""
-            label = f"⬇ {entry.get('display_name', eid)}"
+            star = "⭐ " if eid == self._recommended_id else ""
+            label = f"{star}⬇ {entry.get('display_name', eid)}"
             if size:
                 label += f" ({size})"
             self.combo.addItem(
@@ -987,7 +1004,10 @@ class AIWorkflowStep(QFrame):
         self.combo.blockSignals(False)
 
         self.combo.setEnabled(True)
-        self.combo.setToolTip("")
+        self.combo.setToolTip(
+            "⭐ = recommended for your GPU (catalog + VRAM estimate)"
+            if self._recommended_id else ""
+        )
         self.btn_search.setVisible(True)
         self._populate_scale_dropdown(self._current_engine_id())
         self._render_status()

@@ -781,6 +781,78 @@ def build_args(input_path, output_path, settings, loudnorm_meas=None):
     return args
 
 
+def build_join_args(join_graph, output_path, settings, loudnorm_meas=None):
+    """Argumentos de FFmpeg para una timeline de Join videos.
+
+    ``join_graph`` lo construye ``src.processing.join`` (misma forma que
+    :class:`JoinGraph`) y ya trae las entradas ``-i``, el ``filter_complex``
+    con trim/scale/pad/concat y, si procede, el ``loudnorm`` de la timeline.
+    Aquí solo se añade la cola de codificación, reutilizando las mismas
+    reglas de codec/bitrate/contenedor que el render de un solo vídeo.
+
+    El audio SIEMPRE se recodifica cuando hay timeline: los clips pueden
+    tener codecs y sample rates distintos, así que un ``-c:a copy`` no es
+    posible aunque el usuario haya elegido "Copy" para un archivo único.
+    """
+    settings = dict(settings or {})
+    args = ["-y"]
+    args.extend(list(join_graph.inputs))
+    args.extend([
+        "-filter_complex", join_graph.filter_complex,
+        "-map", join_graph.video_label,
+    ])
+
+    codec = settings.get("codec", "libx264")
+    real_codec, codec_extra_args = resolve_codec(codec)
+    args.extend(["-c:v", real_codec])
+    args.extend(codec_extra_args)
+
+    duration = float(getattr(join_graph, "duration", 0.0) or 0.0)
+    if settings.get("mode") == "Target File Size (MB)" and settings.get("target_size_mb"):
+        target_mb = float(settings["target_size_mb"])
+        if duration > 0:
+            total_bits = target_mb * 8 * 1024 * 1024
+            video_bitrate = max(int((total_bits / duration) - 192000), 100000)
+            args.extend(["-b:v", str(video_bitrate)])
+        else:
+            args.extend(["-b:v", f"{settings.get('bitrate', 1500)}k"])
+    else:
+        args.extend(["-b:v", f"{settings.get('bitrate', 1500)}k"])
+
+    if "-pix_fmt" not in codec_extra_args:
+        args.extend(["-pix_fmt", settings.get("pixel_format", "yuv420p")])
+
+    # "Maximum GPU speed": NVENC en su preset más rápido. Sin la casilla se
+    # mantiene el preset por defecto del encoder (calidad de siempre).
+    if real_codec.endswith("_nvenc") and settings.get("gpu_fast"):
+        args.extend(["-preset", "p1", "-tune", "ull", "-rc", "vbr", "-multipass", "1"])
+
+    audio = settings.get("audio", "copy")
+    if audio == "noaudio" or not getattr(join_graph, "has_audio", False):
+        args.append("-an")
+    else:
+        args.extend(["-map", join_graph.audio_label])
+        container = str(settings.get("format", "mp4")).lower()
+        if container == "webm":
+            encoder_a = "libopus"
+        elif audio == "mp3":
+            encoder_a = "libmp3lame"
+        else:
+            encoder_a = "aac"
+        args.extend(["-c:a", encoder_a, "-b:a", "192k"])
+        if encoder_a == "libopus":
+            args.extend(["-strict", "-2"])
+
+    fmt = settings.get("format", "mp4")
+    if fmt == "wmv":
+        args.extend(["-f", "asf"])
+    elif fmt == "webm":
+        args.extend(["-f", "webm"])
+
+    args.append(output_path)
+    return args
+
+
 def build_boost_filter(settings, measured=None):
     """Filtro(s) del Audio Boost según lo que haya configurado el usuario.
 

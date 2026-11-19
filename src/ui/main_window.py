@@ -53,6 +53,7 @@ from src.ui.preview_dialog import PreviewDialog
 from src.ui.audio_preview import AudioPreviewEngine
 from src.ui.settings_panel import SettingsPanel
 from src.ui.tasks_panel import TasksPanel
+from src.ui.video_tools_dialog import VideoToolsDialog
 from src.ui.tray_dashboard import TrayController, eta_text
 from src.ui.metrics_strip import MetricsStripController
 from src.ui.update_banner import UpdateBanner
@@ -802,6 +803,8 @@ class MainWindow(QMainWindow):
         self.compatible_codecs = compatible_codecs
         self.input_path = None
         self.input_paths = []  # multi-selección (uno o más videos)
+        # Timeline de Join videos. Vacía = modo de un solo vídeo (o cola).
+        self.join_clips = []
         # Dos slots de worker independientes: el render principal
         # (compress / item de cola) y el preview, que puede correr en
         # paralelo por ser un clip corto.
@@ -1008,10 +1011,17 @@ class MainWindow(QMainWindow):
             "interpolation, denoise, colorize and face-restore engines."
         )
         self.btn_ai_engines.clicked.connect(self._show_dependencies)
+        self.btn_video_tools = QPushButton("Video tools…")
+        self.btn_video_tools.setToolTip(
+            "One-off FFmpeg utilities: screenshot, pixelate, blur, stabilize,\n"
+            "remove watermark, reverse, split and change volume."
+        )
+        self.btn_video_tools.clicked.connect(self._open_video_tools)
         self.btn_preferences = QPushButton("Preferences")
         self.btn_preferences.clicked.connect(self._show_preferences)
         for _btn in (self.btn_runtimes, self.btn_output, self.btn_hardware,
-                     self.btn_ai_engines, self.btn_preferences):
+                     self.btn_ai_engines, self.btn_video_tools,
+                     self.btn_preferences):
             _btn.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
             _btn.setMinimumWidth(0)
 
@@ -1019,6 +1029,7 @@ class MainWindow(QMainWindow):
         top_layout.addWidget(self.btn_output)
         top_layout.addWidget(self.btn_hardware)
         top_layout.addWidget(self.btn_ai_engines)
+        top_layout.addWidget(self.btn_video_tools)
         top_layout.addWidget(self.btn_preferences)
         layout.addLayout(top_layout)
 
@@ -1164,6 +1175,12 @@ class MainWindow(QMainWindow):
         self.btn_compress.clicked.connect(self._compress)
         self.btn_preview = QPushButton("Preview")
         self.btn_preview.clicked.connect(self._preview)
+        self.btn_join = QPushButton("Join videos…")
+        self.btn_join.setToolTip(
+            "Import several videos, drag them into order and trim each one;\n"
+            "the joined timeline goes through the same AI/encode pipeline."
+        )
+        self.btn_join.clicked.connect(lambda: self._open_join_dialog())
         # Campo opcional: instante exacto a comparar en el preview
         # (HH:MM:SS o MM:SS o segundos). Vacío = frame aleatorio.
         self.preview_time_label = QLabel("Frame at")
@@ -1185,12 +1202,13 @@ class MainWindow(QMainWindow):
         self.btn_abort = QPushButton("Abort")
         self.btn_abort.setEnabled(False)
         self.btn_abort.clicked.connect(self._abort)
-        for _btn in (self.btn_compress, self.btn_preview, self.btn_add_queue, self.btn_abort):
+        for _btn in (self.btn_compress, self.btn_preview, self.btn_join, self.btn_add_queue, self.btn_abort):
             _btn.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
             _btn.setMinimumWidth(0)
 
         bottom_layout.addWidget(self.btn_compress)
         bottom_layout.addWidget(self.btn_preview)
+        bottom_layout.addWidget(self.btn_join)
         bottom_layout.addWidget(self.preview_time_label)
         bottom_layout.addWidget(self.preview_time_edit)
         bottom_layout.addWidget(self.btn_add_queue)
@@ -1459,6 +1477,13 @@ class MainWindow(QMainWindow):
         paths = [p for p in paths if p and os.path.exists(p)]
         if not paths:
             return
+        if len(paths) > 1:
+            # Varios archivos = timeline de Join: el usuario los ordena y
+            # recorta antes de que entren al flujo. La cola sigue existiendo
+            # para renders independientes (un archivo cada vez).
+            self._open_join_dialog(paths)
+            return
+        self._set_join_clips([])
         self.input_paths = list(paths)
         # Backward compat: el primer video sigue siendo ``input_path`` para
         # los flujos single (preview / compress directo / last_job).
@@ -1476,6 +1501,56 @@ class MainWindow(QMainWindow):
     def _on_video_dropped(self, paths):
         """Drag & drop de videos sobre la casilla Import."""
         self._accept_video_paths(paths)
+
+    # -- Join videos (timeline) -----------------------------------------
+
+    def _open_join_dialog(self, paths=None):
+        """Abre el editor de timeline y adopta el resultado si se acepta."""
+        try:
+            from src.ui.join_dialog import JoinDialog
+
+            logger.info(
+                "Join dialog: opening (paths=%d, existing_clips=%d)",
+                len(paths or []), len(getattr(self, "join_clips", []) or []),
+            )
+            dialog = JoinDialog(self.ffmpeg_path, self, paths=paths)
+            if dialog.exec():
+                self._set_join_clips(dialog.result_clips())
+                logger.info(
+                    "Join dialog: accepted %d clips", len(self.join_clips)
+                )
+        except Exception as exc:
+            # En el EXE no hay consola: sin este log, un fallo al construir el
+            # diálogo se veía como "el botón no hace nada".
+            logger.exception("Join dialog failed")
+            QMessageBox.critical(
+                self, "Join videos",
+                f"Could not open the Join videos dialog:\n{exc}",
+            )
+
+    def _set_join_clips(self, clips):
+        self.join_clips = list(clips or [])
+        if self.join_clips:
+            from src.processing.join import join_duration
+
+            self.input_paths = [c.path for c in self.join_clips]
+            self.input_path = self.join_clips[0].path
+            panel = getattr(self, "settings_panel", None)
+            if panel is not None and hasattr(panel, "set_join_mode"):
+                panel.set_join_mode(True)
+            total = join_duration(self.join_clips)
+            self.status_label.setText(
+                f"Join: {len(self.join_clips)} clips · {total:.1f}s total"
+            )
+            try:
+                self._update_original_bitrate(self.input_path)
+            except Exception:
+                pass
+        else:
+            panel = getattr(self, "settings_panel", None)
+            if panel is not None and hasattr(panel, "set_join_mode"):
+                panel.set_join_mode(False)
+        self._update_action_buttons()
 
     # -- drag & drop sobre toda la ventana -----------------------------
 
@@ -1711,6 +1786,38 @@ class MainWindow(QMainWindow):
         live in the separate "Dependencies" dialog (``_show_runtimes``).
         """
         self._open_dependencies(initial_tab="ai_engines")
+
+    def _open_video_tools(self):
+        """Abre las utilidades FFmpeg de un solo uso para el vídeo actual.
+
+        No usan la cola ni la cadena de IA: son operaciones puntuales sobre un
+        archivo. Con una timeline de Join se trabaja sobre el primer clip; el
+        diálogo enseña siempre la ruta exacta que va a procesar.
+        """
+        input_path = self.input_path
+        if not input_path and getattr(self, "join_clips", None):
+            try:
+                input_path = self.join_clips[0].path
+            except (AttributeError, IndexError, TypeError):
+                input_path = None
+        if not input_path or not os.path.isfile(input_path):
+            QMessageBox.information(
+                self, "Video tools",
+                "Import a video first. Video tools work on the current source "
+                "video and do not modify it.",
+            )
+            return
+        try:
+            dialog = VideoToolsDialog(
+                self.ffmpeg_path, input_path, self.output_dir, self
+            )
+            dialog.exec()
+        except Exception as exc:
+            logger.exception("Video tools dialog failed")
+            QMessageBox.critical(
+                self, "Video tools",
+                f"Could not open the video tools:\n{exc}",
+            )
 
     def _show_runtimes(self):
         """Open the Dependencies dialog (binaries & runtimes only).
@@ -2554,6 +2661,15 @@ class MainWindow(QMainWindow):
 
     def _get_output_path(self, input_path=None):
         settings = self.settings_panel.get_settings()
+        if getattr(self, "join_clips", None):
+            from src.processing.join import timeline_name
+
+            base = settings.get("output_name") or timeline_name(self.join_clips)
+            if settings.get("output_name"):
+                base = f"{base}_{len(self.join_clips)}clips"
+            return os.path.join(
+                self.output_dir, f"{base}.{settings.get('format', 'mp4')}"
+            )
         src = input_path or self.input_path
         base, ext = os.path.splitext(os.path.basename(src))
         output_name = settings.get("output_name") or f"{base}_compressed"
@@ -2588,6 +2704,10 @@ class MainWindow(QMainWindow):
         output_path = self._get_output_path()
         settings = self.settings_panel.get_settings()
         settings["pipeline_order"] = self.workflow.get_pipeline()
+        if getattr(self, "join_clips", None):
+            settings["join_clips"] = [c.to_payload() for c in self.join_clips]
+        else:
+            settings.pop("join_clips", None)
         # Snapshot del device/codec en prefs (si la pref
         # ``remember_last_codec_device`` está activa). Se hace en commit,
         # no a cada keystroke, para reflejar lo que realmente ejecutó.
@@ -2629,7 +2749,7 @@ class MainWindow(QMainWindow):
             getattr(self, "preview_worker", None) is not None
             and self.preview_worker.isRunning()
         )
-        has_input = bool(self.input_path)
+        has_input = bool(self.input_path or getattr(self, "join_clips", None))
         self.btn_compress.setEnabled(has_input and not main_running)
         self.btn_preview.setEnabled(has_input and not preview_running)
         self.btn_abort.setEnabled(main_running or preview_running)
@@ -2651,6 +2771,10 @@ class MainWindow(QMainWindow):
             return
         settings = self.settings_panel.get_settings()
         settings["pipeline_order"] = self.workflow.get_pipeline()
+        if getattr(self, "join_clips", None):
+            settings["join_clips"] = [c.to_payload() for c in self.join_clips]
+        else:
+            settings.pop("join_clips", None)
         self._remember_runtime_prefs(settings)
         # Instante exacto opcional del campo "Frame at". Vacío = aleatorio.
         # Se valida aquí; un valor inválido no bloquea el preview (cae a
@@ -3046,9 +3170,17 @@ class MainWindow(QMainWindow):
 
         settings = self.settings_panel.get_settings()
         settings["pipeline_order"] = self.workflow.get_pipeline()
+        if getattr(self, "join_clips", None):
+            settings["join_clips"] = [c.to_payload() for c in self.join_clips]
+        else:
+            settings.pop("join_clips", None)
         self._remember_runtime_prefs(settings)
         ai_engines = self.workflow.get_selected_engines()
 
+        if getattr(self, "join_clips", None):
+            # Una timeline es UN render, no N: la cola recibe el primer clip
+            # como input y la lista completa en settings.
+            paths = [self.join_clips[0].path]
         queued = 0
         for path in paths:
             if not path or not os.path.exists(path):

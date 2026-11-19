@@ -24,6 +24,7 @@ from src.ffmpeg.runner import (
     KEEP_ALL_AUDIO,
     _parse_time_to_seconds,
     build_args,
+    build_join_args,
     build_boost_filter,
     build_per_stream_boost_args,
     extract_frame,
@@ -37,6 +38,7 @@ from src.ffmpeg.process_supervisor import (
     ProcessSupervisor,
     process_group_popen_kwargs,
 )
+from src.processing import join as join_mod
 from src.utils.timing import StageTimer
 
 
@@ -488,6 +490,22 @@ def compress_video(ffmpeg_path, input_path, output_path, settings,
     ``_abort_running_worker`` in ``src/ui/main_window.py``).
     """
     settings = dict(settings)
+    # Join videos: la fuente es una timeline, no un archivo suelto. El trim
+    # global no aplica (cada clip trae el suyo) y la duración/geometría salen
+    # de la unión, no del primer clip.
+    join_clips = join_mod.clips_from_settings(settings)
+    if join_clips:
+        join_errors = join_mod.validate_clips(join_clips)
+        if join_errors:
+            message = "Join timeline invalid: " + " ".join(join_errors)
+            if status_callback:
+                status_callback(message)
+            logger.error(message)
+            return False
+        settings.pop("start_time", None)
+        settings.pop("end_time", None)
+        settings.pop("aspect_box", None)
+        settings["duration_seconds"] = join_mod.join_duration(join_clips)
     output_path, settings = _coerce_output_for_codec(output_path, settings)
     preflight_errors = validate_render_preflight(
         ffmpeg_path, input_path, output_path, settings,
@@ -498,10 +516,11 @@ def compress_video(ffmpeg_path, input_path, output_path, settings,
             status_callback(message)
         logger.error(message)
         return False
-    # Un ratio de aspecto forzado necesita saber la geometría real del origen
-    # (sobre todo su SAR) para encajar la imagen sin deformarla.
-    settings = _with_aspect_box(ffmpeg_path, input_path, settings)
-    settings["duration_seconds"] = _get_duration_seconds(ffmpeg_path, input_path)
+    if not join_clips:
+        # Un ratio de aspecto forzado necesita saber la geometría real del
+        # origen (sobre todo su SAR) para encajar la imagen sin deformarla.
+        settings = _with_aspect_box(ffmpeg_path, input_path, settings)
+        settings["duration_seconds"] = _get_duration_seconds(ffmpeg_path, input_path)
 
     if ai_engines:
         try:
@@ -549,7 +568,10 @@ def compress_video(ffmpeg_path, input_path, output_path, settings,
     if audio_boost_active:
         _emit_phase(phase_cb, "start", "audio", label="Boosting audio", pct=0)
 
-    loudnorm_meas = _measure_if_needed(
+    # En una timeline el loudnorm va DENTRO del filter_complex (después del
+    # concat): medir solo el primer clip daría una ganancia incorrecta para
+    # el resto. Se usa el modo de una pasada, que se automide sobre la unión.
+    loudnorm_meas = None if join_clips else _measure_if_needed(
         ffmpeg_path, input_path, settings, status_callback=status_callback,
         start_time=settings.get("start_time"),
         end_time=settings.get("end_time"),
@@ -563,7 +585,11 @@ def compress_video(ffmpeg_path, input_path, output_path, settings,
 
     temp_output = _make_temp_output_path(output_path)
     try:
-        args = build_args(input_path, temp_output, settings, loudnorm_meas=loudnorm_meas)
+        if join_clips:
+            join_graph = join_mod.build_join_graph(join_clips, settings)
+            args = build_join_args(join_graph, temp_output, settings)
+        else:
+            args = build_args(input_path, temp_output, settings, loudnorm_meas=loudnorm_meas)
 
         # Progreso real del encode: avanza a la vez la barra principal y las
         # filas del panel de tareas. Con audio boost, el filtro loudnorm se
@@ -667,6 +693,26 @@ def generate_preview(ffmpeg_path, input_path, settings, progress_callback=None,
     preview path.
     """
     settings = dict(settings)
+    # Join videos: el preview compara un instante de la TIMELINE. Se traduce
+    # a (clip, offset local) y se sigue por el camino de un solo archivo, que
+    # ya sabe centrar el clip de 5 s (sin IA) o el único frame (con IA).
+    join_clips = join_mod.clips_from_settings(settings)
+    if join_clips:
+        requested = preview_time if preview_time is not None else settings.get("preview_time")
+        if requested not in (None, ""):
+            requested = join_mod.parse_seconds(requested, 0.0)
+        else:
+            requested = None
+        try:
+            clip, offset = join_mod.select_preview_clip(join_clips, requested)
+        except Exception as exc:
+            raise RuntimeError(f"Join preview: {exc}")
+        input_path = clip.path
+        preview_time = offset
+        settings.pop("join_clips", None)
+        settings.pop("start_time", None)
+        settings.pop("end_time", None)
+        settings["preview_time"] = offset
     preflight_errors = validate_render_preflight(
         ffmpeg_path, input_path, None, settings,
     )
@@ -1182,6 +1228,23 @@ def compress_video_with_ai(
     if not engines:
         raise ValueError("compress_video_with_ai got an empty engine list")
 
+    join_clips = join_mod.clips_from_settings(settings)
+    join_graph = None
+    if join_clips:
+        join_errors = join_mod.validate_clips(join_clips)
+        if join_errors:
+            raise ValueError("Join timeline invalid: " + " ".join(join_errors))
+        # El decoder de este pipeline solo mapea vídeo: el grafo debe ser
+        # video-only para no dejar etiquetas de audio sin consumidor.
+        join_graph = join_mod.build_join_graph(
+            join_clips, settings, video_only=True
+        )
+        settings = dict(settings)
+        settings.pop("start_time", None)
+        settings.pop("end_time", None)
+        settings.pop("aspect_box", None)
+        settings["duration_seconds"] = join_graph.duration
+
     # Preview-only cap: the UI renders exactly one frame through the AI chain
     # and then stops. Without it, a 5 s preview at 25 fps runs 125 inferences
     # just to display one still comparison.
@@ -1198,7 +1261,18 @@ def compress_video_with_ai(
     final_output_path = output_path
     output_path = _make_temp_output_path(final_output_path)
 
-    info = get_video_info(ffmpeg_path, input_path)
+    if join_graph is not None:
+        # La timeline ya normaliza tamaño/fps: el "origen" del render es la
+        # unión, no el primer archivo. Así frame_size, escala, encoder y
+        # progreso usan exactamente lo que sale del concat.
+        info = {
+            "width": str(join_graph.width),
+            "height": str(join_graph.height),
+            "r_frame_rate": join_graph.fps_expr,
+            "duration": str(join_graph.duration),
+        }
+    else:
+        info = get_video_info(ffmpeg_path, input_path)
     # ffprobe devuelve el framerate en ``r_frame_rate`` (ej. "30000/1001"
     # ó "30/1"). Pasamos la cadena tal cual al encoder de FFmpeg (que acepta
     # la forma X/Y) y derivamos un float para matemáticas de progreso.
@@ -1213,7 +1287,10 @@ def compress_video_with_ai(
             )
     fps_str = str(raw_fps)
     fps_value = _fps_string_to_float(raw_fps)
-    duration = _get_duration_seconds(ffmpeg_path, input_path)
+    duration = (
+        join_graph.duration if join_graph is not None
+        else _get_duration_seconds(ffmpeg_path, input_path)
+    )
     if duration and fps_value:
         est_total = int(round(duration * fps_value))
     else:
@@ -1466,7 +1543,12 @@ def compress_video_with_ai(
     _audio_codec = settings.get("audio", "copy")
     _audio_boost = bool(settings.get("audio_boost", False))
     _has_audio_phase = (
-        _audio_codec != "noaudio" and (_audio_boost or _audio_codec != "copy")
+        _audio_codec != "noaudio"
+        and (
+            join_graph is not None
+            or _audio_boost
+            or _audio_codec != "copy"
+        )
     )
     if _has_audio_phase:
         if _audio_boost:
@@ -1488,15 +1570,24 @@ def compress_video_with_ai(
     if _has_audio_phase:
         def _audio_job():
             try:
-                audio_tmp[0] = _encode_audio_parallel(
-                    ffmpeg_path, input_path, settings,
-                    status_callback=status_callback, phase_cb=phase_cb,
-                    abort_event=abort_event,
-                    supervisor=supervisor,
-                    # Junto al render, no en la unidad del sistema: mismo
-                    # criterio que el staging y el temporal del mux.
-                    staging_dir=os.path.dirname(os.path.abspath(output_path)),
-                )
+                if join_graph is not None:
+                    audio_tmp[0] = _encode_join_audio(
+                        ffmpeg_path, join_clips, settings,
+                        status_callback=status_callback, phase_cb=phase_cb,
+                        abort_event=abort_event,
+                        supervisor=supervisor,
+                        staging_dir=os.path.dirname(os.path.abspath(output_path)),
+                    )
+                else:
+                    audio_tmp[0] = _encode_audio_parallel(
+                        ffmpeg_path, input_path, settings,
+                        status_callback=status_callback, phase_cb=phase_cb,
+                        abort_event=abort_event,
+                        supervisor=supervisor,
+                        # Junto al render, no en la unidad del sistema: mismo
+                        # criterio que el staging y el temporal del mux.
+                        staging_dir=os.path.dirname(os.path.abspath(output_path)),
+                    )
             except Exception as exc:
                 audio_error[0] = exc
                 audio_tmp[0] = None
@@ -1511,24 +1602,34 @@ def compress_video_with_ai(
         "-hide_banner",
         "-loglevel", "warning",
     ]
-    _decode_start = settings.get("start_time")
-    _decode_end = settings.get("end_time")
-    if _decode_start not in (None, ""):
-        dec_cmd.extend(["-ss", str(_decode_start)])
-    dec_cmd.extend(["-i", input_path])
+    if join_graph is not None:
+        # N entradas + trim/scale/pad/concat: el pipe entrega ya la timeline
+        # normalizada, así que el bucle de IA no sabe que hay varios vídeos.
+        dec_cmd.extend(join_graph.inputs)
+        dec_cmd.extend([
+            "-filter_complex", join_graph.filter_complex,
+            "-map", join_graph.video_label,
+            "-an",
+        ])
+    else:
+        _decode_start = settings.get("start_time")
+        _decode_end = settings.get("end_time")
+        if _decode_start not in (None, ""):
+            dec_cmd.extend(["-ss", str(_decode_start)])
+        dec_cmd.extend(["-i", input_path])
     # Los campos de Trim de la UI son TEXTO ("00:01:30"). Antes se hacía
     # float() sobre ellos: con "00:01:30" lanzaba ValueError, se caía al
     # camino "sin límite" y el render seguía hasta el FINAL del vídeo
     # ignorando el End en silencio. Ahora se parsea igual que en el resto de
     # la app (_parse_time_to_seconds) y, si el valor no se entiende, se avisa.
-    _decode_start_s = _time_to_seconds(_decode_start, 0.0, "start_time",
-                                       status_callback)
-    _decode_end_s = _time_to_seconds(_decode_end, None, "end_time",
-                                     status_callback)
-    if _decode_end_s is not None and _decode_end_s > _decode_start_s:
-        dec_cmd.extend(["-t", str(_decode_end_s - _decode_start_s)])
+        _decode_start_s = _time_to_seconds(_decode_start, 0.0, "start_time",
+                                           status_callback)
+        _decode_end_s = _time_to_seconds(_decode_end, None, "end_time",
+                                         status_callback)
+        if _decode_end_s is not None and _decode_end_s > _decode_start_s:
+            dec_cmd.extend(["-t", str(_decode_end_s - _decode_start_s)])
+        dec_cmd.extend(["-map", "0:v:0"])
     dec_cmd.extend([
-        "-map", "0:v:0",
         "-f", "rawvideo",
         "-pix_fmt", "bgr24",
         "-v", "error",
@@ -1579,11 +1680,19 @@ def compress_video_with_ai(
         enc_cmd.extend(["-pix_fmt", pixel_fmt])
     enc_cmd.extend(codec_extra_args)
 
+    # "Maximum GPU speed": NVENC en su preset más rápido. Sin la casilla se
+    # mantiene el preset por defecto del encoder (misma calidad que antes).
+    if is_gpu_codec and real_codec.endswith("_nvenc") and settings.get("gpu_fast"):
+        enc_cmd.extend(["-preset", "p1", "-tune", "ull", "-rc", "vbr", "-multipass", "1"])
+
     # Honor the user's bitrate / target-size choice. GPU encoders (NVENC,
     # AMF, QSV) need an explicit bitrate; CPU encoders also accept it.
     mode = settings.get("mode", "")
     if mode == "Target File Size (MB)" and settings.get("target_size_mb"):
-        duration = _get_duration_seconds(ffmpeg_path, input_path)
+        duration = (
+            join_graph.duration if join_graph is not None
+            else _get_duration_seconds(ffmpeg_path, input_path)
+        )
         target_mb = float(settings["target_size_mb"])
         if duration > 0:
             total_bits = target_mb * 8 * 1024 * 1024
@@ -1655,6 +1764,9 @@ def compress_video_with_ai(
         "output_size_bytes": None,
         "error": None,
     }
+    if join_graph is not None:
+        log_entry["join_clips"] = [c.to_payload() for c in join_clips]
+        log_entry["timeline_duration"] = join_graph.duration
     _save_render_log(log_file, log_entry)
 
     enc_kwargs = {
@@ -1900,6 +2012,16 @@ def compress_video_with_ai(
         ]
     except Exception:
         logger.debug("describe_execution unavailable", exc_info=True)
+
+    # Telemetría real de GPU: sin esto, "aprovecha la GPU" es una opinión.
+    gpu_sampler = None
+    try:
+        from src.processing.gpu_metrics import GpuSampler
+
+        gpu_sampler = GpuSampler()
+        gpu_sampler.start()
+    except Exception:
+        logger.debug("GPU metrics sampler unavailable", exc_info=True)
 
     try:
         while True:
@@ -2157,6 +2279,19 @@ def compress_video_with_ai(
                     )
         except Exception:
             logger.debug("ai failure report failed", exc_info=True)
+        if gpu_sampler is not None:
+            try:
+                gpu_stats = gpu_sampler.stop()
+                log_entry["gpu_metrics"] = gpu_stats
+                if status_callback and gpu_stats.get("available"):
+                    util = gpu_stats.get("gpu_util") or {}
+                    status_callback(
+                        f"GPU utilization: {util.get('avg', 0):.0f}% avg "
+                        f"(p95 {util.get('p95', 0):.0f}%, encoder "
+                        f"{(gpu_stats.get('encoder_util') or {}).get('avg', 0):.0f}%)"
+                    )
+            except Exception:
+                logger.debug("GPU metrics summary failed", exc_info=True)
         _save_render_log(log_file, log_entry)
 
     if abort_event and abort_event.is_set():
@@ -2853,6 +2988,81 @@ def _audio_mux_args(audio_codec, loudnorm_meas, audio_boost, container_format="m
         if af:
             args.extend(["-af", af])
     return args
+
+
+def _encode_join_audio(ffmpeg_path, clips, settings,
+                       status_callback=None, phase_cb=None, abort_event=None,
+                       supervisor: ProcessSupervisor | None = None,
+                       staging_dir: str | None = None):
+    """Codifica el audio YA CONCATENADO de una timeline a un temporal.
+
+    ``join_graph`` trae el ``filter_complex`` con el concat de audio (y el
+    ``loudnorm`` si el usuario activó el boost), así que aquí solo hay que
+    mapear ``[aout]`` y elegir el codec del contenedor. El mux final copia
+    este archivo, igual que en el camino de un solo vídeo.
+    """
+    audio_codec = str(settings.get("audio", "copy") or "copy")
+    if audio_codec == "noaudio":
+        return None
+    join_graph = join_mod.build_join_graph(clips, settings, audio_only=True)
+    if not join_graph.has_audio:
+        return None
+
+    container = str(settings.get("format", "mp4")).lower()
+    if container == "webm":
+        encoder_a, ext = "libopus", ".opus"
+    elif audio_codec == "mp3":
+        encoder_a, ext = "libmp3lame", ".mp3"
+    else:
+        encoder_a, ext = "aac", ".m4a"
+
+    tmp_dir = None
+    if staging_dir:
+        try:
+            candidate = os.path.abspath(str(staging_dir))
+            if os.path.isdir(candidate):
+                tmp_dir = candidate
+        except Exception:
+            tmp_dir = None
+    try:
+        tmp_fd, tmp_path = tempfile.mkstemp(
+            prefix=".drag-audio-", suffix=ext, dir=tmp_dir,
+        )
+    except Exception:
+        tmp_fd, tmp_path = tempfile.mkstemp(prefix=".drag-audio-", suffix=ext)
+    try:
+        os.close(tmp_fd)
+    except Exception:
+        pass
+
+    args = ["-y"]
+    args.extend(join_graph.inputs)
+    args.extend([
+        "-filter_complex", join_graph.filter_complex,
+        "-map", join_graph.audio_label,
+        "-vn",
+        "-threads", "0",
+        "-c:a", encoder_a,
+        "-b:a", "192k",
+    ])
+    if encoder_a == "libopus":
+        args.extend(["-strict", "-2"])
+    args.append(tmp_path)
+
+    if phase_cb is not None:
+        _emit_phase(phase_cb, "progress", "audio", label="Encoding audio", pct=0)
+    ok = run_ffmpeg(
+        ffmpeg_path,
+        args,
+        abort_event=abort_event,
+        supervisor=supervisor,
+    )
+    if not ok:
+        _cleanup_path(tmp_path)
+        return None
+    if phase_cb is not None:
+        _emit_phase(phase_cb, "progress", "audio", label="Encoding audio", pct=100)
+    return tmp_path
 
 
 def _encode_audio_parallel(ffmpeg_path, input_path, settings,

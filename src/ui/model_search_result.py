@@ -51,9 +51,10 @@ class ModelSearchResult(QFrame):
     enable_toggled = Signal(str, bool)
     open_folder = Signal(str)
 
-    def __init__(self, model: dict, parent=None):
+    def __init__(self, model: dict, parent=None, recommended: bool = False):
         super().__init__(parent)
         self.model = model
+        self.recommended = bool(recommended)
         self.setObjectName("ModelSearchResult")
         self.setStyleSheet(self._stylesheet())
         self._build()
@@ -173,6 +174,20 @@ class ModelSearchResult(QFrame):
             cs.setAlignment(Qt.AlignmentFlag.AlignCenter)
             title_row.addWidget(cs)
 
+        if self.recommended:
+            rec = QLabel("RECOMMENDED")
+            rec.setStyleSheet(
+                "background-color: #00d2d3; color: #0f0f1a; "
+                "border-radius: 8px; padding: 1px 8px; font-size: 9px; "
+                "font-weight: bold;"
+            )
+            rec.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            rec.setToolTip(
+                "Best fit for this GPU according to the catalog, installed "
+                "state, measured quality and estimated VRAM."
+            )
+            title_row.addWidget(rec)
+
         title_row.addStretch()
         left.addLayout(title_row)
 
@@ -199,6 +214,55 @@ class ModelSearchResult(QFrame):
             compat_lbl = QLabel(f"Engine: {compat_text} — {compat_reason}")
             compat_lbl.setStyleSheet(compat_style)
             left.addWidget(compat_lbl)
+
+        # VRAM estimada y encaje con la GPU detectada.
+        estimate = eng.get("vram_estimate_mb")
+        fit = eng.get("vram_fit")
+        total_mb = eng.get("gpu_total_mb")
+        measured = eng.get("vram_source") == "measured"
+        vram_prefix = "VRAM measured:" if measured else "VRAM est.:"
+        if estimate:
+            est_gb = float(estimate) / 1024.0
+            if fit == "too_large" and total_mb:
+                text = (
+                    f"{vram_prefix} ~{est_gb:.1f} GB · may not fit "
+                    f"({float(total_mb) / 1024.0:.1f} GB GPU)"
+                )
+                colour = "#e74c3c"
+            elif fit == "tight" and total_mb:
+                text = (
+                    f"{vram_prefix} ~{est_gb:.1f} GB · tight on "
+                    f"{float(total_mb) / 1024.0:.1f} GB GPU"
+                )
+                colour = "#f39c12"
+            elif fit == "fits" and total_mb:
+                text = (
+                    f"{vram_prefix} ~{est_gb:.1f} GB · fits "
+                    f"{float(total_mb) / 1024.0:.1f} GB GPU"
+                )
+                colour = "#00d2d3"
+            else:
+                text = f"{vram_prefix} ~{est_gb:.1f} GB"
+                colour = "#a0a0b0"
+            vram_lbl = QLabel(text)
+            vram_lbl.setStyleSheet(f"color: {colour}; font-size: 10px;")
+            if measured:
+                where = eng.get("vram_measured_resolution") or ""
+                vram_lbl.setToolTip(
+                    "Measured with nvidia-smi during a real render on this "
+                    f"GPU{(' at ' + where) if where else ''}. Includes model "
+                    "weights, CUDA context and runtime workspace."
+                )
+            else:
+                vram_lbl.setToolTip(
+                    "Approximate: weights + activation buffers at a 1080p frame. "
+                    "Actual usage depends on the frame size, tiling and backend."
+                )
+            left.addWidget(vram_lbl)
+        elif fit == "unknown":
+            vram_lbl = QLabel("VRAM estimate unavailable")
+            vram_lbl.setStyleSheet("color: #5f6f7f; font-size: 10px;")
+            left.addWidget(vram_lbl)
 
         # URL
         if eng.get("hf_url"):

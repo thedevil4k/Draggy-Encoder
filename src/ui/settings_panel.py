@@ -248,6 +248,19 @@ class SettingsPanel(QWidget):
         trim_layout.addWidget(self.end_edit)
         grid.addLayout(trim_layout, 14, 1)
 
+        # Velocidad GPU: NVENC p1 + ULL. Solo afecta a codecs *_nvenc; en CPU
+        # o en AMD/Intel no cambia nada. Activado por defecto porque el uso
+        # típico de la app es exprimir la GPU, y se puede desactivar para
+        # recuperar el preset de calidad si el bitrate se queda corto.
+        self.gpu_fast_check = QCheckBox("Maximum GPU speed (NVENC p1/ULL)")
+        self.gpu_fast_check.setChecked(True)
+        self.gpu_fast_check.setToolTip(
+            "Use NVIDIA's fastest NVENC preset (p1 + ultra low latency).\n"
+            "Faster renders; at the same bitrate the image may look a bit\n"
+            "softer than the default preset. Uncheck for maximum quality."
+        )
+        grid.addWidget(self.gpu_fast_check, 15, 1)
+
         layout.addWidget(group)
         layout.addStretch()
 
@@ -387,8 +400,29 @@ class SettingsPanel(QWidget):
         self._refresh_audio_track_enabled()
 
     def _on_trim_toggled(self, checked):
-        self.start_edit.setEnabled(checked)
-        self.end_edit.setEnabled(checked)
+        self.start_edit.setEnabled(checked and not getattr(self, "_join_mode", False))
+        self.end_edit.setEnabled(checked and not getattr(self, "_join_mode", False))
+
+    def set_join_mode(self, enabled: bool):
+        """Con una timeline activa el trim es POR CLIP: el global se apaga.
+
+        Dejarlo activo aplicaría un segundo recorte sobre la unión ya
+        montada, que es justo lo contrario de lo que el usuario configuró.
+        """
+        self._join_mode = bool(enabled)
+        if enabled and self.trim_check.isChecked():
+            self.trim_check.setChecked(False)
+        self.trim_check.setEnabled(not enabled)
+        self.start_edit.setEnabled(False)
+        self.end_edit.setEnabled(False)
+        if enabled:
+            self.trim_check.setToolTip(
+                "Join videos is active: each clip has its own trim in the "
+                "Join dialog. Disable the timeline to use the global trim."
+            )
+        else:
+            self.trim_check.setToolTip("")
+            self._on_trim_toggled(self.trim_check.isChecked())
 
     def set_original_bitrate(self, bitrate_text):
         self.original_bitrate_label.setText(f"Original video bitrate: {bitrate_text}")
@@ -415,6 +449,7 @@ class SettingsPanel(QWidget):
             "trim": self.trim_check.isChecked(),
             "start_time": self.start_edit.text() if self.trim_check.isChecked() else None,
             "end_time": self.end_edit.text() if self.trim_check.isChecked() else None,
+            "gpu_fast": self.gpu_fast_check.isChecked(),
         }
 
     def set_device(self, device_name):

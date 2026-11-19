@@ -36,6 +36,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from src.ai.hardware_fit import GpuProfile, current_profile, recommend_models
 from src.ai.hf_search import get_inference_engines, search_catalog_models, search_hub_models
 from src.ui.model_search_result import ModelSearchResult
 
@@ -114,10 +115,19 @@ class _SearchPageBase(QWidget):
 
     model_selected = Signal(dict)
 
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, hardware_profile: GpuProfile | None = None):
         super().__init__(parent)
         self._results: list[dict] = []
+        self._hardware_profile = hardware_profile or current_profile()
         self._build_results_area()
+        self.hw_banner = QLabel()
+        self.hw_banner.setWordWrap(True)
+        self.hw_banner.setStyleSheet(
+            "background-color: #12263a; color: #cfe9ff; "
+            "border: 1px solid #1f4b6e; border-radius: 6px; "
+            "padding: 6px 10px; font-size: 10px;"
+        )
+        self._update_hw_banner(None)
 
     # -- results area ----------------------------------------------------
 
@@ -134,8 +144,62 @@ class _SearchPageBase(QWidget):
         self.results_layout.addStretch()
         self.scroll.setWidget(self.results_container)
 
+    def _current_category(self) -> str | None:
+        combo = getattr(self, "combo_category", None)
+        if combo is None:
+            return None
+        try:
+            return combo.currentData()
+        except Exception:
+            return None
+
+    def _update_hw_banner(self, recommendation: dict | None) -> None:
+        """Muestra GPU + recomendación para la categoría activa."""
+        banner = getattr(self, "hw_banner", None)
+        if banner is None:
+            return
+        profile = self._hardware_profile
+        if not profile.has_gpu:
+            banner.setText(
+                "GPU: none detected · running on CPU. "
+                "Recommendations prioritize the lightest models."
+            )
+            return
+        text = f"GPU: {profile.label()}"
+        if recommendation is None:
+            banner.setText(text)
+            return
+        rec = recommendation or {}
+        if rec.get("engine_id"):
+            cat = self._current_category() or "this function"
+            text += f"  ·  Recommended for {cat}: {rec.get('display_name') or rec['engine_id']}"
+            reason = rec.get("reason") or ""
+            estimate = rec.get("vram_estimate_mb")
+            if reason:
+                text += f" — {reason}"
+            if estimate:
+                suffix = (
+                    "GB measured"
+                    if rec.get("vram_source") == "measured"
+                    else "GB VRAM est."
+                )
+                text += f" · ~{float(estimate) / 1024.0:.1f} {suffix}"
+        else:
+            text += "  ·  No curated model fits the detected VRAM; pick a smaller one."
+        banner.setText(text)
+
     def _set_results(self, models: list[dict]) -> None:
-        self._results = list(models)
+        category = self._current_category()
+        recommendation = recommend_models(
+            models, category=category, profile=self._hardware_profile
+        )
+        self._results = list(recommendation.get("models") or models)
+        recommended_id = recommendation.get("engine_id") or ""
+        for model in self._results:
+            model["recommended"] = bool(recommended_id) and (
+                model.get("engine_id") == recommended_id
+            )
+        self._update_hw_banner(recommendation)
         while self.results_layout.count():
             item = self.results_layout.takeAt(0)
             w = item.widget()
@@ -150,8 +214,8 @@ class _SearchPageBase(QWidget):
             self.results_layout.addStretch()
             return
 
-        for m in models:
-            card = ModelSearchResult(m)
+        for m in self._results:
+            card = ModelSearchResult(m, recommended=bool(m.get("recommended")))
             card.install_requested.connect(self._on_install)
             card.convert_requested.connect(self._on_install)
             card.enable_toggled.connect(self._on_enable_toggled)
@@ -224,8 +288,8 @@ class _SearchPageBase(QWidget):
 class _CatalogSearchPage(_SearchPageBase):
     """Pestaña Catálogo: modelos curated con filtros engine/categoría/tamaño/orden."""
 
-    def __init__(self, parent=None, initial_category=None):
-        super().__init__(parent)
+    def __init__(self, parent=None, initial_category=None, hardware_profile=None):
+        super().__init__(parent, hardware_profile=hardware_profile)
         self._initial_category = initial_category
         self._worker: _CatalogWorker | None = None
         self._build_page()
@@ -270,6 +334,7 @@ class _CatalogSearchPage(_SearchPageBase):
 
         filters.addStretch()
         layout.addLayout(filters)
+        layout.addWidget(self.hw_banner)
 
         search_row = QHBoxLayout()
         search_row.setSpacing(8)
@@ -385,8 +450,8 @@ class _HubSearchPage(_SearchPageBase):
 
     PAGE_SIZE = 30
 
-    def __init__(self, parent=None, initial_category=None):
-        super().__init__(parent)
+    def __init__(self, parent=None, initial_category=None, hardware_profile=None):
+        super().__init__(parent, hardware_profile=hardware_profile)
         self._initial_category = initial_category
         self._worker: _HubWorker | None = None
         self._page = 0
@@ -428,6 +493,7 @@ class _HubSearchPage(_SearchPageBase):
 
         filters.addStretch()
         layout.addLayout(filters)
+        layout.addWidget(self.hw_banner)
 
         search_row = QHBoxLayout()
         search_row.setSpacing(8)
@@ -565,6 +631,7 @@ class ModelSearchDialog(QDialog):
         self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
         self._selected: dict | None = None
         self._initial_category = initial_category
+        self._hardware_profile = current_profile()
         self._build()
 
     def get_selected_model(self) -> dict | None:
@@ -627,13 +694,21 @@ class ModelSearchDialog(QDialog):
         outer.addWidget(self.tabs, stretch=1)
 
     def _make_catalog_page(self) -> QWidget:
-        page = _CatalogSearchPage(self, initial_category=self._initial_category)
+        page = _CatalogSearchPage(
+            self,
+            initial_category=self._initial_category,
+            hardware_profile=self._hardware_profile,
+        )
         page.model_selected.connect(self._on_page_model_selected)
         self._catalog_page = page
         return page
 
     def _make_hub_page(self) -> QWidget:
-        page = _HubSearchPage(self, initial_category=self._initial_category)
+        page = _HubSearchPage(
+            self,
+            initial_category=self._initial_category,
+            hardware_profile=self._hardware_profile,
+        )
         page.model_selected.connect(self._on_page_model_selected)
         self._hub_page = page
         return page
