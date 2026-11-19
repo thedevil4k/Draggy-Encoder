@@ -1,0 +1,145 @@
+name: Build NVIDIA GPU Pack
+
+# Construye el pack GPU offline: un store de PyTorch/ONNX Runtime CUDA troceado
+# en ZIPs de menos de 2 GiB + gpu-pack.json, y lo adjunta a la Release
+# gpu-pack-v1 (o al tag gpu-pack-v1 si se empuja).
+#
+# Alcance: Windows x64 / CPython 3.13 (cp313). No hay job de Linux: el cierre
+# CUDA de ONNX Runtime allí (wheels nvidia-* + LD_LIBRARY_PATH) no está
+# verificado y la app no ofrece el pack fuera de Windows.
+#
+# No usa artifacts de Actions (cuota de 500 MB en Free): los assets de Releases
+# no consumen esa cuota y aceptan hasta 1000 archivos de <2 GiB cada uno.
+#
+# NOTA sobre CUDA: los runners windows-latest NO tienen GPU NVIDIA. Aquí se
+# comprueba que torch y onnxruntime IMPORTAN y que el pack se construye, pero
+# no que CUDA arranque. Esa validación (torch.cuda.is_available() y
+# CUDAExecutionProvider) la repite la app en el equipo del usuario al importar,
+# antes de tocar el store. Para un smoke test real de CUDA hace falta un runner
+# self-hosted con GPU.
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "gpu-pack-v1"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: draggy-gpu-pack-${{ github.repository }}
+  cancel-in-progress: false
+
+env:
+  PY_VERSION: "3.13"
+  # CUDA 13 en Windows exige driver 580+.
+  CUDA_INDEX: cu130
+  CUDA_VERSION: "13.0"
+  MIN_DRIVER: "580"
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Set up Python 3.13
+        uses: actions/setup-python@v6
+        with:
+          python-version: ${{ env.PY_VERSION }}
+
+      # El store se crea con pip EN EL CI (con red), nunca en el equipo del
+      # usuario. La app solo verifica y descomprime este resultado.
+      - name: Install CUDA runtime store
+        shell: pwsh
+        run: |
+          $store = "build\gpu-store"
+          python -m pip install --upgrade pip
+          python -m pip install --target $store --upgrade `
+            --index-url "https://download.pytorch.org/whl/$env:CUDA_INDEX" `
+            --extra-index-url "https://pypi.org/simple" `
+            torch torchvision torchaudio `
+            onnxruntime-gpu onnx onnxscript safetensors
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          "El store ocupa {0:N2} GB" -f ((Get-ChildItem $store -Recurse -File | Measure-Object Length -Sum).Sum / 1GB)
+
+      - name: Import smoke test
+        shell: pwsh
+        run: |
+          # En este runner no hay GPU: se comprueba que las DLL cargan y que
+          # ORT enumera sus providers. CUDA se valida en el equipo del usuario.
+          $env:PYTHONPATH = (Resolve-Path "build\gpu-store").Path
+          python -c "import torch, onnxruntime; print('torch', torch.__version__); print('onnxruntime', onnxruntime.__version__); print('providers', onnxruntime.get_available_providers()); print('cuda_visible', torch.cuda.is_available())"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if (Get-Command nvidia-smi -ErrorAction SilentlyContinue) {
+            nvidia-smi
+          } else {
+            Write-Host "Sin GPU en el runner: la sonda CUDA real la hace la app al importar."
+          }
+
+      - name: Build split pack
+        shell: pwsh
+        run: |
+          python packaging/build_gpu_pack.py `
+            --store "build\gpu-store" `
+            --out "dist\gpu-pack" `
+            --id "nvidia-$env:CUDA_INDEX-win-x64-cp313" `
+            --cuda $env:CUDA_VERSION `
+            --min-driver-branch $env:MIN_DRIVER `
+            --part-mib 1900
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Verify every asset fits a GitHub release
+        shell: pwsh
+        run: |
+          $limit = 2GB
+          $parts = @(Get-ChildItem "dist\gpu-pack" -Filter *.zip -File)
+          if ($parts.Count -lt 1) { throw "No se generó ninguna parte" }
+          if (-not (Test-Path "dist\gpu-pack\gpu-pack.json")) {
+            throw "Falta gpu-pack.json"
+          }
+          foreach ($part in $parts) {
+            $mb = $part.Length / 1MB
+            "Parte {0}: {1:N1} MB" -f $part.Name, $mb
+            if ($part.Length -ge $limit) {
+              throw ("{0} supera el límite de 2 GiB por asset" -f $part.Name)
+            }
+          }
+          $manifest = Get-Content "dist\gpu-pack\gpu-pack.json" -Raw | ConvertFrom-Json
+          if ($manifest.parts.Count -ne $parts.Count) {
+            throw "El manifiesto declara $($manifest.parts.Count) partes y hay $($parts.Count) archivos"
+          }
+          foreach ($entry in $manifest.parts) {
+            "  {0} sha256={1}" -f $entry.name, $entry.sha256
+            if ($entry.bytes -ge $limit) {
+              throw ("{0} supera el límite en el manifiesto" -f $entry.name)
+            }
+          }
+
+      # Assets de Release, no artifacts: no gastan la cuota de 500 MB y
+      # sobreviven a la limpieza de artifacts del CI.
+      - name: Attach pack to release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ github.event_name == 'workflow_dispatch' && 'gpu-pack-v1' || github.ref_name }}
+          name: "Draggy Encoder — NVIDIA GPU pack (offline)"
+          body: |
+            Offline NVIDIA GPU runtime pack for Draggy Encoder.
+
+            Download `gpu-pack.json` and every `.zip` part into the same folder,
+            then place that folder as `gpu-pack/` next to DraggyEncoder.exe
+            (or set `DRAGGY_GPU_PACK` to the manifest). The app verifies each
+            SHA-256, extracts to a staging directory, confirms torch and ONNX
+            Runtime see CUDA in a clean subprocess, and only then swaps the
+            runtime. No pip, no internet.
+
+            The same assets can be downloaded from the app: Manage
+            Dependencies -> Download GPU pack. That path resumes partial
+            parts and installs through the same importer.
+
+            Built for Windows x64, CPython 3.13 (`cp313`), CUDA ${{ env.CUDA_VERSION }}.
+          files: |
+            dist/gpu-pack/*.zip
+            dist/gpu-pack/gpu-pack.json

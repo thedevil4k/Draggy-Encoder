@@ -300,6 +300,101 @@ def all_states() -> dict:
 WEIGHT_EXTS = (".pth", ".pt", ".safetensors", ".onnx", ".bin", ".gguf")
 
 
+# Modelos que viajan dentro del instalador. Son pesos ONNX ya listos para
+# ONNX Runtime: el usuario puede hacer un render sin cuenta de Hugging Face y
+# sin descargar nada. La ruta es relativa al directorio del motor y se usa
+# para sembrar ``engines.json`` la primera vez que arranca la app.
+#
+# No se incluyen los .pth equivalentes: ONNX Runtime es el backend rápido y
+# ya viene con la app; duplicar los pesos solo engordaría el instalador.
+BUNDLED_ENGINES = {
+    "upscale-realesrgan-x4plus": (
+        os.path.join("onnx", "model.onnx"),
+    ),
+    "upscale-realesr-animevideov3": (
+        "realesr-animevideov3.onnx",
+    ),
+}
+
+
+def _raw_engine_record(engine_id: str) -> Optional[dict]:
+    """Registro tal como está en disco, o None si el motor nunca se tocó.
+
+    ``get_state`` rellena defaults; para saber si el usuario ya decidió algo
+    (por ejemplo, deshabilitar un motor) hace falta distinguir un registro
+    explícito de uno ausente.
+    """
+    data = _load()
+    record = data.get("engines", {}).get(engine_id)
+    return record if isinstance(record, dict) else None
+
+
+def seed_bundled_engines() -> list[str]:
+    """Marca como instalados/habilitados los modelos incluidos en el bundle.
+
+    Solo actúa cuando el modelo existe en disco. Respeta al usuario:
+
+    - Un motor sin registro se crea con ``installed=True`` y ``enabled=True``.
+    - Un motor que ya tiene ``enabled=False`` explícito se deja deshabilitado.
+    - Un motor que ya tiene ``installed=False`` explícito se deja desinstalado
+      (el usuario pudo borrar los pesos a propósito).
+    - Un motor instalado por una versión anterior pero sin la clave
+      ``enabled`` recibe ``enabled=True``; antes el default era apagado, así
+      que los modelos preinstalados no aparecían en los nodos del workflow.
+
+    Devuelve los ``engine_id`` cuyo estado cambió. Nunca lanza: un fallo de
+    disco no debe impedir que arranque la app.
+    """
+    changed: list[str] = []
+    try:
+        from src.ai.registry import get_engine_dir
+    except Exception:
+        return changed
+
+    for engine_id, relative_paths in BUNDLED_ENGINES.items():
+        try:
+            install_dir = get_engine_dir(engine_id)
+            model_path = None
+            for relative in relative_paths:
+                candidate = os.path.join(install_dir, relative)
+                if os.path.isfile(candidate):
+                    model_path = candidate
+                    break
+            if not model_path:
+                continue
+
+            record = _raw_engine_record(engine_id)
+            if record is not None:
+                # Una decisión explícita del usuario manda sobre el bundle.
+                if record.get("enabled") is False:
+                    continue
+                if record.get("installed") is False:
+                    continue
+                if record.get("installed") and record.get("enabled") is True:
+                    continue
+
+            fields = {
+                "installed": True,
+                "enabled": True,
+                "install_path": install_dir,
+                "onnx_converted": True,
+                "onnx_path": model_path,
+                "last_error": None,
+            }
+            if not record or record.get("installed_at_iso") is None:
+                fields["installed_at_iso"] = datetime.now(timezone.utc).isoformat()
+            if patch(engine_id, **fields):
+                changed.append(engine_id)
+                logger.info(
+                    "Bundled model ready: %s (%s)", engine_id, model_path
+                )
+        except Exception:
+            logger.warning(
+                "Could not seed bundled model %s", engine_id, exc_info=True
+            )
+    return changed
+
+
 def dir_has_weights(directory: str) -> bool:
     """True si ``directory`` contiene algún archivo de pesos de modelo.
 

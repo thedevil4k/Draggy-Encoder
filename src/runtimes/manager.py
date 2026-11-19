@@ -793,6 +793,11 @@ def _has_nvidia_gpu() -> bool:
     return shutil.which("nvidia-smi") is not None
 
 
+#: Última minor con wheels GPU oficiales de ONNX Runtime para Windows.
+#: Actualizar cuando ONNX Runtime publique cp314 para Windows.
+_MAX_ONNX_PYTHON_MINOR = 13
+
+
 def _python_short() -> str:
     """Versión corta de Python, e.g. '3.11'."""
     return f"{sys.version_info.major}.{sys.version_info.minor}"
@@ -801,17 +806,19 @@ def _python_short() -> str:
 def _is_python_version_supported() -> bool:
     """True si es una versión de Python con wheels oficiales de PyTorch/ONNX.
 
-    El suelo real lo marca PyTorch: las versiones actuales publican desde
-    Python 3.10 (antes llegaron a soportar 3.8/3.9). Si la app corre por
-    debajo, ningún índice sirve wheels y seguir sólo alarga el error, así que
-    se rechaza de entrada con un mensaje claro.
+    El suelo lo marca PyTorch (3.10 con las familias actuales). El techo lo
+    marca ONNX Runtime: sus wheels GPU publicados para Windows llegan a cp313;
+    en Python 3.14 el auto-instalador elegía un wheel cp314 inexistente y
+    fallaba después de mover el store. Rechazar esa versión ANTES de tocar
+    disco evita el error de pip y la pérdida temporal del runtime que ya
+    funcionaba.
     """
     major = sys.version_info.major
     minor = sys.version_info.minor
     if major != 3:
         return False
     minimum = _torch_min_python(_TORCH_MIN_PYTHON[0][0])
-    return minor >= minimum[1]
+    return minimum[1] <= minor <= _MAX_ONNX_PYTHON_MINOR
 
 
 def get_python_support_info() -> dict:
@@ -830,10 +837,11 @@ def get_python_support_info() -> dict:
         "supported": False,
         "short": short,
         "message": (
-            f"Python {short} is NOT supported by official PyTorch/ONNX wheels. "
-            f"Please use Python {floor} or newer, or build the PyInstaller "
-            "bundle with one of those versions. "
-            "AI upscaling/interpolation/colorize will be disabled."
+            f"Python {short} is NOT supported by the official PyTorch/ONNX "
+            f"wheels used by this build (supported: Python {floor}–3.13). "
+            "Use the bundled 3.13 runtime or build the PyInstaller bundle "
+            "with Python 3.13. AI upscaling/interpolation/colorize will be "
+            "disabled on this interpreter."
         ),
     }
 
@@ -2551,9 +2559,10 @@ def _run_pip_checked(report: dict, cmd, progress_callback, start_pct: int,
 def _raise_unsupported_python() -> None:
     short = _python_short()
     raise RuntimeError(
-        f"Python {short} no tiene wheels oficiales de PyTorch/ONNX todavía. "
-        "Por favor, usa Python 3.10–3.14 para que la descarga funcione, "
-        "o instala torch/onnxruntime manualmente en este entorno."
+        f"Python {short} no tiene wheels oficiales de PyTorch/ONNX para este "
+        "build. Usa el runtime embebido de Python 3.13 (o Python 3.10–3.13) "
+        "para que la descarga funcione, o instala torch/onnxruntime "
+        "manualmente en este entorno."
     )
 
 
@@ -3611,7 +3620,17 @@ def ensure_runtime_dlls_on_path() -> None:
     except Exception:
         pass
 
-    extra = [RUNTIME_MODULES_DIR]
+    # Un store vacío no tiene ninguna DLL que resolver. Además, en Windows
+    # ``os.add_dll_directory`` abre un handle sobre la carpeta y puede impedir
+    # que el import del pack renombre ``.staging`` a ``ai_modules``. Cuando el
+    # pack ya está instalado, ``import_pack`` vuelve a llamar a esta función y
+    # entonces sí se registra el store (y sus subcarpetas de DLL).
+    try:
+        store_has_content = bool(os.listdir(RUNTIME_MODULES_DIR))
+    except OSError:
+        store_has_content = False
+
+    extra = [RUNTIME_MODULES_DIR] if store_has_content else []
     # torch/lib y onnxruntime/capi contienen las DLL nativas que
     # CPython carga via LoadLibrary. Añadirlas explícitamente antes
     # que `torch/__init__.py` lo haga evita condiciones de carrera

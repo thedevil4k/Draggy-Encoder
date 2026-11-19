@@ -24,7 +24,10 @@ SetupIconFile=assets\app.ico
 ; Sin esta directiva Windows elige un icono por su cuenta (suele ser el
 ; genérico del desinstalador). Apuntamos al EXE, que ya lleva el .ico embebido.
 UninstallDisplayIcon={app}\DraggyEncoder.exe
-DefaultDirName={localappdata}\Programs\DraggyEncoder
+; La app escribe los modelos y runtimes junto al EXE. En un equipo con D:
+; (el caso de este proyecto) se instala allí para no llenar C:; si no existe
+; D:, se mantiene el destino por usuario de siempre.
+DefaultDirName={code:GetDefaultInstallDir}
 DefaultGroupName=Draggy Encoder
 DisableProgramGroupPage=yes
 PrivilegesRequired=lowest
@@ -40,14 +43,25 @@ CloseApplications=yes
 Name: "english"; MessagesFile: "compiler:Default.isl"
 Name: "spanish"; MessagesFile: "compiler:Languages\Spanish.isl"
 
+[Code]
+function GetDefaultInstallDir(Param: string): string;
+begin
+  if DirExists('D:\') then
+    Result := 'D:\DraggyEncoder'
+  else
+    Result := ExpandConstant('{localappdata}\Programs\DraggyEncoder');
+end;
+
 [Tasks]
 Name: "desktopicon"; Description: "Create a &desktop shortcut"; GroupDescription: "Additional icons:"
 
 [Files]
-; El EXE, _internal/, assets/ y bin/ de arranque en limpio (sin modelos).
-; bin\logs\ se excluye del copiado recursivo y se trata aparte: el sello de
-; copia de Inno no debe marcar esos logs instalados (cambian en cada arranque).
-Source: "dist\DraggyEncoder\*"; DestDir: "{app}"; Flags: recursesubdirs createallsubdirs; Excludes: "bin\logs\*"
+; El EXE, _internal/, assets/, el Python embebido y bin/models con los dos
+; upscalers bundled. bin\logs\ se excluye del copiado recursivo y se trata
+; aparte: el sello de copia de Inno no debe marcar esos logs instalados
+; (cambian en cada arranque). Los backups locales de _internal (pre-*/before-*)
+; no son parte del producto: incluirlos duplicaría cientos de MB en el setup.
+Source: "dist\DraggyEncoder\*"; DestDir: "{app}"; Flags: recursesubdirs createallsubdirs; Excludes: "bin\logs\*,_internal.pre-*,_internal.before-*"
 Source: "dist\DraggyEncoder\bin\logs\*"; DestDir: "{app}\bin\logs"; Flags: skipifsourcedoesntexist uninsneveruninstall
 ; El Python embebido NO se marca uninsneveruninstall: va con la app.
 

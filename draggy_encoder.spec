@@ -1,5 +1,6 @@
 # -*- mode: python ; coding: utf-8 -*-
 import os
+import shutil
 import sys
 import importlib.util
 
@@ -78,12 +79,37 @@ stdlib_hiddenimports = sorted(
 # sin cargarlos en el proceso de la GUI — importarlos ahí mataba la app con
 # 0xc0000005 en python313.dll. Si esta entrada desaparece, el selftest del
 # bundle falla al arrancar el host y el build se para.
+# Modelos que el instalador debe llevar de fábrica: los dos upscalers
+# pedidos (Real-ESRGAN normal y RealESR AnimeVideo v3). Se copian SOLO los
+# .onnx, no los .pth ni los modelos de usuario que haya en bin/models. La
+# ruta de destino usa minúsculas porque get_engine_dir() deriva la categoría
+# del engine_id ("upscale"); en Windows es equivalente, en Linux importa.
+_BUNDLED_MODEL_FILES = [
+    ("bin/models/Upscale/realesrgan-x4plus/onnx/model.onnx",
+     "bin/models/upscale/realesrgan-x4plus/onnx"),
+    ("bin/models/Upscale/realesr-animevideov3/realesr-animevideov3.onnx",
+     "bin/models/upscale/realesr-animevideov3"),
+]
+for _src, _dest in _BUNDLED_MODEL_FILES:
+    if not os.path.isfile(_src):
+        raise SystemExit(
+            "Bundled model missing: %s. Run `python packaging/fetch_bundled_models.py` "
+            "before building; the installer promises these two upscalers." % _src
+        )
+
+_datas = [("assets", "assets"), ("src", "ai_src/src")]
+_datas.extend(_BUNDLED_MODEL_FILES)
+
 a = Analysis(
     ["main.py"],
     pathex=[],
     binaries=[],
-    datas=[("assets", "assets"), ("src", "ai_src/src")],
-    hiddenimports=stdlib_hiddenimports,
+    datas=_datas,
+    # ``src.runtimes.offline_pack`` se importa de forma diferida en el worker de
+    # arranque (y desde el diálogo de dependencias). Se declara explícito para
+    # que el import del pack GPU exista siempre en el bundle, incluso si el
+    # análisis de imports diferidos cambia.
+    hiddenimports=stdlib_hiddenimports + ["src.runtimes.offline_pack", "src.runtimes.pack_download"],
     hookspath=[],
     runtime_hooks=[],
     excludes=excludes,
@@ -132,3 +158,18 @@ coll = COLLECT(
     upx=False,
     name="DraggyEncoder",
 )
+
+# PyInstaller 6 coloca los ``datas`` bajo _internal/. La app resuelve los
+# modelos con get_data_dir()/bin, que en un bundle es la carpeta del EXE, no
+# _internal. Moverlos a la raíz deja el layout que espera la app y que copia
+# Inno Setup; además evita duplicar 70 MB dentro del instalador.
+try:
+    _dist_root = os.path.join(DISTPATH, "DraggyEncoder")
+    _models_src = os.path.join(_dist_root, "_internal", "bin", "models")
+    _models_dst = os.path.join(_dist_root, "bin", "models")
+    if os.path.isdir(_models_src):
+        os.makedirs(os.path.dirname(_models_dst), exist_ok=True)
+        shutil.copytree(_models_src, _models_dst, dirs_exist_ok=True)
+        shutil.rmtree(_models_src)
+except Exception as _exc:
+    raise SystemExit("Could not place bundled models next to the EXE: %s" % _exc)

@@ -103,6 +103,12 @@ jobs:
           python -m pip install --upgrade pip setuptools wheel
           python -m pip install -r requirements-build.txt
 
+      # Los .onnx no se versionan (70 MB de binarios). Se bajan del Hub con
+      # hash fijo antes del spec; así el instalador sigue llevando los dos
+      # upscalers de fábrica sin meterlos en Git ni en un artifact.
+      - name: Fetch bundled AI models
+        run: python packaging/fetch_bundled_models.py
+
       # Regenera assets/app.ico (multi-resolución) desde assets/Import.png.
       # Se versiona también, pero regenerarlo aquí garantiza que el EXE y el
       # instalador usen SIEMPRE el logo actual aunque alguien cambie el PNG.
@@ -268,6 +274,21 @@ jobs:
             throw "Expected exactly one Windows installer, found $($installers.Count)"
           }
           $installers | ForEach-Object { "{0} {1} bytes" -f $_.Name, $_.Length }
+
+      # GitHub Releases acepta como máximo 2 GiB por asset. El instalador
+      # deliberadamente NO lleva torch/CUDA (se instalan bajo demanda), así que
+      # debe quedar muy por debajo; este guard convierte una regresión de
+      # tamaño en un fallo del CI en vez de un upload roto.
+      - name: Verify installer fits a GitHub release asset
+        shell: pwsh
+        run: |
+          $installer = Get-ChildItem -Path installer -Filter *.exe -File | Select-Object -First 1
+          $limit = 1900MB
+          $mb = $installer.Length / 1MB
+          "Installer size: {0:N1} MB" -f $mb
+          if ($installer.Length -ge $limit) {
+            throw ("Installer is {0:N1} MB, over the 1.9 GB safety limit" -f $mb)
+          }
 
       # ÚNICO paquete de Windows: el instalador x64. No se sube además un
       # artifact de Actions (era una segunda copia del mismo EXE y gastaba

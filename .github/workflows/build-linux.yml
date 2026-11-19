@@ -238,6 +238,11 @@ jobs:
           python -m pip install --upgrade pip setuptools wheel
           python -m pip install -r requirements-build.txt
 
+      # Los .onnx no se versionan (70 MB). Se bajan del Hub con hash fijo
+      # antes del spec; el AppImage debe llevar los dos upscalers de fábrica.
+      - name: Fetch bundled AI models
+        run: python packaging/fetch_bundled_models.py
+
       # PySide6/Qt necesita las bibliotecas de gráficos del sistema (EGL,
       # GL, X11) incluso para importar QtGui. Sin ellas el bundle no
       # arranca ni en --selftest.
@@ -311,9 +316,21 @@ jobs:
         run: |
           python packaging/linux/capture_screenshots.py screenshots
 
+      # No borrar dist/DraggyEncoder/bin entero: ahí viven los dos modelos
+      # ONNX que el spec copió a propósito. Solo se retiran los datos que
+      # genera una ejecución (sesión, logs, runtimes descargados y FFmpeg);
+      # los modelos bundled deben llegar al AppImage.
       - name: Remove generated user data before packaging
         shell: bash
-        run: rm -rf dist/DraggyEncoder/bin dist/DraggyEncoder/personal
+        run: |
+          rm -rf \
+            dist/DraggyEncoder/bin/.session \
+            dist/DraggyEncoder/bin/logs \
+            dist/DraggyEncoder/bin/runtimes \
+            dist/DraggyEncoder/bin/ffmpeg \
+            dist/DraggyEncoder/personal
+          test -s dist/DraggyEncoder/bin/models/upscale/realesrgan-x4plus/onnx/model.onnx
+          test -s dist/DraggyEncoder/bin/models/upscale/realesr-animevideov3/realesr-animevideov3.onnx
 
       # Los símbolos de depuración de Python/PySide6/FFmpeg no le sirven al
       # usuario final. Stripeamos el árbol entero antes de empaquetar: el
@@ -357,6 +374,23 @@ jobs:
             exit 1
           fi
           ls -l "${images[0]}"
+
+      # GitHub Releases acepta como máximo 2 GiB por asset. El AppImage no
+      # lleva torch/CUDA (se instalan bajo demanda), pero este guard detecta
+      # cualquier regresión de tamaño antes de subirlo.
+      - name: Verify AppImage fits a GitHub release asset
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          images=(DraggyEncoder-Linux-x86_64-*.AppImage)
+          size=$(stat -c %s "${images[0]}")
+          limit=$((2 * 1024 * 1024 * 1024))
+          echo "AppImage size: $((size / 1024 / 1024)) MB"
+          if [ "$size" -ge "$limit" ]; then
+            echo "AppImage is over the 2 GiB release-asset limit" >&2
+            exit 1
+          fi
 
       # Prueba de humo REAL del paquete: se ejecuta el AppImage (no el
       # bundle de dist/) y se exige que pase el selftest de la app. Sin

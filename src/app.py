@@ -103,27 +103,118 @@ class StartupWorker(QThread):
             #    usuario podrá reintentarlo desde ahí.
             try:
                 from src.runtimes.manager import (
+                    get_python_support_info,
                     install_onnxruntime,
                     install_pytorch,
                     onnx_status,
                     torch_status,
                 )
-                if not onnx_status().get("installed"):
-                    self.progress.emit(55, "Installing ONNX Runtime...")
-                    install_onnxruntime(
-                        "auto",
-                        progress_callback=lambda p, m, b=55, s=17: (
-                            self._map_runtime_progress(p, m, b, s)
-                        ),
+                from src.runtimes.offline_pack import (
+                    find_pack,
+                    import_pack,
+                    is_offline_mode,
+                    pack_supported,
+                )
+
+                support = get_python_support_info()
+
+                # 3a. Pack GPU offline. Se busca junto al ejecutable
+                # (``gpu-pack/gpu-pack.json``) o en DRAGGY_GPU_PACK y se
+                # importa ANTES de tocar pip: el equipo sin internet no debe
+                # intentar una descarga de GB para acabar fallando.
+                pack_manifest = find_pack()
+                pack_failed = False
+                if pack_manifest:
+                    self.progress.emit(55, "Importing offline GPU pack...")
+                    try:
+                        pack_result = import_pack(
+                            pack_manifest,
+                            progress_callback=lambda p, m, b=55, s=17: (
+                                self._map_runtime_progress(p, m, b, s)
+                            ),
+                        )
+                        logger.info(
+                            "Offline GPU pack %s: %s",
+                            (pack_result.get("manifest") or {}).get("id"),
+                            "already installed"
+                            if pack_result.get("already_installed")
+                            else "imported",
+                        )
+                    except Exception as exc:
+                        # Un pack presente pero inválido NO cae a una descarga
+                        # por red: el usuario eligió explícitamente el camino
+                        # offline. El runtime anterior, si lo había, sigue
+                        # intacto (el swap solo ocurre tras validar).
+                        pack_failed = True
+                        runtime_error = (
+                            "Offline GPU pack could not be imported: "
+                            f"{exc}"
+                        )
+                        logger.warning("Offline GPU pack import failed: %s", exc)
+
+                if is_offline_mode():
+                    missing = [
+                        name
+                        for name, status in (
+                            ("ONNX Runtime", onnx_status()),
+                            ("PyTorch", torch_status()),
+                        )
+                        if not status.get("installed")
+                    ]
+                    if missing:
+                        if pack_supported():
+                            note = (
+                                " Offline mode (DRAGGY_OFFLINE) skips all "
+                                "AI runtime downloads. Download the GPU pack "
+                                "and place it in the 'gpu-pack' folder next "
+                                "to the app, then restart (or import it from "
+                                "Dependencies). The pack includes the "
+                                "user-space CUDA runtime, not the NVIDIA "
+                                "driver: install and update the driver "
+                                "separately."
+                            )
+                        else:
+                            # Linux/AppImage: no hay pack offline todavía. La
+                            # nota no puede mandar a descargar algo que no
+                            # existe para esta plataforma.
+                            note = (
+                                " Offline mode (DRAGGY_OFFLINE) skips all "
+                                "AI runtime downloads, and the offline GPU "
+                                "pack is only available for Windows x64. On "
+                                "this platform PyTorch and ONNX Runtime must "
+                                "be installed while online."
+                            )
+                        runtime_error = (runtime_error or "") + note
+                        logger.warning(
+                            "offline mode, missing runtimes: %s",
+                            ", ".join(missing),
+                        )
+                elif not support.get("supported"):
+                    # No intentar pip en un Python sin wheels (p. ej. cp314):
+                    # el fallo llegaba después de mover el store y dejaba la
+                    # app sin el runtime que ya tenía instalado.
+                    runtime_error = support.get("message") or (
+                        f"Python {support.get('short', '?')} is not supported "
+                        "by the official AI runtime wheels."
                     )
-                if not torch_status().get("installed"):
-                    self.progress.emit(72, "Installing PyTorch...")
-                    install_pytorch(
-                        "auto",
-                        progress_callback=lambda p, m, b=72, s=18: (
-                            self._map_runtime_progress(p, m, b, s)
-                        ),
-                    )
+                    logger.warning("AI runtime auto-install skipped: %s", runtime_error)
+                elif not pack_failed:
+                    if not onnx_status().get("installed"):
+                        self.progress.emit(55, "Installing ONNX Runtime...")
+                        install_onnxruntime(
+                            "auto",
+                            progress_callback=lambda p, m, b=55, s=17: (
+                                self._map_runtime_progress(p, m, b, s)
+                            ),
+                        )
+                    if not torch_status().get("installed"):
+                        self.progress.emit(72, "Installing PyTorch...")
+                        install_pytorch(
+                            "auto",
+                            progress_callback=lambda p, m, b=72, s=18: (
+                                self._map_runtime_progress(p, m, b, s)
+                            ),
+                        )
             except Exception as exc:
                 runtime_error = str(exc)
                 logger.warning("AI runtime auto-install failed: %s", exc)
@@ -211,6 +302,17 @@ class DraggyEncoderApp:
         # seleccionar y copiar. Va aquí, con la QApplication, para que también
         # la alcancen los cuadros de diálogo que se abren más adelante.
         install_text_selection(self.app)
+        # Los dos upscalers que viajan en el instalador deben aparecer como
+        # instalados/habilitados sin pasar por Hugging Face. Se hace antes de
+        # construir MainWindow para que el primer paint del workflow ya los
+        # vea; si el usuario los deshabilitó, se respeta su estado.
+        try:
+            from src.ai.engines_state import seed_bundled_engines
+            seeded = seed_bundled_engines()
+            if seeded:
+                logger.info("Bundled AI models enabled: %s", ", ".join(seeded))
+        except Exception:
+            logger.warning("Could not seed bundled AI models", exc_info=True)
         # El logo del programa es el mismo icono que el botón Import de
         # la cadena: un único asset en toda la app.
         logo_path = get_asset_path("Import.png")

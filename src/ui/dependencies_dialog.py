@@ -18,6 +18,7 @@ from PySide6.QtCore import Qt, QThread, QTimer, Signal
 from PySide6.QtGui import QFont
 from PySide6.QtWidgets import (
     QDialog,
+    QFileDialog,
     QHBoxLayout,
     QLabel,
     QMessageBox,
@@ -53,6 +54,7 @@ from src.ai.fetcher import (
 from src.ai.registry import get_engine_dir
 from src.ai.engines_state import dir_has_weights
 from src.config import get_logs_dir
+from src.runtimes.offline_pack import is_offline_mode, pack_supported
 from src.ui.dialog_utils import fit_to_screen, open_folder
 from src.ui.engines_tab import EnginesTab
 from src.ui.dep_row import DepRow
@@ -127,6 +129,117 @@ class _ReinstallWorker(QThread):
                 self.cancelled.emit(self.dep_id)
             else:
                 self.failed.emit(self.dep_id, str(exc))
+
+
+class _GpuPackImportWorker(QThread):
+    """Importa el pack GPU offline sin bloquear la UI.
+
+    No descarga nada: verifica los SHA-256 de las partes locales, extrae en
+    staging, valida CUDA en un subproceso y hace el swap del store. Un fallo
+    deja intacto el runtime que ya funcionaba.
+    """
+
+    progress = Signal(int, str)
+    finished_ok = Signal(object)      # resultado de import_pack()
+    failed = Signal(str)              # mensaje para el usuario
+    cancelled = Signal()
+
+    def __init__(self, manifest_path, parent=None):
+        super().__init__(parent)
+        self.manifest_path = manifest_path
+        self.abort_event = threading.Event()
+
+    def cancel(self):
+        self.abort_event.set()
+
+    def run(self):
+        try:
+            # El host de IA mantiene torch/onnxruntime cargados y, con ellos,
+            # las DLL del store anterior. Hay que apagarlo antes de renombrar
+            # la carpeta; el siguiente trabajo de IA lo relanza contra el
+            # runtime recién importado.
+            try:
+                from src.ai import host_client
+
+                host_client.stop_host()
+            except Exception:
+                pass
+
+            from src.runtimes.offline_pack import import_pack
+
+            result = import_pack(
+                self.manifest_path,
+                progress_callback=lambda p, m: self.progress.emit(
+                    int(p), str(m or "")
+                ),
+                abort_event=self.abort_event,
+            )
+            self.finished_ok.emit(result)
+        except Exception as exc:
+            if self.abort_event.is_set():
+                self.cancelled.emit()
+            else:
+                self.failed.emit(str(exc))
+
+
+class _GpuPackDownloadWorker(QThread):
+    """Descarga el pack de la Release y lo instala con el importador normal.
+
+    La descarga es reanudable y verifica SHA-256; si se cancela o falla, las
+    partes ``.part`` se conservan para reintentar. El host de IA solo se
+    detiene al final, justo antes del swap: durante la descarga puede seguir
+    trabajando. Tras una instalación correcta se borra la descarga temporal.
+    """
+
+    progress = Signal(int, str)
+    finished_ok = Signal(object)      # resultado de import_pack()
+    failed = Signal(str)
+    cancelled = Signal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.abort_event = threading.Event()
+
+    def cancel(self):
+        self.abort_event.set()
+
+    def run(self):
+        try:
+            from src.runtimes.pack_download import (
+                discard_downloaded_pack,
+                download_pack,
+            )
+
+            manifest_path = download_pack(
+                progress_callback=lambda p, m: self.progress.emit(
+                    int(p), str(m or "")
+                ),
+                abort_event=self.abort_event,
+            )
+
+            try:
+                from src.ai import host_client
+
+                host_client.stop_host()
+            except Exception:
+                pass
+
+            from src.runtimes.offline_pack import import_pack
+
+            result = import_pack(
+                manifest_path,
+                progress_callback=lambda p, m: self.progress.emit(
+                    60 + int(int(p) * 0.40), str(m or "")
+                ),
+                abort_event=self.abort_event,
+            )
+            discard_downloaded_pack(manifest_path)
+            self.finished_ok.emit(result)
+        except Exception as exc:
+            if self.abort_event.is_set():
+                self.cancelled.emit()
+            else:
+                self.failed.emit(str(exc))
 
 
 class _UninstallWorker(QThread):
@@ -269,6 +382,7 @@ class DependenciesDialog(QDialog):
         )
         self._row_widgets = []
         self._active_worker = None
+        self._pack_worker = None
         self._uninstall_worker = None
         self._upstream_worker = None
         self._check_force_next = False
@@ -352,6 +466,27 @@ class DependenciesDialog(QDialog):
                 "insignia 'UPDATE AVAILABLE' cuando hay una build más "
                 "reciente; pulsa 'Update' para traerla."
             )
+            if not pack_supported():
+                # Linux/AppImage no tiene pack offline todavía: se dice aquí,
+                # donde el usuario busca el botón, en vez de ofrecer una
+                # acción que solo puede fallar.
+                subtitle_text += (
+                    "\n\nOffline GPU pack: Windows x64 only. On this platform "
+                    "PyTorch and ONNX Runtime are installed online."
+                )
+            else:
+                subtitle_text += (
+                    "\n\nEl pack GPU (descarga o archivo local) incluye el "
+                    "runtime CUDA de usuario —cudart, cuBLAS y cuDNN—, pero "
+                    "NO el driver NVIDIA. Instala el driver con NVIDIA y "
+                    "mantenlo actualizado."
+                )
+                if is_offline_mode():
+                    subtitle_text += (
+                        "\n\nOffline mode is active (DRAGGY_OFFLINE): the GPU "
+                        "pack download is disabled. Use 'Import GPU pack…' "
+                        "with the local files."
+                    )
         title_font = QFont()
         title_font.setPointSize(16)
         title_font.setBold(True)
@@ -388,12 +523,39 @@ class DependenciesDialog(QDialog):
                 "Re-checks the FFmpeg upstream cache and redraws the binaries list."
             )
             self.btn_refresh.clicked.connect(self._refresh)
+            self.btn_download_pack = None
+            if pack_supported() and not is_offline_mode():
+                self.btn_download_pack = QPushButton("Download GPU pack")
+                self.btn_download_pack.setToolTip(
+                    "Descarga el runtime NVIDIA CUDA desde GitHub Releases "
+                    "(2–3 GB), con reanudación y verificación SHA-256. "
+                    "Incluye CUDA de usuario, no el driver NVIDIA; no usa pip."
+                )
+                self.btn_download_pack.clicked.connect(self._download_gpu_pack)
+            self.btn_import_pack = QPushButton("Import GPU pack…")
+            if pack_supported():
+                self.btn_import_pack.setToolTip(
+                    "Instala el runtime NVIDIA CUDA desde un pack local "
+                    "(gpu-pack.json + partes ZIP). Incluye CUDA de usuario, "
+                    "no el driver NVIDIA; no usa pip ni internet."
+                )
+                self.btn_import_pack.clicked.connect(self._import_gpu_pack)
+            else:
+                self.btn_import_pack.setEnabled(False)
+                self.btn_import_pack.setToolTip(
+                    "El pack GPU offline solo está disponible para Windows "
+                    "x64. En Linux/AppImage, PyTorch y ONNX Runtime se "
+                    "instalan online."
+                )
         self.btn_logs = QPushButton("Open logs")
         self.btn_logs.clicked.connect(self._open_logs)
         self.btn_close = QPushButton("Close")
         self.btn_close.clicked.connect(self.accept)
         if not self._engines_mode:
             bottom.addWidget(self.btn_refresh)
+            if self.btn_download_pack is not None:
+                bottom.addWidget(self.btn_download_pack)
+            bottom.addWidget(self.btn_import_pack)
         bottom.addWidget(self.btn_logs)
         bottom.addStretch()
         bottom.addWidget(self.btn_close)
@@ -598,6 +760,175 @@ class DependenciesDialog(QDialog):
     def _open_logs(self):
         open_folder(get_logs_dir(), self, "Open logs",
                      "No se pudo abrir la carpeta de logs")
+
+    def _download_gpu_pack(self):
+        """Descarga el pack publicado y lo importa, sin bloquear la UI."""
+        if self._pack_worker and self._pack_worker.isRunning():
+            QMessageBox.information(
+                self, "Ocupado",
+                "Ya hay una operación del pack GPU en curso.",
+            )
+            return
+
+        confirm = QMessageBox.question(
+            self,
+            "Download GPU pack",
+            "Se descargará el runtime NVIDIA CUDA desde GitHub Releases.\n\n"
+            "La descarga ronda los 2–3 GB y el runtime instalado ocupa unos "
+            "3,4 GB; hace falta espacio libre para ambos. Se puede cancelar "
+            "y continúa donde quedó.\n\n"
+            "Incluye el runtime CUDA de usuario (cudart, cuBLAS y cuDNN), "
+            "pero NO el driver NVIDIA: el driver debe estar instalado y "
+            "actualizado en el equipo.\n\n"
+            "Al terminar, el runtime de IA se detendrá para reemplazar sus "
+            "archivos. Si hay un render de IA en curso, se interrumpirá.\n\n"
+            "¿Continuar?",
+        )
+        if confirm != QMessageBox.StandardButton.Yes:
+            return
+
+        progress = QProgressDialog(
+            "Contactando con GitHub Releases…\n"
+            "La descarga se reanuda si se cancela.",
+            "Cancel", 0, 100, self,
+        )
+        progress.setWindowTitle("Download GPU pack")
+        progress.setWindowModality(Qt.WindowModality.WindowModal)
+        progress.setMinimumDuration(0)
+        progress.setAutoClose(False)
+        progress.setAutoReset(False)
+
+        worker = _GpuPackDownloadWorker(parent=self)
+        self._pack_worker = worker
+        worker.progress.connect(
+            lambda percent, message: (
+                progress.setLabelText(message),
+                progress.setValue(int(percent)),
+            )
+        )
+        worker.finished_ok.connect(
+            lambda result: self._on_pack_imported(result, progress)
+        )
+        worker.failed.connect(
+            lambda message: self._on_pack_failed(message, progress)
+        )
+        worker.cancelled.connect(
+            lambda: self._on_pack_cancelled(progress)
+        )
+        progress.canceled.connect(worker.cancel)
+        worker.start()
+
+    def _import_gpu_pack(self):
+        """Pide el manifiesto del pack y lo importa en un hilo aparte."""
+        if self._pack_worker and self._pack_worker.isRunning():
+            QMessageBox.information(
+                self, "Ocupado",
+                "Ya hay una operación del pack GPU en curso.",
+            )
+            return
+
+        from src.config import get_base_dir, get_bin_dir
+        from src.runtimes.offline_pack import MANIFEST_NAME, PACK_DIR_NAME
+
+        start = os.path.join(get_bin_dir(), PACK_DIR_NAME)
+        if not os.path.isdir(start):
+            start = os.path.join(get_base_dir(), PACK_DIR_NAME)
+        if not os.path.isdir(start):
+            start = os.path.join(os.path.expanduser("~"), "Downloads")
+
+        path, _selected = QFileDialog.getOpenFileName(
+            self,
+            "Import offline GPU pack",
+            start,
+            f"GPU pack manifest ({MANIFEST_NAME} *.json);;"
+            "ZIP part (*.zip);;All files (*)",
+        )
+        if not path:
+            return
+
+        confirm = QMessageBox.question(
+            self,
+            "Import GPU pack",
+            "El runtime de IA se detendrá para poder reemplazar sus archivos. "
+            "Si hay un render de IA en curso, se interrumpirá.\n\n"
+            "Incluye el runtime CUDA de usuario (cudart, cuBLAS y cuDNN), "
+            "pero NO el driver NVIDIA: el driver debe estar instalado y "
+            "actualizado en el equipo.\n\n"
+            "¿Continuar con la importación?",
+        )
+        if confirm != QMessageBox.StandardButton.Yes:
+            return
+
+        progress = QProgressDialog(
+            "Verifying the offline GPU pack...\n"
+            "Nothing is downloaded; the files are read from disk.",
+            "Cancel", 0, 100, self,
+        )
+        progress.setWindowTitle("Import GPU pack")
+        progress.setWindowModality(Qt.WindowModality.WindowModal)
+        progress.setMinimumDuration(0)
+        progress.setAutoClose(False)
+        progress.setAutoReset(False)
+
+        worker = _GpuPackImportWorker(path, parent=self)
+        self._pack_worker = worker
+        worker.progress.connect(
+            lambda percent, message: (
+                progress.setLabelText(message),
+                progress.setValue(int(percent)),
+            )
+        )
+        worker.finished_ok.connect(
+            lambda result: self._on_pack_imported(result, progress)
+        )
+        worker.failed.connect(
+            lambda message: self._on_pack_failed(message, progress)
+        )
+        worker.cancelled.connect(
+            lambda: self._on_pack_cancelled(progress)
+        )
+        progress.canceled.connect(worker.cancel)
+        worker.start()
+
+    def _on_pack_imported(self, result, progress):
+        progress.close()
+        self._pack_worker = None
+        manifest = (result or {}).get("manifest") or {}
+        versions = (result or {}).get("versions") or manifest.get("versions") or {}
+        detail = ", ".join(f"{name} {version}" for name, version in versions.items())
+        if (result or {}).get("already_installed"):
+            headline = "Ese pack GPU ya estaba importado."
+        else:
+            headline = (
+                "Pack GPU importado y validado con CUDA.\n"
+                "El runtime anterior fue reemplazado solo después de que la "
+                "sonda confirmó que torch y ONNX Runtime funcionan."
+            )
+        QMessageBox.information(
+            self, "GPU pack",
+            headline + (f"\n\n{detail}" if detail else ""),
+        )
+        self._populate()
+
+    def _on_pack_failed(self, message, progress):
+        progress.close()
+        self._pack_worker = None
+        QMessageBox.critical(
+            self, "GPU pack",
+            "No se pudo descargar o importar el pack GPU. El runtime que ya "
+            f"estaba instalado no se ha tocado.\n\n{message}",
+        )
+        self._populate()
+
+    def _on_pack_cancelled(self, progress):
+        progress.close()
+        self._pack_worker = None
+        QMessageBox.information(
+            self, "GPU pack",
+            "Operación cancelada. No se ha cambiado el runtime; si estaba "
+            "descargando, lo descargado se conserva para reanudar.",
+        )
+        self._populate()
 
     @staticmethod
     def _dep_display_name(dep_id):

@@ -7,6 +7,8 @@ DRAGGY ENCODER combines FFmpeg-based encoding with ONNX/PyTorch AI models for vi
 ## Features
 
 - GPU-accelerated AI upscaling (Real-ESRGAN, OmniSR, CUGAN, SwinIR) via ONNX Runtime (CUDA/TensorRT)
+- Two upscalers ship ready to use: **Real-ESRGAN x4+** (general) and **RealESR AnimeVideo v3** (fast, x2/x3/x4); the rest are downloaded on demand
+- One-off **Video tools**: screenshot, pixelate, blur, stabilize, remove watermark, reverse, split and change volume
 - Frame interpolation (RIFE, FILM) via PyTorch/ONNX
 - Frame-by-frame decode → AI → encode pipeline with audio passthrough
 - Auto-downloading FFmpeg (latest BtbN gpl build) and AI models from HuggingFace
@@ -34,7 +36,9 @@ pip install -r requirements.txt
 python main.py
 ```
 
-On first launch the app auto-detects your hardware, downloads FFmpeg + ONNX Runtime + PyTorch if needed, and tests all compatible GPU/CPU codecs — no configuration required.
+Use Python **3.10–3.13** for source runs: the official ONNX Runtime GPU wheels currently stop at cp313, so the auto-installer refuses Python 3.14 instead of trying a nonexistent wheel. The Windows installer bundles its own Python 3.13.
+
+On first launch the app auto-detects your hardware, downloads FFmpeg + ONNX Runtime + PyTorch if needed, seeds the bundled upscalers, and tests all compatible GPU/CPU codecs — no configuration required.
 
 ### Choosing the FFmpeg version
 
@@ -96,7 +100,7 @@ DRAGGY_ENCODER/
 │   ├── .session/             # Preferences, queue & render history, engine state
 │   ├── ffmpeg/               # FFmpeg (auto-downloaded on first run)
 │   ├── runtimes/             # PyTorch + ONNX Runtime (pip install --target)
-│   ├── models/               # Downloaded AI model weights
+│   ├── models/               # Bundled defaults + downloaded AI model weights
 │   └── logs/                 # Render logs & FFmpeg logs
 ├── personal/                 # HuggingFace tokens (gitignored)
 └── src/
@@ -249,6 +253,92 @@ GitHub Actions publishes one package per platform:
 - **Linux (x86_64):** `DraggyEncoder-Linux-x86_64-*.AppImage`, directly executable.
 
 The AppImage can be marked executable and launched from the file manager.
+
+### Release size budget
+
+Neither package embeds PyTorch, ONNX Runtime or CUDA: those are installed on
+first run into `bin/runtimes/ai_modules`, outside the installer/AppImage. The
+package only carries Qt, the embedded Python used for that install, and the two
+bundled ONNX upscalers (~383 MB before compression). The `.onnx` files are not
+stored in Git; CI downloads them with a pinned SHA-256 before PyInstaller.
+
+The CI deliberately does **not** upload build artifacts. GitHub Actions
+artifact storage on Free is only 500 MB, while a Release asset has a 2 GiB
+per-file limit and no overall size limit. Packages go straight to Releases via
+`softprops/action-gh-release`; the workflows also fail early if an installer or
+AppImage ever approaches the 2 GiB ceiling.
+
+### Offline NVIDIA GPU pack (Windows x64 only)
+
+**Platform: Windows x64 / CPython 3.13 (`cp313`).** There is no
+Linux/AppImage offline pack yet: the CUDA closure is different (ONNX Runtime on
+Linux needs the `nvidia-*` wheel libraries and `LD_LIBRARY_PATH`) and it has not
+been verified on a Linux GPU machine. On Linux the app installs PyTorch and
+ONNX Runtime online as before; the importer rejects any non-Windows manifest.
+
+The pack contains the **user-space CUDA runtime** that PyTorch and ONNX Runtime
+load on Windows: the CUDA runtime (`cudart`), cuBLAS and cuDNN shipped inside
+the torch/ORT wheels. It does **not** contain the NVIDIA driver. The driver is
+a kernel/display component that must be installed with the NVIDIA installer and
+kept up to date by the user; the full CUDA Toolkit is not required. On import
+the app checks the detected driver branch and refuses a pack that needs a newer
+driver; if no working driver is present, the CUDA probe fails before the
+runtime store is replaced.
+
+The installer stays slim: it does not contain PyTorch, ONNX Runtime or CUDA. On
+a machine that will never have internet, download the **offline GPU pack** and
+put it next to the app before the first launch:
+
+```text
+DraggyEncoder/
+  DraggyEncoder.exe
+  gpu-pack/
+    gpu-pack.json
+    gpu-pack-nvidia-cu130-win-x64-cp313-part01.zip
+    gpu-pack-nvidia-cu130-win-x64-cp313-part02.zip
+```
+
+On start the app validates the pack's platform, architecture and CPython tag
+(`cp313`), verifies every part's SHA-256, extracts into
+`bin/runtimes/.staging`, imports torch and onnxruntime in a clean subprocess
+to confirm they see CUDA, and only then swaps the runtime store. A bad part, a
+pack for another Python or a machine without a working NVIDIA driver leaves the
+existing runtime untouched and names the failing part. Nothing is downloaded
+and pip is never invoked.
+
+You can also point `DRAGGY_GPU_PACK` at the manifest (or its folder), or use
+**Manage Dependencies → Import GPU pack…**. `DRAGGY_OFFLINE=1` disables every
+network AI-runtime install attempt, so a missing runtime is reported instead
+of silently downloaded.
+
+If the machine has internet, **Manage Dependencies → Download GPU pack** does
+the same install without pip: it reads `gpu-pack.json` from the `gpu-pack-v1`
+Release, validates the platform and CPython tag before downloading, fetches
+each part with HTTP range resume, verifies every SHA-256, and then calls the
+same importer. The download is roughly 2–3 GB and the installed runtime ~3.4 GB;
+a cancelled or failed download keeps its `.part` files so the next attempt
+continues where it stopped, and the temporary download folder is removed after
+a successful install. It is Windows x64 only, like the manual pack.
+
+Each ZIP is independent (paths are relative to the store root), so a corrupt
+part can be re-downloaded alone; the app extracts the parts in order into the
+same staging directory. The builder cuts by *uncompressed* size (1900 MiB by
+default), which guarantees the compressed asset also stays under GitHub's 2 GiB
+per-file limit:
+
+```bash
+python packaging/build_gpu_pack.py --store path/to/ai_modules --out dist/gpu-pack
+```
+
+The measured CUDA 13 store (torch 2.14.1+cu130, torchvision 0.29.1,
+torchaudio 2.11.0, ONNX Runtime 1.32) is ~3.4 GB installed, so it splits into
+two parts. CI (`.github/workflows/build-gpu-pack.yml`) builds the pack on
+`windows-latest` and attaches `gpu-pack.json` plus the ZIPs to a Release. The
+hosted runner has no NVIDIA GPU, so it only proves that the packages import and
+that the pack is built; the real CUDA check is the import probe the app runs on
+the user's machine before touching the store. FFmpeg is still a separate
+first-run download (or drop `ffmpeg.exe`/`ffprobe.exe` into `bin/ffmpeg/` on a
+machine that never gets internet).
 
 ### Downloads — latest build
 
