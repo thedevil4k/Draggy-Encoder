@@ -258,6 +258,28 @@ def installed_pack_info() -> dict:
         return {}
 
 
+def pack_state() -> dict:
+    """Estado del pack para la UI: soportado, importado y todavía en uso.
+
+    ``installed`` solo dice que existe el marcador de una importación.
+    ``in_use`` exige además que el store actual tenga las versiones que ese
+    pack declaró: un ``pip install`` posterior deja el marcador en su sitio
+    pero reemplaza el runtime, y decir "instalado" entonces sería mentira.
+    """
+    info = installed_pack_info()
+    supported = pack_supported()
+    installed = supported and bool(info)
+    in_use = installed and _installed_versions_match(
+        {"versions": info.get("versions") or {}}
+    )
+    return {
+        "supported": supported,
+        "installed": installed,
+        "in_use": in_use,
+        "info": info,
+    }
+
+
 # ---------------------------------------------------------------------------
 # Validación del manifiesto
 # ---------------------------------------------------------------------------

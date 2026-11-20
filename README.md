@@ -179,7 +179,11 @@ Dos reglas que costaron un disgusto y conviene no volver a romper:
 ## Requirements
 
 - Python 3.10–3.14
-- GPU recommended for AI upscaling (NVIDIA CUDA or AMD Vulkan)
+- NVIDIA GPU recommended for AI upscaling (CUDA). The AI runtimes this app
+  installs are the CUDA builds of PyTorch and ONNX Runtime: on an AMD or Intel
+  GPU the engines still work, but on the CPU. There is no Vulkan, DirectML or
+  ROCm path for the AI engines. Video *encoding* is a separate matter — AMF
+  (AMD) and QuickSync (Intel) come from FFmpeg and are unaffected.
 - No Git required: model downloads use the bundled `huggingface_hub`
   (the packaged app no longer falls back to `git clone`, since the
   Windows installer does not ship Git).

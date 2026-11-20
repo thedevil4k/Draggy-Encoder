@@ -14,6 +14,7 @@ import logging
 import os
 import threading
 import traceback
+from datetime import datetime, timezone
 from PySide6.QtCore import Qt, QThread, QTimer, Signal
 from PySide6.QtGui import QFont
 from PySide6.QtWidgets import (
@@ -54,7 +55,11 @@ from src.ai.fetcher import (
 from src.ai.registry import get_engine_dir
 from src.ai.engines_state import dir_has_weights
 from src.config import get_logs_dir
-from src.runtimes.offline_pack import is_offline_mode, pack_supported
+from src.runtimes.offline_pack import (
+    is_offline_mode,
+    pack_state,
+    pack_supported,
+)
 from src.ui.dialog_utils import fit_to_screen, open_folder
 from src.ui.engines_tab import EnginesTab
 from src.ui.dep_row import DepRow
@@ -76,6 +81,20 @@ _CONVERT_STATUS_MAP = {
 def _friendly_convert_status(raw: str) -> str:
     """Traduce las fases crudas del OnnxConvertWorker a español."""
     return _CONVERT_STATUS_MAP.get(str(raw or "").strip(), str(raw or ""))
+
+
+def _fmt_pack_timestamp(value):
+    """``2026-11-20T16:47:58+00:00`` -> ``2026-11-20 16:47 UTC``."""
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    try:
+        stamp = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return text
+    if stamp.tzinfo is not None:
+        return stamp.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    return stamp.strftime("%Y-%m-%d %H:%M")
 
 
 def _fmt_bytes(n):
@@ -395,6 +414,9 @@ class DependenciesDialog(QDialog):
         self._remove_progress = None
         # Pane de modelos; solo existe en modo AI Engines.
         self.engines_tab = None
+        # Etiqueta de estado del pack GPU; solo existe fuera del modo AI
+        # Engines (allí no hay pack). Se crea en _build().
+        self.pack_status = None
         # Escuchamos el bus de estado para repintar la pestaña AI Engines
         # aunque las mutaciones ocurran en otra ventana (workflow widget,
         # followup al cerrar, etc.). UniqueConnection evita handlers
@@ -516,6 +538,16 @@ class DependenciesDialog(QDialog):
             self.scroll.setWidget(self.container)
             layout.addWidget(self.scroll, stretch=1)
 
+        if not self._engines_mode:
+            # Estado del pack GPU pegado a sus botones: sin esto el panel no
+            # decía en ninguna parte si el runtime vino del pack o de pip.
+            self.pack_status = QLabel()
+            self.pack_status.setWordWrap(True)
+            self.pack_status.setTextInteractionFlags(
+                Qt.TextInteractionFlag.TextSelectableByMouse
+            )
+            layout.addWidget(self.pack_status)
+
         bottom = QHBoxLayout()
         if not self._engines_mode:
             self.btn_refresh = QPushButton("Refresh")
@@ -627,6 +659,8 @@ class DependenciesDialog(QDialog):
         # Las ranuras de modelos (KIND_MODEL) se gestionan por motor desde
         # el diálogo 'AI Engines'; no se listan aquí para no duplicar
         # categorías.
+        self._update_pack_status()
+
         for info in dependencies.list_all():
             if info.get("kind") == dependencies.KIND_MODEL:
                 continue
@@ -756,6 +790,65 @@ class DependenciesDialog(QDialog):
         # Refresh manual: repobla inmediatamente + fuerza un HEAD fresco.
         self._populate()
         self._schedule_upstream_check(delay_ms=0, force=True)
+
+    def _update_pack_status(self):
+        """Pinta si el pack GPU está instalado y si su runtime sigue en uso."""
+        if self.pack_status is None:
+            return
+        try:
+            state = pack_state()
+        except Exception:
+            logger.exception("Could not read the GPU pack state")
+            self.pack_status.setText("GPU pack: estado desconocido.")
+            self.pack_status.setStyleSheet("color: #a0a0b0;")
+            return
+
+        info = state.get("info") or {}
+        imported = _fmt_pack_timestamp(info.get("imported_at"))
+        versions = ", ".join(
+            f"{name} {version}"
+            for name, version in (info.get("versions") or {}).items()
+        )
+
+        if not state.get("supported"):
+            text = (
+                "GPU pack: no disponible en esta plataforma (solo Windows "
+                "x64). Aquí PyTorch y ONNX Runtime se instalan online desde "
+                "sus filas."
+            )
+            color = "#a0a0b0"
+        elif state.get("in_use"):
+            text = "GPU pack: INSTALADO"
+            if imported:
+                text += f" (importado {imported})"
+            if versions:
+                text += f" · {versions}"
+            text += (
+                ". El runtime CUDA de usuario sale del pack; el driver "
+                "NVIDIA se instala aparte."
+            )
+            color = "#2ecc71"
+        elif state.get("installed"):
+            text = "GPU pack: importado"
+            if imported:
+                text += f" {imported}"
+            text += (
+                ", pero el runtime actual ya no es el del pack (otra "
+                "instalación lo reemplazó). Vuélvelo a importar para usar "
+                "el pack."
+            )
+            color = "#f5a623"
+        else:
+            text = (
+                "GPU pack: NO instalado — PyTorch y ONNX Runtime están "
+                "presentes, pero no se instalaron con el pack. 'Download GPU "
+                "pack' trae el runtime CUDA de usuario sin pip; 'Import GPU "
+                "pack…' hace lo mismo desde archivos locales."
+            )
+            color = "#a0a0b0"
+
+        self.pack_status.setText(text)
+        self.pack_status.setStyleSheet(f"color: {color};")
 
     def _open_logs(self):
         open_folder(get_logs_dir(), self, "Open logs",

@@ -74,6 +74,41 @@ def _dir_has_files(path: str) -> bool:
 # Factories para runtimes / ranuras de modelos
 # ---------------------------------------------------------------------------
 
+def _cpu_only_reason() -> str:
+    """Por qué la IA va en CPU cuando hay GPU pero no es NVIDIA.
+
+    El runtime que instala esta app es el build CUDA de PyTorch y ONNX
+    Runtime, y ese build solo acelera tarjetas NVIDIA: en un equipo AMD o
+    Intel la inferencia funciona igual, pero en CPU. Sin esta frase la fila
+    decía solo "solo CPU", que delante de una Radeon parece un fallo del
+    equipo en vez de una limitación conocida.
+
+    ``get_known_hardware()`` es la detección que ya hizo la ventana principal
+    (``None`` = no lo sabemos): se lee de ahí y no se vuelve a sondear el
+    sistema al pintar una fila. Si no sabemos qué GPU hay, no se afirma nada.
+    """
+    try:
+        from src.hardware.detector import get_known_hardware
+
+        hardware = get_known_hardware() or {}
+    except Exception:
+        return ""
+    vendors = {
+        str(gpu.get("vendor") or "").strip().lower()
+        for gpu in (hardware.get("gpus") or [])
+        if isinstance(gpu, dict)
+    }
+    if "nvidia" in vendors:
+        # Con NVIDIA la causa sería otra (driver, build CPU): no se inventa.
+        return ""
+    if any(vendor.startswith(("amd", "intel")) for vendor in vendors):
+        return (
+            " · el runtime instalado es el build CUDA, que solo acelera "
+            "tarjetas NVIDIA: en AMD/Intel la IA se ejecuta en CPU"
+        )
+    return ""
+
+
 def _runtime_status(engine_id, display_name, source_url, manager_status_fn):
     """Estado de un runtime IA (torch/onnxruntime) usando la fuente única de
     verdad: ``runtimes.manager``.
@@ -105,6 +140,8 @@ def _runtime_status(engine_id, display_name, source_url, manager_status_fn):
     if installed:
         status = STATUS_INSTALLED
         gpu_text = " · GPU (CUDA) disponible" if gpu else " · solo CPU"
+        if not gpu:
+            gpu_text += _cpu_only_reason()
         detail = f"Instalado en la carpeta del programa. Versión: {version}{gpu_text}"
     elif _runtime_package_downloaded(store, engine_id):
         # Descargado en el store local pero el import falla. Dos causas
