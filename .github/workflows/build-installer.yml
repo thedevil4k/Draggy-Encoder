@@ -11,10 +11,19 @@ on:
     tags: ["v*"]
   workflow_dispatch:
 
-# Todos los workflows de empaquetado comparten la cuota de artifacts. El
-# mismo grupo serializa la limpieza y la subida entre Linux y Windows.
+# Grupo PROPIO por workflow. Antes Linux y Windows compartían
+# `draggy-packaging-<repo>` y, como GitHub solo conserva un run pendiente por
+# grupo, cada push cancelaba el run de Linux antes de que arrancara (los
+# AppImage nunca se construían).
+#
+# La limpieza de artifacts no necesita serializarse: cada prune ignora los
+# artifacts de su propio run y los de runs que siguen activos, y tolera el
+# 404 si el otro workflow borró el mismo artifact primero. Además ninguno de
+# los dos workflows sube artifacts de Actions (solo assets de Release, que no
+# cuentan contra la cuota), así que no hay salida de una plataforma que el
+# otro pueda pisar.
 concurrency:
-  group: draggy-packaging-${{ github.repository }}
+  group: draggy-packaging-windows-${{ github.repository }}
   cancel-in-progress: false
 
 env:
@@ -32,7 +41,9 @@ jobs:
 
       # La cuota es compartida por Linux, Windows y Pages. Eliminamos todos
       # los artifacts temporales conocidos de ejecuciones terminadas antes de
-      # compilar; los assets de Releases no se tocan.
+      # compilar; los assets de Releases no se tocan. Linux puede estar
+      # haciendo lo mismo en paralelo: los borrados duplicados se ignoran
+      # (404) y los artifacts de runs activos se respetan.
       #
       # Cada workflow de empaquetado limpia TODO lo que conozca (Installer,
       # paquetes Linux y repo Flatpak de Pages), no solo sus propios

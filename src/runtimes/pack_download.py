@@ -16,7 +16,6 @@ import os
 import shutil
 import urllib.parse
 
-from src.config import REPO_URL
 from src.runtimes import manager, offline_pack
 from src.runtimes.offline_pack import (
     FREE_SPACE_MARGIN,
@@ -30,9 +29,14 @@ from src.runtimes.offline_pack import (
     validate_manifest,
 )
 
-#: Release rolling que publica el workflow ``build-gpu-pack.yml``.
+#: Repo público solo de binarios. Los assets de una Release de un repo
+#: privado exigen token, y la app descarga de forma anónima; por eso el pack
+#: vive aquí y no en el repo del código.
+PACK_REPO_URL = "https://github.com/thedevil4k/Draggy-Encoder-Binaries"
+
+#: Release que publica el pack (``build-gpu-pack.yml`` o subida manual).
 RELEASE_TAG = "gpu-pack-v1"
-RELEASE_BASE_URL = f"{REPO_URL}/releases/download/{RELEASE_TAG}"
+RELEASE_BASE_URL = f"{PACK_REPO_URL}/releases/download/{RELEASE_TAG}"
 
 #: Carpeta de descarga dentro de ``bin/runtimes``: misma unidad que el store
 #: (el import usa rename, no copia entre volúmenes) y fuera de ``ai_modules``.
@@ -116,8 +120,8 @@ def _fetch_manifest(session, target_dir: str) -> str:
     if getattr(response, "status_code", 200) == 404:
         raise OfflinePackError(
             "La Release del pack GPU todavía no tiene assets publicados "
-            f"({RELEASE_TAG}). Ejecuta el workflow 'Build NVIDIA GPU Pack' "
-            "o usa 'Import GPU pack…' con un pack local."
+            f"({RELEASE_TAG} en {PACK_REPO_URL}). Publica el pack en esa "
+            "Release o usa 'Import GPU pack…' con un pack local."
         )
     try:
         response.raise_for_status()
