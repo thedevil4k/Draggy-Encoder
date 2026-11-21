@@ -805,11 +805,14 @@ class DependenciesDialog(QDialog):
 
         info = state.get("info") or {}
         imported = _fmt_pack_timestamp(info.get("imported_at"))
+        # Lista completa solo en el tooltip: en línea eran 24 paquetes y la
+        # etiqueta se convertía en un párrafo de cuatro líneas.
         versions = ", ".join(
             f"{name} {version}"
             for name, version in (info.get("versions") or {}).items()
         )
 
+        tooltip = ""
         if not state.get("supported"):
             text = (
                 "GPU pack: no disponible en esta plataforma (solo Windows "
@@ -818,13 +821,20 @@ class DependenciesDialog(QDialog):
             )
             color = "#a0a0b0"
         elif state.get("in_use"):
-            text = "GPU pack: INSTALADO"
+            text = "GPU pack: instalado y en uso"
             if imported:
                 text += f" (importado {imported})"
-            if versions:
-                text += f" · {versions}"
-            text += (
-                ". El runtime CUDA de usuario sale del pack; el driver "
+            key_versions = [
+                f"{name} {version}"
+                for name, version in (info.get("versions") or {}).items()
+                if name in ("torch", "torchvision", "onnxruntime-gpu")
+            ]
+            if key_versions:
+                text += " · " + ", ".join(key_versions)
+            text += "."
+            tooltip = (
+                (f"Versiones del pack: {versions}\n\n" if versions else "")
+                + "El runtime CUDA de usuario sale del pack; el driver "
                 "NVIDIA se instala aparte."
             )
             color = "#2ecc71"
@@ -848,6 +858,9 @@ class DependenciesDialog(QDialog):
             color = "#a0a0b0"
 
         self.pack_status.setText(text)
+        self.pack_status.setToolTip(
+            tooltip if state.get("in_use") else ""
+        )
         self.pack_status.setStyleSheet(f"color: {color};")
 
     def _open_logs(self):
