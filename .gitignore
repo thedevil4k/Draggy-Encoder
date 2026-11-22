@@ -96,13 +96,12 @@ dist/
 *.spec
 !draggy_encoder.spec
 
-# Logs de compilación local y Setup generado por Inno Setup (OutputDir de
-# draggy_encoder.iss). Los .log ya caen por *.log; la carpeta se ignora para
-# que ni los .txt de selftest ni los temporales de PyInstaller ensucien
-# `git status`. Nada de installer/ se versiona: el CI publica el .exe como
-# artefacto de la release, no como fichero del repositorio.
-.build-tmp/
-installer/
+# Artefactos de compilación local: logs de PyInstaller/ISCC y selftests en
+# .build-tmp/, y el Setup que Inno deja en installer/ (su OutputDir). El .exe
+# se publica como artefacto de la release, no como fichero del repositorio.
+# Ancladas a la raíz para no ignorar un installer/ cualquiera del árbol.
+/.build-tmp/
+/installer/
 
 # Metainfo AppStream generado por el CI desde flatpak-metainfo.xml.in
 packaging/linux/flatpak-metainfo.xml
