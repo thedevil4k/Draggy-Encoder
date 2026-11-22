@@ -491,6 +491,49 @@ def get_audio_streams(ffmpeg_path, video_path):
         return []
 
 
+def get_subtitle_streams(ffmpeg_path, video_path):
+    """Pistas de subtítulos de ``video_path``, en orden de FFmpeg.
+
+    ``subtitle_index`` es el índice que usa ``-map 0:s:<index>``; ``index`` es
+    el stream global y el resto son etiquetas para mostrarlas o copiarlas.
+    Devuelve lista vacía si no hay ffprobe, el fichero no existe o falla.
+    """
+    ffprobe = get_ffprobe_path()
+    if not ffprobe or not os.path.exists(video_path):
+        return []
+    try:
+        cmd = [
+            ffprobe,
+            "-v", "error",
+            "-select_streams", "s",
+            "-show_entries", "stream=index,codec_name:stream_tags=language,title",
+            "-of", "json",
+            video_path,
+        ]
+        result = subprocess.run(cmd, timeout=30, **_run_kwargs())
+        if result.returncode != 0:
+            return []
+        payload = json.loads(result.stdout or "{}")
+        streams = payload.get("streams", [])
+        if not isinstance(streams, list):
+            return []
+        tracks = []
+        for subtitle_index, stream in enumerate(streams):
+            if not isinstance(stream, dict):
+                continue
+            tags = stream.get("tags") or {}
+            tracks.append({
+                "subtitle_index": subtitle_index,
+                "index": stream.get("index"),
+                "codec_name": stream.get("codec_name", ""),
+                "language": tags.get("language", ""),
+                "title": tags.get("title", ""),
+            })
+        return tracks
+    except Exception:
+        return []
+
+
 def health_check_ffmpeg(ffmpeg_path, timeout=10):
     """Smoke-test rápido del binario FFmpeg antes de una compresión real.
 

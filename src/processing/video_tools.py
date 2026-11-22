@@ -13,11 +13,13 @@ Así se pueden probar y usar sin arrastrar torch, Qt ni la cola de renders.
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import dataclass, field
 
 from src.ffmpeg.runner import (
     build_boost_filter,
     get_audio_streams,
+    get_subtitle_streams,
     get_video_info,
     measurement_is_usable,
 )
@@ -47,9 +49,11 @@ TOOL_DESCRIPTIONS = {
     "multiaudio": "Keep this video and add the audio of another episode (a "
                    "whole video file is fine) as extra selectable tracks, so "
                    "one file carries every dub. Nothing has to be extracted "
-                   "first: its first audio track is copied straight in. Each "
+                   "first: the audio track you pick is copied straight in, "
+                   "together with the subtitles that file carries. Each "
                    "added track can be loudness-normalised (EBU R128) so it "
-                   "matches the volume of the one already in the video.",
+                   "matches the volume of the one already in the video, and "
+                   "carries its own delay when the dubs do not start together.",
 }
 
 TOOL_SUFFIXES = {
@@ -63,6 +67,24 @@ TOOL_SUFFIXES = {
     "volume": "_volume",
     "multiaudio": "_multi",
 }
+
+# Extensiones que se consideran "episodio" al añadir una carpeta en lote. El
+# audio suelto queda fuera: en una carpeta de serie, un .mka/.mp3 es un
+# doblaje, no un vídeo al que añadirle pistas.
+VIDEO_EXTENSIONS = (
+    ".mkv", ".mp4", ".m4v", ".mov", ".avi", ".webm", ".ts", ".m2ts",
+    ".mpg", ".mpeg", ".wmv", ".flv",
+)
+
+# Extensiones que puede aportar un doblaje (el vídeo entero también vale).
+MEDIA_EXTENSIONS = VIDEO_EXTENSIONS + (
+    ".mka", ".m4a", ".aac", ".mp3", ".ac3", ".eac3", ".dts", ".flac",
+    ".wav", ".opus", ".ogg",
+)
+
+# Desfase máximo que se admite por pista. Más que esto no es un desfase, es
+# otro montaje del episodio.
+MAX_DELAY_SECONDS = 30.0
 
 _VIDEO_ENCODE = ("-c:v", "libx264", "-preset", "veryfast", "-crf", "18")
 _AUDIO_ENCODE = ("-c:a", "aac", "-b:a", "192k")
@@ -92,6 +114,9 @@ class VideoToolPlan:
     normalize_sources: list[tuple[int, str, int]] = field(
         default_factory=list
     )
+    # [(indice_en_tracks, ruta, pista)] de los doblajes cuyo desfase hay que
+    # medir comparando su audio con el del vídeo, antes del comando.
+    delay_sources: list[tuple[int, str, int]] = field(default_factory=list)
 
 
 def _as_float(value, default=0.0) -> float:
@@ -134,12 +159,44 @@ def _audio_track_entries(options: dict) -> list[dict]:
         path = str(item.get("path") or "").strip()
         if not path:
             raise ValueError("Every added track needs a file.")
+        try:
+            stream = int(item.get("stream") or 0)
+        except (TypeError, ValueError):
+            raise ValueError(
+                "The audio track index of the added file is invalid."
+            ) from None
+        if not 0 <= stream <= 63:
+            raise ValueError("The audio track index of the added file is invalid.")
+        try:
+            delay = float(item.get("delay") or 0.0)
+        except (TypeError, ValueError):
+            raise ValueError("The delay must be a number of seconds.") from None
+        if not -MAX_DELAY_SECONDS <= delay <= MAX_DELAY_SECONDS:
+            raise ValueError(
+                f"The delay must be between -{MAX_DELAY_SECONDS:g} and "
+                f"{MAX_DELAY_SECONDS:g} seconds."
+            )
         entries.append({
             "path": path,
+            "stream": stream,
             "language": str(item.get("language") or "").strip(),
             "title": str(item.get("title") or "").strip(),
+            "delay": delay,
         })
     return entries
+
+
+# Subtítulos que MP4 acepta: solo texto, y convertidos a mov_text. Un PGS o un
+# subtítulo de DVD son imagen y harían fallar el mux entero.
+_TEXT_SUBTITLE_CODECS = frozenset({
+    "subrip", "srt", "ass", "ssa", "mov_text", "webvtt", "text", "eia_608",
+})
+
+
+def subtitle_is_text(stream: dict) -> bool:
+    """¿Este subtítulo se puede meter en un MP4 como ``mov_text``?"""
+    codec = str((stream or {}).get("codec_name") or "").lower()
+    return codec in _TEXT_SUBTITLE_CODECS
 
 
 def _loudnorm_for(measurements: dict, out_index: int) -> str:
@@ -182,6 +239,8 @@ def build_tool_args(
     width: int = 0,
     height: int = 0,
     audio_track_count: int | None = None,
+    subtitle_streams: list[list[dict]] | None = None,
+    base_subtitle_count: int = 0,
 ) -> list[str]:
     """Construye los argumentos de FFmpeg para ``tool_id``.
 
@@ -239,8 +298,36 @@ def build_tool_args(
         # dejan fuera en vez de hacer fallar el mux.
         if container == "mkv":
             args.extend(["-map", "0:s?", "-map", "0:t?"])
-        for index in range(1, len(entries) + 1):
-            args.extend(["-map", f"{index}:a:0"])
+        for index, entry in enumerate(entries, start=1):
+            args.extend(["-map", f"{index}:a:{entry['stream']}"])
+        # -c copy va antes de los codecs por pista de los subtítulos: si fuera
+        # después, el copiado genérico pisaría el mov_text y FFmpeg intentaría
+        # meter un subrip en MP4.
+        args.extend(["-c", "copy"])
+        # Subtítulos del fichero añadido, los que traiga. En MKV se copian tal
+        # cual (SRT, ASS, PGS); en MP4 solo entran los de texto y convertidos a
+        # mov_text, que es lo único que el contenedor acepta.
+        added_subs = subtitle_streams or []
+        sub_out = base_subtitle_count if container == "mkv" else 0
+        for offset in range(len(entries)):
+            streams = added_subs[offset] if offset < len(added_subs) else []
+            for stream in streams:
+                if container == "mp4" and not subtitle_is_text(stream):
+                    continue
+                args.extend([
+                    "-map", f"{offset + 1}:s:{stream['subtitle_index']}",
+                ])
+                if container == "mp4":
+                    args.extend([f"-c:s:{sub_out}", "mov_text"])
+                language = str(stream.get("language") or "")
+                if language and language != "und":
+                    args.extend([
+                        f"-metadata:s:s:{sub_out}", f"language={language}",
+                    ])
+                title = str(stream.get("title") or "")
+                if title:
+                    args.extend([f"-metadata:s:s:{sub_out}", f"title={title}"])
+                sub_out += 1
         base_tracks = (
             audio_track_count
             if audio_track_count is not None
@@ -264,10 +351,10 @@ def build_tool_args(
                 args.extend([
                     f"-metadata:s:a:{out_index}", f"handler_name={title}",
                 ])
-        args.extend(["-c", "copy"])
         # Un filtro no se puede aplicar a una pista copiada: las añadidas se
-        # recodifican a AAC cuando se normaliza el volumen, y las que ya trae
-        # el vídeo también si se pide nivelar todo el fichero. Si no, copiadas.
+        # recodifican a AAC cuando se normaliza el volumen o se les pone
+        # desfase, y las que ya trae el vídeo también si se pide nivelar todo
+        # el fichero. Si no, copiadas.
         if normalize and options.get("normalize_original"):
             for index in range(base_tracks):
                 args.extend([
@@ -277,20 +364,35 @@ def build_tool_args(
                     f"-filter:a:{index}",
                     _loudnorm_for(measurements, index),
                 ])
-        if container == "mp4" or normalize:
+        has_delay = any(abs(entry["delay"]) > 1e-9 for entry in entries)
+        if container == "mp4" or normalize or has_delay:
             # Un dub en AC-3/DTS tampoco entra en MP4 sin reencodear; las
             # pistas originales (normalmente AAC) sí se copian tal cual.
-            for offset in range(len(entries)):
+            for offset, entry in enumerate(entries):
                 out_index = base_tracks + offset
                 args.extend([
                     f"-c:a:{out_index}", "aac",
                     f"-b:a:{out_index}", "192k",
                     f"-ar:{out_index}", "48000",
                 ])
+                # El desfase va como filtro, no como -itsoffset: con -c copy
+                # el muxer de MKV recoloca los timestamps negativos y el
+                # audio vuelve a ir tarde (comprobado con un episodio real).
+                filters = []
+                if entry["delay"] > 0:
+                    filters.append(
+                        f"adelay={int(round(entry['delay'] * 1000))}:all=1"
+                    )
+                elif entry["delay"] < 0:
+                    filters.append(
+                        f"atrim=start={abs(entry['delay']):.3f},"
+                        f"asetpts=PTS-STARTPTS"
+                    )
                 if normalize:
+                    filters.append(_loudnorm_for(measurements, out_index))
+                if filters:
                     args.extend([
-                        f"-filter:a:{out_index}",
-                        _loudnorm_for(measurements, out_index),
+                        f"-filter:a:{out_index}", ",".join(filters),
                     ])
         if container == "mp4":
             args.extend(_MP4_FLAGS)
@@ -398,6 +500,104 @@ def _unique_dir(output_dir: str, stem: str, suffix: str) -> str:
         attempt += 1
 
 
+# ---------------------------------------------------------------------------
+# Emparejado de episodios con su doblaje (modo lote)
+# ---------------------------------------------------------------------------
+# El código de episodio es lo primero que se mira: dos rips del mismo capítulo
+# casi nunca se llaman igual ("Family.Guy.S01E03.1080p" y
+# "Padre.de.familia.S01E03.Castellano"), pero los dos llevan S01E03.
+_EPISODE_SXXEXX = re.compile(
+    r"(?:^|[^0-9a-z])s(\d{1,2})[ ._-]*e(\d{1,3})(?![0-9])", re.IGNORECASE
+)
+_EPISODE_NXNN = re.compile(r"(?:^|[^0-9])(\d{1,2})x(\d{1,3})(?![0-9])")
+
+# Tokens que no distinguen un episodio de su doblaje: idioma del rip y ruido
+# de release. Se quitan para comparar nombres cuando no hay código de episodio.
+_NOISE_TOKENS = frozenset({
+    "eng", "english", "ing", "spa", "spanish", "esp", "es", "cast",
+    "castellano", "lat", "latino", "vose", "vos", "vo", "multi", "dual",
+    "dub", "dubbed", "doblaje", "sub", "subs", "subbed", "espanol",
+    "1080p", "720p", "2160p", "480p", "576p", "4k", "x264", "x265",
+    "h264", "h265", "hevc", "avc", "bluray", "bdrip", "brrip", "webrip",
+    "web", "webdl", "dl", "hdtv", "dvdrip", "aac", "ac3", "eac3", "dts",
+    "ddp", "10bit", "hdr", "proper", "repack", "remux",
+})
+
+
+def episode_key(name: str) -> tuple[int, int] | None:
+    """(temporada, episodio) si el nombre lo lleva, o ``None``.
+
+    Acepta ``S01E03`` (con puntos, espacios o guiones en medio) y ``1x03``.
+    """
+    stem = os.path.splitext(os.path.basename(str(name or "")))[0]
+    match = _EPISODE_SXXEXX.search(stem) or _EPISODE_NXNN.search(stem)
+    if not match:
+        return None
+    return (int(match.group(1)), int(match.group(2)))
+
+
+def normalized_stem(name: str) -> str:
+    """Nombre sin extensión, en minúsculas y sin tokens de idioma/calidad."""
+    stem = os.path.splitext(os.path.basename(str(name or "")))[0]
+    text = re.sub(r"[^0-9a-z]+", " ", stem.lower())
+    return " ".join(
+        token for token in text.split() if token and token not in _NOISE_TOKENS
+    )
+
+
+def media_files(folder: str, extensions=MEDIA_EXTENSIONS) -> list[str]:
+    """Ficheros de ``folder`` con esas extensiones, ordenados y sin carpetas."""
+    try:
+        names = os.listdir(folder)
+    except OSError:
+        return []
+    found = [
+        os.path.join(folder, name) for name in names
+        if name.lower().endswith(tuple(extensions))
+    ]
+    return sorted(path for path in found if os.path.isfile(path))
+
+
+def match_dub(episode_path: str, dub_paths: list[str]) -> dict:
+    """Busca el doblaje de ``episode_path`` dentro de ``dub_paths``.
+
+    Devuelve ``{"dub": ruta o "", "status": texto}``. Nunca adivina: dos
+    candidatos para el mismo capítulo (castellano y latino, por ejemplo) salen
+    como ambiguos en vez de elegir uno al azar y producir un mux equivocado.
+    """
+    episode_abs = os.path.normcase(os.path.abspath(episode_path))
+    candidates = [
+        path for path in dub_paths
+        if os.path.isfile(path)
+        and os.path.normcase(os.path.abspath(path)) != episode_abs
+    ]
+    key = episode_key(episode_path)
+    if key is not None:
+        same_key = [path for path in candidates if episode_key(path) == key]
+        if len(same_key) == 1:
+            return {"dub": same_key[0], "status": "Matched (S%02dE%02d)" % key}
+        if len(same_key) > 1:
+            stem = normalized_stem(episode_path)
+            same_stem = [p for p in same_key if normalized_stem(p) == stem]
+            if stem and len(same_stem) == 1:
+                return {
+                    "dub": same_stem[0], "status": "Matched (S%02dE%02d)" % key,
+                }
+            return {
+                "dub": "", "status": f"Ambiguous ({len(same_key)} files)",
+            }
+    stem = normalized_stem(episode_path)
+    if stem:
+        same_stem = [p for p in candidates if normalized_stem(p) == stem]
+        if len(same_stem) == 1:
+            return {"dub": same_stem[0], "status": "Matched (name)"}
+        if len(same_stem) > 1:
+            return {
+                "dub": "", "status": f"Ambiguous ({len(same_stem)} files)",
+            }
+    return {"dub": "", "status": "No dub found"}
+
+
 def _source_stem(input_path: str) -> str:
     stem = os.path.splitext(os.path.basename(input_path or ""))[0]
     return stem or "video"
@@ -425,7 +625,10 @@ def plan_tool(
     options = dict(options or {})
     stem = _source_stem(input_path)
     suffix = TOOL_SUFFIXES[tool_id]
-    normalize_sources: list[tuple[int, str]] = []
+    normalize_sources: list[tuple[int, str, int]] = []
+    delay_sources: list[tuple[int, str, int]] = []
+    subtitle_streams: list[list[dict]] = []
+    base_subtitle_count = 0
 
     if tool_id == "screenshot":
         extension = ".jpg" if str(options.get("format", "png")).lower() in (
@@ -437,26 +640,42 @@ def plan_tool(
         container = _multiaudio_container(options)
         entries = _audio_track_entries(options)
         for entry in entries:
+            name = os.path.basename(entry["path"])
             if not os.path.isfile(entry["path"]):
+                raise ValueError(f"{name} no longer exists.")
+            extra_audio = get_audio_streams(ffmpeg_path, entry["path"])
+            if not extra_audio:
+                raise ValueError(f"{name} has no audio track.")
+            if entry["stream"] >= len(extra_audio):
                 raise ValueError(
-                    f"{os.path.basename(entry['path'])} no longer exists."
+                    f"{name} has no audio track #{entry['stream'] + 1}."
                 )
-            if not get_audio_streams(ffmpeg_path, entry["path"]):
-                raise ValueError(
-                    f"{os.path.basename(entry['path'])} has no audio track."
-                )
+            subtitle_streams.append(
+                get_subtitle_streams(ffmpeg_path, entry["path"])
+            )
+        if container == "mkv":
+            # Los subtítulos del propio vídeo se copian, así que las pistas
+            # añadidas empiezan después de los suyos.
+            base_subtitle_count = len(
+                get_subtitle_streams(ffmpeg_path, input_path)
+            )
+        if options.get("auto_delay"):
+            # El desfase se mide en el worker (decodifica audio): aquí solo se
+            # anota qué pista de qué doblaje hay que comparar con el vídeo.
+            for index, entry in enumerate(entries):
+                delay_sources.append((index, entry["path"], entry["stream"]))
         if options.get("normalize"):
             # El índice es el de la pista en la SALIDA: las que ya trae el
             # vídeo van delante, y el worker mide cada pista para rehacer el
-            # comando con su loudness medido. La tercera columna es la pista
-            # de audio del fichero que hay que medir.
+            # comando con su loudness medido. La última columna es la pista de
+            # audio del fichero que hay que medir.
             base_count = len(audio_streams)
             if options.get("normalize_original"):
                 for index in range(base_count):
                     normalize_sources.append((index, input_path, index))
             for offset, entry in enumerate(entries):
                 normalize_sources.append(
-                    (base_count + offset, entry["path"], 0)
+                    (base_count + offset, entry["path"], entry["stream"])
                 )
         output_path = _unique_file(
             output_dir, stem, suffix, ".mkv" if container == "mkv" else ".mp4"
@@ -480,6 +699,8 @@ def plan_tool(
         width=width,
         height=height,
         audio_track_count=len(audio_streams),
+        subtitle_streams=subtitle_streams,
+        base_subtitle_count=base_subtitle_count,
     )
     return VideoToolPlan(
         tool_id=tool_id,
@@ -494,4 +715,5 @@ def plan_tool(
         options=options,
         audio_track_count=len(audio_streams),
         normalize_sources=normalize_sources,
+        delay_sources=delay_sources,
     )
