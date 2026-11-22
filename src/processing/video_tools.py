@@ -3,7 +3,8 @@
 La app ya tiene el flujo principal (Import -> IA -> Compress) y el editor de
 Join. Estas herramientas son operaciones puntuales sobre un vídeo concreto:
 capturar un frame, pixelar, difuminar, estabilizar, quitar una marca de agua,
-invertir, dividir o cambiar el volumen.
+invertir, dividir, cambiar el volumen o añadir pistas de audio de otros
+ficheros.
 
 No tocan el pipeline ni el estado de la app: reciben una ruta y devuelven otra.
 Así se pueden probar y usar sin arrastrar torch, Qt ni la cola de renders.
@@ -14,7 +15,12 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass, field
 
-from src.ffmpeg.runner import get_audio_streams, get_video_info
+from src.ffmpeg.runner import (
+    build_boost_filter,
+    get_audio_streams,
+    get_video_info,
+    measurement_is_usable,
+)
 
 
 TOOL_LABELS = {
@@ -26,6 +32,7 @@ TOOL_LABELS = {
     "reverse": "Reverse video",
     "split": "Split video",
     "volume": "Change volume",
+    "multiaudio": "Add audio tracks",
 }
 
 TOOL_DESCRIPTIONS = {
@@ -37,6 +44,12 @@ TOOL_DESCRIPTIONS = {
     "reverse": "Play the clip backwards, audio included when present.",
     "split": "Cut the clip into equal-length parts. Parts are re-encoded for clean cuts.",
     "volume": "Raise or lower the audio gain without re-encoding the video.",
+    "multiaudio": "Keep this video and add the audio of another episode (a "
+                   "whole video file is fine) as extra selectable tracks, so "
+                   "one file carries every dub. Nothing has to be extracted "
+                   "first: its first audio track is copied straight in. Each "
+                   "added track can be loudness-normalised (EBU R128) so it "
+                   "matches the volume of the one already in the video.",
 }
 
 TOOL_SUFFIXES = {
@@ -48,6 +61,7 @@ TOOL_SUFFIXES = {
     "reverse": "_reversed",
     "split": "_parts",
     "volume": "_volume",
+    "multiaudio": "_multi",
 }
 
 _VIDEO_ENCODE = ("-c:v", "libx264", "-preset", "veryfast", "-crf", "18")
@@ -68,6 +82,16 @@ class VideoToolPlan:
     width: int = 0
     height: int = 0
     is_directory: bool = False
+    # Opciones originales y datos con los que se construyó ``args``: el worker
+    # los necesita para rehacer el comando cuando mide el loudness en dos
+    # pasadas, ya fuera del hilo de la interfaz.
+    options: dict = field(default_factory=dict)
+    audio_track_count: int = 0
+    # [(indice_de_salida, ruta, indice_de_pista)] de las pistas que el worker
+    # tiene que medir antes del mux (añadidas y, opcionalmente, originales).
+    normalize_sources: list[tuple[int, str, int]] = field(
+        default_factory=list
+    )
 
 
 def _as_float(value, default=0.0) -> float:
@@ -96,6 +120,50 @@ def _audio_encode_args() -> list[str]:
     return list(_AUDIO_ENCODE)
 
 
+def _audio_track_entries(options: dict) -> list[dict]:
+    """Normaliza ``options['tracks']`` a una lista de dicts validada."""
+    raw = options.get("tracks")
+    if not isinstance(raw, list) or not raw:
+        raise ValueError("Add at least one audio file first.")
+    entries = []
+    for item in raw:
+        if isinstance(item, str):
+            item = {"path": item}
+        if not isinstance(item, dict):
+            raise ValueError("Invalid audio track entry.")
+        path = str(item.get("path") or "").strip()
+        if not path:
+            raise ValueError("Every added track needs a file.")
+        entries.append({
+            "path": path,
+            "language": str(item.get("language") or "").strip(),
+            "title": str(item.get("title") or "").strip(),
+        })
+    return entries
+
+
+def _loudnorm_for(measurements: dict, out_index: int) -> str:
+    """Filtro de normalización de una pista de salida, con lo que se midió.
+
+    Con medición usable se usa el loudnorm lineal de dos pasadas; sin ella
+    (silencio digital, pista ilegible) cae a una pasada en vez de dejar la
+    pista sin normalizar.
+    """
+    measured = measurements.get(out_index)
+    if measured is None:
+        measured = measurements.get(str(out_index))
+    return build_boost_filter(
+        {}, measured if measurement_is_usable(measured) else None
+    )
+
+
+def _multiaudio_container(options: dict) -> str:
+    container = str(options.get("container") or "mkv").strip().lower()
+    if container not in ("mkv", "mp4"):
+        raise ValueError("The output container must be MKV or MP4.")
+    return container
+
+
 def _filtered_video_args(options: dict, *, has_audio: bool) -> list[str]:
     args = [*_video_encode_args(), *_MP4_FLAGS]
     if has_audio:
@@ -113,6 +181,7 @@ def build_tool_args(
     duration: float = 0.0,
     width: int = 0,
     height: int = 0,
+    audio_track_count: int | None = None,
 ) -> list[str]:
     """Construye los argumentos de FFmpeg para ``tool_id``.
 
@@ -137,6 +206,95 @@ def build_tool_args(
             raise ValueError("The frame time is beyond the end of the video.")
         args.extend(["-ss", _fmt_seconds(stamp), "-i", input_path,
                      "-frames:v", "1", "-q:v", "2", output_path])
+        return args
+
+    if tool_id == "multiaudio":
+        entries = _audio_track_entries(options)
+        container = _multiaudio_container(options)
+        normalize = bool(options.get("normalize"))
+        measurements = options.get("measurements") or {}
+        source_key = os.path.normcase(os.path.abspath(input_path))
+        seen = set()
+        for entry in entries:
+            key = os.path.normcase(os.path.abspath(entry["path"]))
+            if key == source_key:
+                raise ValueError(
+                    "The source video is already included; pick another file."
+                )
+            if key in seen:
+                raise ValueError(
+                    f"{os.path.basename(entry['path'])} was added twice."
+                )
+            seen.add(key)
+
+        args.extend(["-i", input_path])
+        for entry in entries:
+            args.extend(["-i", entry["path"]])
+        # El vídeo y las pistas que ya trae se copian; cada fichero añadido
+        # aporta su primera pista de audio como una pista más.
+        args.extend(["-map", "0:v:0"])
+        if has_audio:
+            args.extend(["-map", "0:a?"])
+        # MKV admite subtítulos copiados; MP4 solo mov_text, así que allí se
+        # dejan fuera en vez de hacer fallar el mux.
+        if container == "mkv":
+            args.extend(["-map", "0:s?", "-map", "0:t?"])
+        for index in range(1, len(entries) + 1):
+            args.extend(["-map", f"{index}:a:0"])
+        base_tracks = (
+            audio_track_count
+            if audio_track_count is not None
+            else (1 if has_audio else 0)
+        )
+        args.extend(["-map_metadata", "0", "-map_chapters", "0"])
+        for offset, entry in enumerate(entries):
+            out_index = base_tracks + offset
+            if entry["language"]:
+                args.extend([
+                    f"-metadata:s:a:{out_index}",
+                    f"language={entry['language']}",
+                ])
+            title = entry["title"] or os.path.splitext(
+                os.path.basename(entry["path"])
+            )[0]
+            args.extend([f"-metadata:s:a:{out_index}", f"title={title}"])
+            if container == "mp4":
+                # En MP4 el nombre de pista visible en los reproductores sale
+                # de handler_name; con solo title algunos lo muestran vacío.
+                args.extend([
+                    f"-metadata:s:a:{out_index}", f"handler_name={title}",
+                ])
+        args.extend(["-c", "copy"])
+        # Un filtro no se puede aplicar a una pista copiada: las añadidas se
+        # recodifican a AAC cuando se normaliza el volumen, y las que ya trae
+        # el vídeo también si se pide nivelar todo el fichero. Si no, copiadas.
+        if normalize and options.get("normalize_original"):
+            for index in range(base_tracks):
+                args.extend([
+                    f"-c:a:{index}", "aac",
+                    f"-b:a:{index}", "192k",
+                    f"-ar:{index}", "48000",
+                    f"-filter:a:{index}",
+                    _loudnorm_for(measurements, index),
+                ])
+        if container == "mp4" or normalize:
+            # Un dub en AC-3/DTS tampoco entra en MP4 sin reencodear; las
+            # pistas originales (normalmente AAC) sí se copian tal cual.
+            for offset in range(len(entries)):
+                out_index = base_tracks + offset
+                args.extend([
+                    f"-c:a:{out_index}", "aac",
+                    f"-b:a:{out_index}", "192k",
+                    f"-ar:{out_index}", "48000",
+                ])
+                if normalize:
+                    args.extend([
+                        f"-filter:a:{out_index}",
+                        _loudnorm_for(measurements, out_index),
+                    ])
+        if container == "mp4":
+            args.extend(_MP4_FLAGS)
+        args.append(output_path)
         return args
 
     args.extend(["-i", input_path])
@@ -262,16 +420,47 @@ def plan_tool(
     duration = max(0.0, _as_float(info.get("duration"), 0.0))
     width = max(0, _as_int(info.get("width"), 0))
     height = max(0, _as_int(info.get("height"), 0))
-    has_audio = bool(get_audio_streams(ffmpeg_path, input_path))
+    audio_streams = get_audio_streams(ffmpeg_path, input_path)
+    has_audio = bool(audio_streams)
     options = dict(options or {})
     stem = _source_stem(input_path)
     suffix = TOOL_SUFFIXES[tool_id]
+    normalize_sources: list[tuple[int, str]] = []
 
     if tool_id == "screenshot":
         extension = ".jpg" if str(options.get("format", "png")).lower() in (
             "jpg", "jpeg",
         ) else ".png"
         output_path = _unique_file(output_dir, stem, suffix, extension)
+        is_directory = False
+    elif tool_id == "multiaudio":
+        container = _multiaudio_container(options)
+        entries = _audio_track_entries(options)
+        for entry in entries:
+            if not os.path.isfile(entry["path"]):
+                raise ValueError(
+                    f"{os.path.basename(entry['path'])} no longer exists."
+                )
+            if not get_audio_streams(ffmpeg_path, entry["path"]):
+                raise ValueError(
+                    f"{os.path.basename(entry['path'])} has no audio track."
+                )
+        if options.get("normalize"):
+            # El índice es el de la pista en la SALIDA: las que ya trae el
+            # vídeo van delante, y el worker mide cada pista para rehacer el
+            # comando con su loudness medido. La tercera columna es la pista
+            # de audio del fichero que hay que medir.
+            base_count = len(audio_streams)
+            if options.get("normalize_original"):
+                for index in range(base_count):
+                    normalize_sources.append((index, input_path, index))
+            for offset, entry in enumerate(entries):
+                normalize_sources.append(
+                    (base_count + offset, entry["path"], 0)
+                )
+        output_path = _unique_file(
+            output_dir, stem, suffix, ".mkv" if container == "mkv" else ".mp4"
+        )
         is_directory = False
     elif tool_id == "split":
         output_path = _unique_dir(output_dir, stem, suffix)
@@ -290,6 +479,7 @@ def plan_tool(
         duration=duration,
         width=width,
         height=height,
+        audio_track_count=len(audio_streams),
     )
     return VideoToolPlan(
         tool_id=tool_id,
@@ -301,4 +491,7 @@ def plan_tool(
         width=width,
         height=height,
         is_directory=is_directory,
+        options=options,
+        audio_track_count=len(audio_streams),
+        normalize_sources=normalize_sources,
     )

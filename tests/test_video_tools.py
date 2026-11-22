@@ -110,6 +110,170 @@ def test_plan_split_returns_numbered_pattern(tmp_path, monkeypatch):
     assert plan.output_path.endswith(os.path.join("clip_parts", "part_%03d.mp4"))
 
 
+def test_multiaudio_maps_every_track_and_tags_the_new_one():
+    args = _args(
+        "multiaudio",
+        output="out.mkv",
+        options={"tracks": [{"path": "es.mkv", "language": "spa",
+                             "title": "Spanish"}]},
+        has_audio=True,
+        audio_track_count=1,
+    )
+    assert args.count("-i") == 2
+    assert "1:a:0" in args
+    assert "0:a?" in args
+    assert args[args.index("language=spa") - 1] == "-metadata:s:a:1"
+    assert "copy" in args
+    assert args[-1] == "out.mkv"
+
+
+def test_multiaudio_mp4_reencodes_only_the_added_track():
+    args = _args(
+        "multiaudio",
+        output="out.mp4",
+        options={"container": "mp4",
+                 "tracks": [{"path": "en.mkv", "language": "eng"}]},
+        has_audio=True,
+        audio_track_count=2,
+    )
+    assert args[args.index("language=eng") - 1] == "-metadata:s:a:2"
+    assert args[args.index("-c:a:2") + 1] == "aac"
+    assert "+faststart" in args
+
+
+def test_multiaudio_rejects_duplicates_and_the_source_itself():
+    with pytest.raises(ValueError, match="already included"):
+        _args("multiaudio", options={"tracks": [{"path": "input.mp4"}]},
+              has_audio=True)
+    with pytest.raises(ValueError, match="twice"):
+        _args(
+            "multiaudio",
+            options={"tracks": [{"path": "a.mkv"}, {"path": "a.mkv"}]},
+            has_audio=True,
+        )
+    with pytest.raises(ValueError, match="at least one"):
+        _args("multiaudio", options={"tracks": []}, has_audio=True)
+
+
+def test_plan_multiaudio_uses_mkv_and_checks_added_files(tmp_path, monkeypatch):
+    source = tmp_path / "ep.mp4"
+    source.write_bytes(b"")
+    extra = tmp_path / "ep_es.mkv"
+    extra.write_bytes(b"")
+    monkeypatch.setattr(video_tools, "get_video_info", lambda *_: {
+        "duration": "20.0", "width": "640", "height": "360",
+    })
+    monkeypatch.setattr(video_tools, "get_audio_streams", lambda *_: [{"index": 1}])
+
+    plan = video_tools.plan_tool(
+        "ffmpeg", "multiaudio", str(source), str(tmp_path),
+        {"tracks": [{"path": str(extra), "language": "spa"}]},
+    )
+    assert plan.output_path.endswith("ep_multi.mkv")
+    assert plan.is_directory is False
+
+    monkeypatch.setattr(video_tools, "get_audio_streams", lambda *_: [])
+    with pytest.raises(ValueError, match="no audio"):
+        video_tools.plan_tool(
+            "ffmpeg", "multiaudio", str(source), str(tmp_path),
+            {"tracks": [{"path": str(extra)}]},
+        )
+
+
+def test_multiaudio_normalize_reencodes_only_the_added_tracks():
+    args = _args(
+        "multiaudio",
+        output="out.mkv",
+        options={"normalize": True,
+                 "measurements": {2: {"input_i": "-27.0", "input_tp": "-3.0",
+                                      "input_lra": "7.0",
+                                      "input_thresh": "-37.0",
+                                      "target_offset": "0.0"}},
+                 "tracks": [{"path": "es.mkv", "language": "spa"}]},
+        has_audio=True,
+        audio_track_count=2,
+    )
+    assert args[args.index("-c:a:2") + 1] == "aac"
+    assert args[args.index("-ar:2") + 1] == "48000"
+    filter_text = args[args.index("-filter:a:2") + 1]
+    assert "loudnorm=" in filter_text
+    assert "measured_I=-27.0000" in filter_text
+    assert "linear=true" in filter_text
+    assert "-c:a:0" not in args and "-c:a:1" not in args
+    assert "copy" in args
+    assert "+faststart" not in args
+
+
+def test_multiaudio_normalize_can_also_level_the_original_tracks():
+    args = _args(
+        "multiaudio",
+        output="out.mkv",
+        options={"normalize": True, "normalize_original": True,
+                 "measurements": {0: {"input_i": "-24.0", "input_tp": "-2.0",
+                                      "input_lra": "9.0",
+                                      "input_thresh": "-34.0",
+                                      "target_offset": "0.0"}},
+                 "tracks": [{"path": "es.mkv", "language": "spa"}]},
+        has_audio=True,
+        audio_track_count=1,
+    )
+    assert args[args.index("-c:a:0") + 1] == "aac"
+    assert args[args.index("-ar:0") + 1] == "48000"
+    assert "measured_I=-24.0000" in args[args.index("-filter:a:0") + 1]
+    # La añadida sigue normalizándose a su vez y con su propia medición.
+    assert args[args.index("-c:a:1") + 1] == "aac"
+    assert "loudnorm=" in args[args.index("-filter:a:1") + 1]
+
+
+def test_multiaudio_normalize_without_measurement_uses_one_pass():
+    args = _args(
+        "multiaudio",
+        options={"normalize": True, "tracks": [{"path": "es.mkv"}]},
+        has_audio=True,
+    )
+    assert args[args.index("-filter:a:1") + 1] == "loudnorm=I=-16:TP=-1.5:LRA=11"
+
+
+def test_multiaudio_without_normalize_keeps_every_track_copied():
+    args = _args(
+        "multiaudio",
+        options={"normalize": False, "tracks": [{"path": "es.mkv"}]},
+        has_audio=True,
+    )
+    assert not any(arg.startswith("-filter:") for arg in args)
+    assert not any(arg.startswith("-c:a:") for arg in args)
+
+
+def test_plan_multiaudio_normalize_lists_each_added_track(
+    tmp_path, monkeypatch
+):
+    source = tmp_path / "ep.mp4"
+    source.write_bytes(b"")
+    extra = tmp_path / "ep_es.mkv"
+    extra.write_bytes(b"")
+    monkeypatch.setattr(video_tools, "get_video_info", lambda *_: {
+        "duration": "20.0", "width": "640", "height": "360",
+    })
+    monkeypatch.setattr(video_tools, "get_audio_streams", lambda *_: [{"index": 1}])
+
+    plan = video_tools.plan_tool(
+        "ffmpeg", "multiaudio", str(source), str(tmp_path),
+        {"tracks": [{"path": str(extra)}], "normalize": True},
+    )
+    # Una pista original delante: el índice de salida de la añadida es 1.
+    assert plan.normalize_sources == [(1, str(extra), 0)]
+    assert plan.options["normalize"] is True
+    assert plan.audio_track_count == 1
+
+    plan = video_tools.plan_tool(
+        "ffmpeg", "multiaudio", str(source), str(tmp_path),
+        {"tracks": [{"path": str(extra)}], "normalize": True,
+         "normalize_original": True},
+    )
+    # También se mide la pista propia del vídeo, que en la salida es la 0.
+    assert plan.normalize_sources == [(0, str(source), 0), (1, str(extra), 0)]
+
+
 def test_unknown_tool_is_rejected():
     with pytest.raises(ValueError, match="Unknown"):
         _args("nope")

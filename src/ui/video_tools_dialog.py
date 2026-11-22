@@ -15,6 +15,7 @@ import threading
 
 from PySide6.QtCore import QThread, Signal, Qt
 from PySide6.QtWidgets import (
+    QCheckBox,
     QComboBox,
     QDialog,
     QDoubleSpinBox,
@@ -33,10 +34,17 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from src.ffmpeg.runner import get_audio_streams, get_video_info, run_ffmpeg
+from src.ffmpeg.loudnorm import measure_loudness
+from src.ffmpeg.runner import (
+    get_audio_streams,
+    get_video_info,
+    measurement_is_usable,
+    run_ffmpeg,
+)
 from src.processing.video_tools import (
     TOOL_DESCRIPTIONS,
     TOOL_LABELS,
+    build_tool_args,
     plan_tool,
 )
 from src.utils.helpers import parse_time_to_seconds
@@ -48,6 +56,7 @@ class VideoToolWorker(QThread):
     progress = Signal(int)
     done = Signal(str)
     failed = Signal(str)
+    stage = Signal(str)
 
     def __init__(self, ffmpeg_path, plan, parent=None):
         super().__init__(parent)
@@ -63,11 +72,62 @@ class VideoToolWorker(QThread):
             return os.path.dirname(self.plan.output_path)
         return self.plan.output_path
 
+    def _normalize_args(self) -> list[str] | None:
+        """Mide el loudness de cada pista añadida y rehace el comando.
+
+        La medición (paso 1 de loudnorm) se hace aquí, en el hilo del worker:
+        en un episodio dura decenas de segundos y hacerlo al preparar el plan
+        congelaría el diálogo. Devuelve ``None`` si el usuario aborta.
+        """
+        measurements = {}
+        total = len(self.plan.normalize_sources)
+        for position, (out_index, path, stream_index) in enumerate(
+            self.plan.normalize_sources, start=1
+        ):
+            self.stage.emit(
+                f"Measuring loudness ({position}/{total}): "
+                f"{os.path.basename(path)}…"
+            )
+            measured = measure_loudness(
+                self.ffmpeg_path,
+                path,
+                audio_stream_index=stream_index,
+                abort_event=self.abort_event,
+            )
+            if self.abort_event.is_set():
+                return None
+            measurements[out_index] = (
+                measured if measurement_is_usable(measured) else None
+            )
+        self.stage.emit("Adding the tracks…")
+        return build_tool_args(
+            self.plan.tool_id,
+            self.plan.input_path,
+            self.plan.output_path,
+            {**self.plan.options, "measurements": measurements},
+            has_audio=self.plan.has_audio,
+            duration=self.plan.duration,
+            width=self.plan.width,
+            height=self.plan.height,
+            audio_track_count=self.plan.audio_track_count,
+        )
+
     def run(self):
+        args = self.plan.args
+        if self.plan.normalize_sources:
+            try:
+                normalized = self._normalize_args()
+            except Exception as exc:
+                self.failed.emit(f"Could not measure the audio levels:\n{exc}")
+                return
+            if normalized is None:
+                self.failed.emit("Cancelled by user.")
+                return
+            args = normalized
         try:
             ok = run_ffmpeg(
                 self.ffmpeg_path,
-                self.plan.args,
+                args,
                 progress_callback=self.progress.emit,
                 abort_event=self.abort_event,
             )
@@ -112,6 +172,8 @@ class VideoToolsDialog(QDialog):
         self.worker = None
         self._tool_ids = list(TOOL_LABELS.keys())
         self._panels = {}
+        # Ficheros cuyo audio se añade al vídeo actual (herramienta multiaudio).
+        self._audio_tracks: list[dict] = []
         self._info = get_video_info(ffmpeg_path, input_path) or {}
         self._duration = self._float_info("duration")
         self._width = int(self._float_info("width"))
@@ -351,6 +413,87 @@ class VideoToolsDialog(QDialog):
                 note.setStyleSheet("color: #f39c12;")
             form.addRow(note)
 
+        elif tool_id == "multiaudio":
+            self.multi_container = QComboBox()
+            self.multi_container.addItem(
+                "MKV (tracks copied; added ones re-encoded if normalised)", "mkv"
+            )
+            self.multi_container.addItem("MP4 (extra tracks re-encoded to AAC)", "mp4")
+            form.addRow("Output format", self.multi_container)
+
+            self.multi_language = QComboBox()
+            for label, code in (
+                ("Spanish", "spa"),
+                ("English", "eng"),
+                ("French", "fra"),
+                ("German", "deu"),
+                ("Italian", "ita"),
+                ("Portuguese", "por"),
+                ("Japanese", "jpn"),
+                ("No language tag", ""),
+            ):
+                self.multi_language.addItem(label, code)
+            form.addRow("Language of new tracks", self.multi_language)
+
+            self.multi_normalize = QComboBox()
+            self.multi_normalize.addItem("Copy the added tracks as they are", False)
+            self.multi_normalize.addItem(
+                "Normalise loudness (EBU R128, −16 LUFS)", True
+            )
+            self.multi_normalize.setToolTip(
+                "Same EBU R128 loudnorm as the main render's Audio Boost, applied "
+                "to the added tracks only. The level is measured on each added "
+                "file, so no dB value has to be worked out by hand."
+            )
+            form.addRow("Volume of added tracks", self.multi_normalize)
+
+            self.multi_normalize_original = QCheckBox(
+                "Also normalise the video's own tracks"
+            )
+            self.multi_normalize_original.setEnabled(False)
+            self.multi_normalize_original.setToolTip(
+                "Levels every audio track of the file to the same target, so "
+                "switching language keeps the same volume. The video's own "
+                "tracks are re-encoded to AAC; the picture is still copied."
+            )
+            self.multi_normalize.currentIndexChanged.connect(
+                lambda _index: self.multi_normalize_original.setEnabled(
+                    bool(self.multi_normalize.currentData())
+                )
+            )
+            form.addRow(self.multi_normalize_original)
+
+            self.multi_tracks = QListWidget()
+            self.multi_tracks.setObjectName("trackList")
+            self.multi_tracks.setMinimumHeight(88)
+            form.addRow("Added audio", self.multi_tracks)
+
+            track_buttons = QHBoxLayout()
+            track_buttons.setSpacing(8)
+            self.btn_add_audio = QPushButton("Add dubbed episode…")
+            self.btn_add_audio.clicked.connect(self._add_audio_files)
+            self.btn_remove_audio = QPushButton("Remove selected")
+            self.btn_remove_audio.clicked.connect(self._remove_audio_file)
+            track_buttons.addWidget(self.btn_add_audio)
+            track_buttons.addWidget(self.btn_remove_audio)
+            track_buttons.addStretch(1)
+            form.addRow(track_buttons)
+
+            note = QLabel(
+                "Pick the other episode as it is: its first audio track is taken "
+                "directly, with no need to extract or convert anything. The video "
+                "and the tracks it already has are copied without re-encoding, so "
+                "use the same episode so the tracks stay in sync. With loudness "
+                "normalisation each added file is measured first and only those "
+                "tracks are re-encoded, all the dubs landing on the same target "
+                "(-16 LUFS, -1.5 dBTP) instead of the raw level of each rip. "
+                "Tick the box to level the video's own tracks too, so switching "
+                "language does not change the volume."
+            )
+            note.setWordWrap(True)
+            note.setObjectName("toolHint")
+            form.addRow(note)
+
         layout.addLayout(form)
         layout.addStretch(1)
         return panel
@@ -389,6 +532,10 @@ class VideoToolsDialog(QDialog):
                 padding: 6px 12px;
             }
             QPushButton:hover { background-color: #2c3e50; }
+            QListWidget#trackList {
+                background-color: #1f2c4c; color: #e0e0e0;
+                border: 1px solid #2c3e50; border-radius: 4px; padding: 4px;
+            }
             QPushButton:disabled { color: #5f6f7f; }
             QPushButton#primaryButton {
                 background-color: #00d2d3; color: #0f0f1a;
@@ -421,6 +568,77 @@ class VideoToolsDialog(QDialog):
         row = max(0, self.tool_list.currentRow())
         return self._tool_ids[row]
 
+    def _add_audio_files(self) -> None:
+        paths, _ = QFileDialog.getOpenFileNames(
+            self,
+            "Add the dubbed episode (video or audio)",
+            self.output_dir,
+            "Video or audio (*.mkv *.mp4 *.m4v *.mov *.avi *.webm *.ts *.m2ts "
+            "*.mka *.m4a *.aac *.mp3 *.ac3 *.eac3 *.dts *.flac *.wav *.opus "
+            "*.ogg);;Video (*.mkv *.mp4 *.m4v *.mov *.avi *.webm *.ts *.m2ts);;"
+            "Audio (*.mka *.m4a *.aac *.mp3 *.ac3 *.eac3 *.dts *.flac *.wav "
+            "*.opus *.ogg);;All files (*)",
+        )
+        if not paths:
+            return
+        code = self.multi_language.currentData() or ""
+        label = self.multi_language.currentText() if code else "No language tag"
+        source_key = os.path.normcase(os.path.abspath(self.input_path))
+        added = 0
+        skipped = []
+        for path in paths:
+            key = os.path.normcase(os.path.abspath(path))
+            if key == source_key:
+                continue
+            if any(
+                os.path.normcase(os.path.abspath(track["path"])) == key
+                for track in self._audio_tracks
+            ):
+                continue
+            # Un vídeo entero también vale: se usa su primera pista de audio,
+            # sin extraer ni convertir nada antes.
+            streams = get_audio_streams(self.ffmpeg_path, path)
+            if not streams:
+                skipped.append(os.path.basename(path))
+                continue
+            first = streams[0]
+            detail_bits = [str(first.get("codec_name") or "audio")]
+            channels = first.get("channels")
+            if channels:
+                detail_bits.append(f"{channels}ch")
+            source_language = str(first.get("language") or "")
+            if source_language and source_language != "und":
+                detail_bits.append(source_language)
+            detail = " ".join(detail_bits)
+            self._audio_tracks.append({
+                "path": path,
+                "language": code,
+                "title": self.multi_language.currentText() if code else "",
+            })
+            self.multi_tracks.addItem(
+                f"{os.path.basename(path)}  ·  {detail}  ·  {label}"
+            )
+            added += 1
+        if skipped:
+            QMessageBox.warning(
+                self,
+                "Add audio tracks",
+                "These files have no audio track and were skipped:\n\n"
+                + "\n".join(skipped),
+            )
+        if added:
+            self.status.setText(f"{len(self._audio_tracks)} audio track(s) to add.")
+        elif not skipped:
+            self.status.setText("Those files are already in the list.")
+
+    def _remove_audio_file(self) -> None:
+        row = self.multi_tracks.currentRow()
+        if row < 0 or row >= len(self._audio_tracks):
+            return
+        self.multi_tracks.takeItem(row)
+        self._audio_tracks.pop(row)
+        self.status.setText(f"{len(self._audio_tracks)} audio track(s) to add.")
+
     def _options(self) -> dict:
         tool_id = self._current_tool_id()
         if tool_id == "screenshot":
@@ -448,6 +666,18 @@ class VideoToolsDialog(QDialog):
             return {"parts": self.split_parts.value()}
         if tool_id == "volume":
             return {"db": self.volume_db.value()}
+        if tool_id == "multiaudio":
+            if not self._audio_tracks:
+                raise ValueError("Add at least one audio file first.")
+            return {
+                "tracks": [dict(track) for track in self._audio_tracks],
+                "container": self.multi_container.currentData() or "mkv",
+                "normalize": bool(self.multi_normalize.currentData()),
+                "normalize_original": (
+                    bool(self.multi_normalize.currentData())
+                    and self.multi_normalize_original.isChecked()
+                ),
+            }
         return {}
 
     def _set_running(self, running: bool) -> None:
@@ -456,6 +686,24 @@ class VideoToolsDialog(QDialog):
         self.btn_run.setEnabled(not running)
         self.btn_abort.setEnabled(running)
         self.btn_close.setEnabled(not running)
+        for name in (
+            "multi_tracks",
+            "multi_container",
+            "multi_language",
+            "multi_normalize",
+            "multi_normalize_original",
+            "btn_add_audio",
+            "btn_remove_audio",
+        ):
+            widget = getattr(self, name, None)
+            if widget is not None:
+                widget.setEnabled(not running)
+        # El check de nivelar las pistas originales solo tiene sentido con la
+        # normalización activa, también al volver del render.
+        if getattr(self, "multi_normalize_original", None) is not None:
+            self.multi_normalize_original.setEnabled(
+                not running and bool(self.multi_normalize.currentData())
+            )
 
     def _run(self) -> None:
         if self.worker is not None:
@@ -485,6 +733,7 @@ class VideoToolsDialog(QDialog):
         self._set_running(True)
         self.worker = VideoToolWorker(self.ffmpeg_path, plan, self)
         self.worker.progress.connect(self.progress.setValue)
+        self.worker.stage.connect(self.status.setText)
         self.worker.done.connect(self._on_done)
         self.worker.failed.connect(self._on_failed)
         self.worker.finished.connect(self.worker.deleteLater)

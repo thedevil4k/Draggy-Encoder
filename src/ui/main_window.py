@@ -1014,7 +1014,8 @@ class MainWindow(QMainWindow):
         self.btn_video_tools = QPushButton("Video tools…")
         self.btn_video_tools.setToolTip(
             "One-off FFmpeg utilities: screenshot, pixelate, blur, stabilize,\n"
-            "remove watermark, reverse, split and change volume."
+            "remove watermark, reverse, split, change volume and add audio\n"
+            "tracks from other files (one file with every dub)."
         )
         self.btn_video_tools.clicked.connect(self._open_video_tools)
         self.btn_preferences = QPushButton("Preferences")

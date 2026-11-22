@@ -8,7 +8,7 @@ DRAGGY ENCODER combines FFmpeg-based encoding with ONNX/PyTorch AI models for vi
 
 - GPU-accelerated AI upscaling (Real-ESRGAN, OmniSR, CUGAN, SwinIR) via ONNX Runtime (CUDA/TensorRT)
 - Two upscalers ship ready to use: **Real-ESRGAN x4+** (general) and **RealESR AnimeVideo v3** (fast, x2/x3/x4); the rest are downloaded on demand
-- One-off **Video tools**: screenshot, pixelate, blur, stabilize, remove watermark, reverse, split and change volume
+- One-off **Video tools**: screenshot, pixelate, blur, stabilize, remove watermark, reverse, split, change volume and **add audio tracks** (pick the whole episode in another language and its first audio track is muxed in as an extra selectable one, no extraction needed, with optional loudness normalisation (EBU R128) measured per track, for the added dubs only or for every track in the file)
 - Frame interpolation (RIFE, FILM) via PyTorch/ONNX
 - Frame-by-frame decode → AI → encode pipeline with audio passthrough
 - Auto-downloading FFmpeg (latest BtbN gpl build) and AI models from HuggingFace
