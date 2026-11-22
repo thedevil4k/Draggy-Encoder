@@ -4,8 +4,14 @@
 ; y se copia completo, incluyendo embed-python/ (el Python embebido con pip
 ; bootstrapado que la app usa para instalar torch/onnxruntime a demanda).
 
-#ifndef MyAppVersion
-  #define MyAppVersion "1"
+; La versión real la inyecta el CI con /DDRAGGY_VERSION=x.y.z: en una tag
+; v* se pasa la tag sin la "v" y en cada push a main se usa "1" (la misma
+; versión rodante que el AppImage). Sin define, el respaldo es "1".
+; Este valor manda en el nombre del instalador y en la versión que registra
+; Windows, así que DraggyEncoder-Setup-<versión>.exe y Settings > Apps
+; siempre coinciden.
+#ifndef DRAGGY_VERSION
+  #define DRAGGY_VERSION "1"
 #endif
 
 ; Instalación por usuario en {localappdata}\Programs: la app escribe datos
@@ -14,8 +20,8 @@
 [Setup]
 AppId={{9D2A6F4B-8E11-4C5F-A3D6-1B2C4E5F6071}}
 AppName=Draggy Encoder
-AppVersion={#MyAppVersion}
-AppVerName=Draggy Encoder v{#MyAppVersion}
+AppVersion={#DRAGGY_VERSION}
+AppVerName=Draggy Encoder v{#DRAGGY_VERSION}
 AppPublisher=thedevil4k
 ; Icono del instalador y del desinstalador (multi-resolución, ver
 ; packaging/windows/make_icon.py). Sin SetupIconFile usan el icono genérico.
@@ -33,7 +39,7 @@ DisableProgramGroupPage=yes
 PrivilegesRequired=lowest
 ArchitecturesInstallIn64BitMode=x64compatible
 OutputDir=installer
-OutputBaseFilename=DraggyEncoder-Setup-{#MyAppVersion}
+OutputBaseFilename=DraggyEncoder-Setup-{#DRAGGY_VERSION}
 Compression=lzma2
 SolidCompression=yes
 WizardStyle=modern
